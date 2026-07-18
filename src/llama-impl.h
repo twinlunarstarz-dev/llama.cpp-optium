@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml.h" // for ggml_log_level
+#include "llama-arch.h"
 
 #include <string>
 #include <type_traits>

@@ -492,6 +492,125 @@ static bool arch_supported(const llm_arch arch) {
     return true;
 }
 
+static void test_sequential_arch_allowlist() {
+    for (const llm_arch arch : {
+         LLM_ARCH_LLAMA,
+         LLM_ARCH_QWEN2,
+         LLM_ARCH_GEMMA,
+         LLM_ARCH_DEEPSEEK4,
+         }) {
+        GGML_ASSERT(llama_model_arch_supports_sequential_load(arch));
+    }
+    for (const llm_arch arch : {
+             LLM_ARCH_LLAMA4,       // MoE is mandatory in the local generator.
+             LLM_ARCH_QWEN2MOE,     // MoE.
+             LLM_ARCH_RWKV6,        // Recurrent.
+             LLM_ARCH_JAMBA,        // Hybrid.
+             LLM_ARCH_QWEN2VL,      // Multimodal.
+             LLM_ARCH_MISTRAL3,     // Numerical validation exceeds the relative-error tolerance.
+             LLM_ARCH_GEMMA2,       // Numerical validation exceeds the relative-error tolerance.
+             LLM_ARCH_PHI3,         // Numerical validation exceeds the relative-error tolerance.
+             LLM_ARCH_UNKNOWN,
+         }) {
+        GGML_ASSERT(!llama_model_arch_supports_sequential_load(arch));
+    }
+}
+
+struct error_stats {
+    double max_abs = 0.0;
+    double max_rel = 0.0;
+};
+
+static error_stats compare_logits(const std::vector<float> & expected, const std::vector<float> & actual) {
+    GGML_ASSERT(expected.size() == actual.size());
+    error_stats result;
+    for (size_t i = 0; i < expected.size(); ++i) {
+        const double abs_error = std::abs(double(expected[i]) - double(actual[i]));
+        const double denom = std::max(std::abs(double(expected[i])), 1.0e-6);
+        result.max_abs = std::max(result.max_abs, abs_error);
+        result.max_rel = std::max(result.max_rel, abs_error / denom);
+    }
+    return result;
+}
+
+static ggml_backend_dev_t get_single_cuda_device() {
+    ggml_backend_dev_t result = nullptr;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        if (reg != nullptr && strcmp(ggml_backend_reg_name(reg), "CUDA") == 0) {
+            GGML_ASSERT(result == nullptr);
+            result = dev;
+        }
+    }
+    return result;
+}
+
+static std::vector<float> load_file_and_decode(
+        const std::string & path, ggml_backend_dev_t cuda_dev, bool sequential, const std::vector<llama_token> & tokens) {
+    llama_model_params model_params = llama_model_default_params();
+    ggml_backend_dev_t devices[] = { cuda_dev, nullptr };
+    model_params.devices = devices;
+    model_params.sequential_load = sequential;
+    model_params.use_mmap = true;
+
+    llama_model_ptr model(llama_model_load_from_file(path.c_str(), model_params));
+    if (!model) {
+        throw std::runtime_error(std::string(sequential ? "sequential" : "ordinary") + " file load failed");
+    }
+    llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.n_ctx = 128;
+    ctx_params.n_batch = 32;
+    ctx_params.n_ubatch = 32;
+    llama_context_ptr ctx(llama_init_from_model(model.get(), ctx_params));
+    if (!ctx) {
+        throw std::runtime_error(std::string(sequential ? "sequential" : "ordinary") + " context creation failed");
+    }
+    return get_logits(model.get(), ctx.get(), tokens);
+}
+
+static int validate_sequential_fixture(const llm_arch arch, const size_t seed, const std::string & dir) {
+    if (!llama_model_arch_supports_sequential_load(arch)) {
+        throw std::runtime_error("architecture is not in the sequential allowlist");
+    }
+    ggml_backend_dev_t cuda_dev = get_single_cuda_device();
+    if (cuda_dev == nullptr) {
+        throw std::runtime_error("exactly one visible CUDA device is required");
+    }
+
+    std::filesystem::create_directories(dir);
+    const std::string path = dir + "/" + llm_arch_name(arch) + "-dense.gguf";
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, false, true);
+    auto generated = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {});
+    llama_model_save_to_file(generated.first.get(), path.c_str());
+    generated = {};
+
+    const std::vector<llama_token> tokens = { 5, 6, 7, 8 };
+    const std::vector<float> ordinary = load_file_and_decode(path, cuda_dev, false, tokens);
+
+    size_t free_before = 0;
+    size_t total = 0;
+    ggml_backend_dev_memory(cuda_dev, &free_before, &total);
+    error_stats worst;
+    for (int cycle = 0; cycle < 3; ++cycle) {
+        const std::vector<float> sequential = load_file_and_decode(path, cuda_dev, true, tokens);
+        const error_stats current = compare_logits(ordinary, sequential);
+        worst.max_abs = std::max(worst.max_abs, current.max_abs);
+        worst.max_rel = std::max(worst.max_rel, current.max_rel);
+    }
+    size_t free_after = 0;
+    ggml_backend_dev_memory(cuda_dev, &free_after, &total);
+    const int64_t drift = int64_t(free_before) - int64_t(free_after);
+    const uintmax_t file_size = std::filesystem::file_size(path);
+    printf("SEQUENTIAL_RESULT arch=%s bytes=%" PRIuMAX " ordinary=PASS sequential=PASS cycles=3 max_abs=%.9g max_rel=%.9g free_before=%zu free_after=%zu drift=%" PRId64 "\n",
+        llm_arch_name(arch), file_size, worst.max_abs, worst.max_rel, free_before, free_after, drift);
+
+    if (worst.max_abs > 1.0e-5 || worst.max_rel > 1.0e-4 || std::abs(drift) > 2*1024*1024) {
+        throw std::runtime_error("sequential fixture tolerance or VRAM drift exceeded");
+    }
+    return 0;
+}
+
 static int save_models(const llm_arch target_arch, const size_t seed, const ggml_log_level log_level, const std::string & dir) {
     struct user_data_t {
         struct {
