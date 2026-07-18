@@ -361,8 +361,9 @@ extern "C" {
 
     // Limit total weight bytes per GPU split when force_weight_offload is active.
     // When non-zero, splits are broken when accumulated weight inputs exceed this limit.
-    // This enables streaming layer-by-layer execution in VRAM-constrained scenarios.
-    GGML_API void                 ggml_backend_sched_set_max_weight_bytes_per_split(ggml_backend_sched_t sched, size_t max_bytes);
+    // The split is an execution unit and does not imply a semantic model layer.
+    GGML_API void                 ggml_backend_sched_set_max_weight_bytes_per_split(
+            ggml_backend_sched_t sched, ggml_backend_t backend, size_t max_bytes);
 
     //
     // Meta backend

@@ -767,6 +767,30 @@ void llama_context::sched_reserve() {
         }
     }
 
+    if (model.is_sequential()) {
+        ggml_backend_sched_synchronize(sched.get());
+        for (ggml_backend_t backend : backend_ptrs) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                continue;
+            }
+            size_t free_bytes = 0;
+            size_t total_bytes = 0;
+            ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
+            size_t window_bytes = 0;
+            size_t safety_reserve_bytes = 0;
+            const bool memory_valid = ggml_backend_sched_set_weight_window(
+                sched.get(), backend, free_bytes, total_bytes, SIZE_MAX, &window_bytes, &safety_reserve_bytes);
+            ggml_backend_sched_set_weight_residency(sched.get(), backend, memory_valid && window_bytes > 0);
+            ggml_backend_sched_set_max_weight_bytes_per_split(sched.get(), backend, window_bytes);
+            LLAMA_LOG_INFO("%s: sequential weight window: total = %.2f MiB, post-reservation free = %.2f MiB, "
+                           "safety reserve = %.2f MiB, admitted = %.2f MiB, memory valid = %s\n",
+                __func__, total_bytes / 1024.0 / 1024.0, free_bytes / 1024.0 / 1024.0,
+                safety_reserve_bytes / 1024.0 / 1024.0, window_bytes / 1024.0 / 1024.0,
+                memory_valid ? "yes" : "no");
+        }
+    }
+
     if (n_nodes_pp == n_nodes_tg) {
         LLAMA_LOG_INFO("%s: graph nodes  = %d\n", __func__, n_nodes_pp);
     } else {

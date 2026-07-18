@@ -356,6 +356,26 @@ static std::vector<std::string> get_environment() {
     return env;
 }
 
+static bool is_explicit_cuda_device_list(const std::string & value) {
+    if (value.empty() || value == "none") {
+        return false;
+    }
+    size_t begin = 0;
+    while (begin < value.size()) {
+        const size_t end = value.find(',', begin);
+        const std::string item = value.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
+        if (item.rfind("CUDA", 0) != 0 || item.size() == 4 ||
+                !std::all_of(item.begin() + 4, item.end(), [](unsigned char c) { return std::isdigit(c); })) {
+            return false;
+        }
+        if (end == std::string::npos) {
+            return true;
+        }
+        begin = end + 1;
+    }
+    return false;
+}
+
 void server_model_meta::update_args(common_preset_context & ctx_preset, std::string bin_path) {
     // update params
     unset_reserved_args(preset, false);
@@ -549,6 +569,18 @@ void server_models::load_models() {
     // e.g. `llama-server --temp 0` is honoured by all child processes
     for (auto & [name, preset] : final_presets) {
         preset.merge(base_preset);
+    }
+
+    for (auto & [name, preset] : final_presets) {
+        std::string sequential;
+        if (!preset.get_option("LLAMA_ARG_SEQUENTIAL", sequential) || !common_arg_utils::is_truthy(sequential)) {
+            continue;
+        }
+
+        std::string device;
+        if (!preset.get_option("LLAMA_ARG_DEVICE", device) || !is_explicit_cuda_device_list(device)) {
+            throw std::runtime_error("sequential loading requires an explicit native CUDA device list in router mode");
+        }
     }
 
     auto get_source = [&](const std::string & name) {

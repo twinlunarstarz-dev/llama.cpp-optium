@@ -1286,6 +1286,47 @@ struct common_init_result::impl {
     std::vector<llama_sampler_seq_config> samplers_seq_config;
 };
 
+static void common_validate_sequential_params(const common_params & params) {
+    if (!params.sequential_load) {
+        return;
+    }
+
+    std::vector<ggml_backend_dev_t> devices;
+    for (ggml_backend_dev_t dev : params.devices) {
+        if (dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            devices.push_back(dev);
+        }
+    }
+    if (devices.empty()) {
+        throw std::runtime_error("sequential loading requires at least one selected non-CPU device");
+    }
+
+    for (ggml_backend_dev_t device : devices) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
+        if (reg == nullptr || strcmp(ggml_backend_reg_name(reg), "CUDA") != 0) {
+            throw std::runtime_error("sequential loading currently requires native CUDA devices");
+        }
+    }
+    if (!params.use_mmap) {
+        throw std::runtime_error("sequential MVP requires mmap");
+    }
+    if (params.use_direct_io) {
+        throw std::runtime_error("sequential MVP does not support direct I/O");
+    }
+    if (params.use_mlock) {
+        throw std::runtime_error("sequential MVP does not support mlock");
+    }
+    if (params.no_alloc) {
+        throw std::runtime_error("sequential MVP does not support no-alloc model loading");
+    }
+    if (!params.lora_adapters.empty()) {
+        throw std::runtime_error("sequential MVP does not support LoRA adapters");
+    }
+    if (!params.control_vectors.empty()) {
+        throw std::runtime_error("sequential MVP does not support control vectors");
+    }
+}
+
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
     auto mparams = common_model_params_to_llama(params);
