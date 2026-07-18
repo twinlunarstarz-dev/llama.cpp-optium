@@ -741,7 +741,7 @@ void llama_context::sched_reserve() {
             const bool memory_valid = ggml_backend_sched_set_weight_window(
                 sched.get(), backend, free_bytes, total_bytes, SIZE_MAX, &window_bytes, &safety_reserve_bytes);
             ggml_backend_sched_set_weight_residency(sched.get(), backend, memory_valid && window_bytes > 0);
-            ggml_backend_sched_set_max_weight_bytes_per_split(sched.get(), window_bytes);
+            ggml_backend_sched_set_max_weight_bytes_per_split(sched.get(), backend, window_bytes);
             LLAMA_LOG_INFO("%s: sequential weight window: total = %.2f MiB, post-reservation free = %.2f MiB, "
                            "safety reserve = %.2f MiB, admitted = %.2f MiB, memory valid = %s\n",
                 __func__, total_bytes / 1024.0 / 1024.0, free_bytes / 1024.0 / 1024.0,

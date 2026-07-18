@@ -360,7 +360,8 @@ extern "C" {
     // Limit total weight bytes per accelerator scheduler split when force_weight_offload is active.
     // When non-zero, splits are broken when accumulated weight inputs exceed this limit.
     // The split is an execution unit and does not imply a semantic model layer.
-    GGML_API void                 ggml_backend_sched_set_max_weight_bytes_per_split(ggml_backend_sched_t sched, size_t max_bytes);
+    GGML_API void                 ggml_backend_sched_set_max_weight_bytes_per_split(
+            ggml_backend_sched_t sched, ggml_backend_t backend, size_t max_bytes);
 
     // Configure an exact transient-weight admission window from a synchronized, post-reservation
     // device-memory sample. A zero or inconsistent sample enables fail-closed admission.

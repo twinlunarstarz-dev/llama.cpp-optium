@@ -131,17 +131,6 @@ int llama_server(common_params & params, int argc, char ** argv) {
                                && params.model.hf_repo.empty();
 
     if (!is_router_server) {
-        if (params.sequential_load) {
-            if (params.n_parallel < 0) {
-                SRV_INF("%s", "n_parallel is set to auto, using n_parallel = 1 for sequential loading and kv_unified = true\n");
-                params.n_parallel = 1;
-                params.kv_unified = true;
-            } else if (params.n_parallel != 1) {
-                SRV_ERR("%s\n", "sequential loading requires exactly one server slot; use --parallel 1");
-                return 1;
-            }
-        }
-
         try {
             common_params_resolve_devices(params);
         } catch (const std::exception & e) {
@@ -458,24 +447,8 @@ int llama_server(common_params & params, int argc, char ** argv) {
             return 1;
         }
 
-        if (params.sequential_load && ctx_server.has_initialized_mtmd()) {
-            clean_up();
-            if (ctx_http.thread.joinable()) {
-                ctx_http.thread.join();
-            }
-            SRV_ERR("%s\n", "sequential loading is incompatible with an initialized multimodal projector");
-            return 1;
-        }
-        if (params.sequential_load && ctx_server.has_initialized_speculative()) {
-            clean_up();
-            if (ctx_http.thread.joinable()) {
-                ctx_http.thread.join();
-            }
-            SRV_ERR("%s\n", "sequential loading is incompatible with an initialized speculative decoding context");
-            return 1;
-        }
         if (params.sequential_load) {
-            SRV_INF("%s", "sequential loading containment enabled: slots=1, multimodal=false, speculative=false\n");
+            SRV_INF("%s", "sequential loading enabled with ordinary server feature composition\n");
         }
 
         routes.update_meta(ctx_server);

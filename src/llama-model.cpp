@@ -1283,8 +1283,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // note: CPU layers point directly to mmap (no extra RAM), OS pages on demand
         LLAMA_LOG_INFO("%s: sequential load: %d layers (~%.1f GiB) streamed from disk via mmap, "
                        "eligible ops are offloaded through scheduler split copies\n",
-            __func__, n_layer_all + 1, ml.n_bytes / (1024.0 * 1024.0 * 1024.0),
-            total_stream_layers);
+            __func__, n_layer_all + 1, ml.n_bytes / (1024.0 * 1024.0 * 1024.0));
     }
 
     const bool use_mmap_buffer = true;

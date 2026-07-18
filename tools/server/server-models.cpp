@@ -193,14 +193,24 @@ static std::vector<std::string> get_environment() {
     return env;
 }
 
-static bool is_single_explicit_cuda_device(const std::string & value) {
-    if (value.empty() || value.find(',') != std::string::npos || value == "none") {
+static bool is_explicit_cuda_device_list(const std::string & value) {
+    if (value.empty() || value == "none") {
         return false;
     }
-    if (value.rfind("CUDA", 0) != 0 || value.size() == 4) {
-        return false;
+    size_t begin = 0;
+    while (begin < value.size()) {
+        const size_t end = value.find(',', begin);
+        const std::string item = value.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
+        if (item.rfind("CUDA", 0) != 0 || item.size() == 4 ||
+                !std::all_of(item.begin() + 4, item.end(), [](unsigned char c) { return std::isdigit(c); })) {
+            return false;
+        }
+        if (end == std::string::npos) {
+            return true;
+        }
+        begin = end + 1;
     }
-    return std::all_of(value.begin() + 4, value.end(), [](unsigned char c) { return std::isdigit(c); });
+    return false;
 }
 
 void server_model_meta::update_args(common_preset_context & ctx_preset, std::string bin_path) {
@@ -396,27 +406,15 @@ void server_models::load_models() {
         preset.merge(base_preset);
     }
 
-    bool has_sequential_child = false;
     for (auto & [name, preset] : final_presets) {
         std::string sequential;
         if (!preset.get_option("LLAMA_ARG_SEQUENTIAL", sequential) || !common_arg_utils::is_truthy(sequential)) {
             continue;
         }
 
-        has_sequential_child = true;
         std::string device;
-        if (!preset.get_option("LLAMA_ARG_DEVICE", device) || !is_single_explicit_cuda_device(device)) {
-            throw std::runtime_error("sequential loading requires exactly one explicit CUDA device in router mode");
-        }
-    }
-
-    if (has_sequential_child) {
-        if (models_max_explicit && base_params.models_max != 1) {
-            throw std::runtime_error("sequential loading requires --models-max 1 in router mode");
-        }
-        if (!models_max_explicit) {
-            base_params.models_max = 1;
-            SRV_INF("%s", "sequential loading enabled for router children; defaulting models_max to 1\n");
+        if (!preset.get_option("LLAMA_ARG_DEVICE", device) || !is_explicit_cuda_device_list(device)) {
+            throw std::runtime_error("sequential loading requires an explicit native CUDA device list in router mode");
         }
     }
 

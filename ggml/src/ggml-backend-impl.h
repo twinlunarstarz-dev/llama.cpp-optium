@@ -58,6 +58,8 @@ extern "C" {
         uint64_t uploaded_logical_bytes;
         uint64_t uploaded_backend_bytes;
         uint64_t upload_count;
+        uint64_t upload_chunk_count;
+        size_t max_upload_chunk_bytes;
         uint64_t transfer_completion_wait_count;
         uint64_t transfer_completion_wait_us;
         uint64_t compute_completion_wait_count;

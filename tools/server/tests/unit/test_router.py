@@ -398,7 +398,7 @@ def _get_model_entry(model_id: str) -> dict:
 
 
 def test_router_models_preset_sequential_load():
-    """Legacy sequential_load is canonicalized and contained without spawning."""
+    """Legacy sequential_load is canonicalized without changing router capacity."""
     global server
 
     preset_path = os.path.join(TMP_DIR, "test_sequential.ini")
@@ -428,7 +428,7 @@ def test_router_models_preset_sequential_load():
         assert "seq-alias" in entry["aliases"]
         assert entry["status"]["value"] == "unloaded"
         props = server.make_request("GET", "/props")
-        assert props.body["max_instances"] == 1
+        assert props.body["max_instances"] != 1
     finally:
         os.remove(preset_path)
 
@@ -487,23 +487,21 @@ def test_router_sequential_cli_precedence(cli_value: bool, ini_value: str, expec
 
 
 @pytest.mark.parametrize("models_max", [0, 2])
-def test_router_sequential_explicit_models_max_rejected(models_max: int):
+def test_router_sequential_explicit_models_max_preserved(models_max: int):
     preset_path = os.path.join(TMP_DIR, "test_sequential_models_max.ini")
-    log_path = os.path.join(TMP_DIR, "test_sequential_models_max.log")
     with open(preset_path, "w") as f:
         f.write("[model-seq]\nhf-repo = local/test\nsequential-load = true\ndevice = CUDA0\n")
     server.models_preset = preset_path
     server.models_max = models_max
-    server.log_path = log_path
-    with pytest.raises(RuntimeError):
-        server.start(timeout_seconds=10)
-    with open(log_path) as f:
-        assert "sequential loading requires --models-max 1 in router mode" in f.read()
-    os.remove(preset_path)
-    os.remove(log_path)
+    server.start()
+    try:
+        props = server.make_request("GET", "/props")
+        assert props.body["max_instances"] == models_max
+    finally:
+        os.remove(preset_path)
 
 
-@pytest.mark.parametrize("device", [None, "none", "CPU", "CUDA0,CUDA1", "Vulkan0"])
+@pytest.mark.parametrize("device", [None, "none", "CPU", "Vulkan0"])
 def test_router_sequential_invalid_device_rejected(device: str | None):
     preset_path = os.path.join(TMP_DIR, "test_sequential_device.ini")
     log_path = os.path.join(TMP_DIR, "test_sequential_device.log")
@@ -515,6 +513,19 @@ def test_router_sequential_invalid_device_rejected(device: str | None):
     with pytest.raises(RuntimeError):
         server.start(timeout_seconds=10)
     with open(log_path) as f:
-        assert "sequential loading requires exactly one explicit CUDA device in router mode" in f.read()
+        assert "sequential loading requires an explicit native CUDA device list in router mode" in f.read()
     os.remove(preset_path)
     os.remove(log_path)
+
+
+def test_router_sequential_multi_cuda_device_list_accepted():
+    preset_path = os.path.join(TMP_DIR, "test_sequential_multi_cuda.ini")
+    with open(preset_path, "w") as f:
+        f.write("[model-seq]\nhf-repo = local/test\nsequential-load = true\ndevice = CUDA0,CUDA1\n")
+    server.models_preset = preset_path
+    server.start()
+    try:
+        args = _get_model_entry("model-seq")["status"]["args"]
+        assert args[args.index("--device") + 1] == "CUDA0,CUDA1"
+    finally:
+        os.remove(preset_path)

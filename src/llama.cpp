@@ -336,12 +336,14 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             if (params.no_alloc) {
                 throw std::runtime_error("sequential MVP does not support no-alloc model loading");
             }
-            if (model->devices.size() != 1) {
-                throw std::runtime_error("sequential MVP requires exactly one selected non-CPU device");
+            if (model->devices.empty()) {
+                throw std::runtime_error("sequential loading requires at least one selected non-CPU device");
             }
-            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(model->devices.front().dev);
-            if (reg == nullptr || strcmp(ggml_backend_reg_name(reg), "CUDA") != 0) {
-                throw std::runtime_error("sequential MVP requires the selected device to use the native CUDA backend");
+            for (const auto & device : model->devices) {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device.dev);
+                if (reg == nullptr || strcmp(ggml_backend_reg_name(reg), "CUDA") != 0) {
+                    throw std::runtime_error("sequential loading currently requires native CUDA devices");
+                }
             }
         }
         if (model->arch == LLM_ARCH_CLIP) {

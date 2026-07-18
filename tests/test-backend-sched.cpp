@@ -23,6 +23,7 @@ struct mock_context {
     size_t free_memory = 1u << 30;
     size_t total_memory = 1u << 30;
     std::vector<ggml_tensor *> transferred;
+    std::vector<size_t> transfer_sizes;
     std::vector<ggml_tensor *> computed_transients;
 };
 
@@ -56,6 +57,7 @@ static void mock_buffer_set(ggml_backend_buffer_t buffer, ggml_tensor * tensor, 
     auto * ctx = (mock_buffer_context *) buffer->context;
     ctx->owner->transfers++;
     ctx->owner->transferred.push_back(tensor);
+    ctx->owner->transfer_sizes.push_back(size);
     memcpy((char *) tensor->data + offset, data, size);
 }
 static void mock_buffer_get(ggml_backend_buffer_t, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -277,6 +279,7 @@ static void test_transient_success_and_failures() {
     GGML_ASSERT(metrics.peak_transient_bytes == 160 && metrics.peak_transient_records == 2);
     GGML_ASSERT(first.allocation_requested_bytes == 160 && first.allocation_admitted_bytes == 160 && first.allocation_rejected_bytes == 0);
     GGML_ASSERT(first.allocation_count == 2 && first.upload_count == 2);
+    GGML_ASSERT(first.upload_chunk_count == 2 && first.max_upload_chunk_bytes == 64);
     GGML_ASSERT(first.uploaded_logical_bytes == 128 && first.uploaded_backend_bytes == 160);
     GGML_ASSERT(first.transfer_completion_wait_count == 1 && first.compute_completion_wait_count == 1);
     GGML_ASSERT(first.transient_split_count == 1 && first.drain_count[GGML_BACKEND_SCHED_TRANSIENT_DRAIN_NORMAL] == 1);
@@ -329,6 +332,34 @@ static void test_transient_success_and_failures() {
 
     ggml_backend_sched_reset(sched);
     assert_detached(env.mock.ctx);
+    ggml_backend_sched_free(sched);
+    GGML_ASSERT(env.mock.ctx.allocations == env.mock.ctx.frees);
+}
+
+static void test_weight_upload_fast_path() {
+    constexpr size_t CHUNK = 64u * 1024u * 1024u;
+    test_env env(2);
+    ggml_tensor * weight = env.weight_1d(CHUNK / sizeof(float) + 1);
+    env.allocate_weights();
+
+    ggml_init_params graph_params{ 8 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+    ggml_context_ptr graph_ctx(ggml_init(graph_params));
+    ggml_tensor * node = ggml_sqr(graph_ctx.get(), weight);
+    ggml_cgraph * graph = ggml_new_graph(graph_ctx.get());
+    ggml_build_forward_expand(graph, node);
+
+    ggml_backend_sched_t sched = make_sched(env);
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched, graph));
+    GGML_ASSERT(ggml_backend_sched_graph_compute_async(sched, graph) == GGML_STATUS_SUCCESS);
+    GGML_ASSERT(env.mock.ctx.transfer_sizes.size() == 1);
+    GGML_ASSERT(env.mock.ctx.transfer_sizes[0] == CHUNK + sizeof(float));
+
+    const auto metrics = get_metrics(sched);
+    const auto & row = metrics.backends[0];
+    GGML_ASSERT(row.upload_count == 1 && row.upload_chunk_count == 1);
+    GGML_ASSERT(row.uploaded_logical_bytes == CHUNK + sizeof(float));
+    GGML_ASSERT(row.max_upload_chunk_bytes == CHUNK + sizeof(float));
+
     ggml_backend_sched_free(sched);
     GGML_ASSERT(env.mock.ctx.allocations == env.mock.ctx.frees);
 }
@@ -472,14 +503,14 @@ static void test_limit_rejections() {
     ggml_build_forward_expand(graph, node);
 
     ggml_backend_sched_t sched = make_sched(env);
-    ggml_backend_sched_set_max_weight_bytes_per_split(sched, 79);
+    ggml_backend_sched_set_max_weight_bytes_per_split(sched, &env.mock.backend, 79);
     GGML_ASSERT(ggml_backend_sched_alloc_graph(sched, graph));
     GGML_ASSERT(ggml_backend_sched_graph_compute_async(sched, graph) == GGML_STATUS_ALLOC_FAILED);
     auto metrics = get_metrics(sched);
     GGML_ASSERT(metrics.backends[0].allocation_limit_rejection_count == 1);
     GGML_ASSERT(metrics.backends[0].oversized_tensor_rejection_count == 1);
     GGML_ASSERT(metrics.backends[0].allocation_rejected_bytes == 80 && metrics.current_transient_records == 0);
-    ggml_backend_sched_set_max_weight_bytes_per_split(sched, 120);
+    ggml_backend_sched_set_max_weight_bytes_per_split(sched, &env.mock.backend, 120);
     GGML_ASSERT(ggml_backend_sched_graph_compute_async(sched, graph) == GGML_STATUS_ALLOC_FAILED);
     metrics = get_metrics(sched);
     GGML_ASSERT(metrics.backends[0].allocation_limit_rejection_count == 2);
@@ -824,6 +855,7 @@ static void test_persistent_residency_lru_eviction() {
 }
 
 int main() {
+    test_weight_upload_fast_path();
     test_transient_success_and_failures();
     test_two_device_splits_recopy_tied_weight();
     test_parallel_fails_closed_to_ordinary_ownership();

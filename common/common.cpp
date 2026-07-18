@@ -1225,13 +1225,15 @@ static void common_validate_sequential_params(const common_params & params) {
             devices.push_back(dev);
         }
     }
-    if (devices.size() != 1) {
-        throw std::runtime_error("sequential MVP requires exactly one selected non-CPU device");
+    if (devices.empty()) {
+        throw std::runtime_error("sequential loading requires at least one selected non-CPU device");
     }
 
-    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(devices.front());
-    if (reg == nullptr || strcmp(ggml_backend_reg_name(reg), "CUDA") != 0) {
-        throw std::runtime_error("sequential MVP requires the selected device to use the native CUDA backend");
+    for (ggml_backend_dev_t device : devices) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
+        if (reg == nullptr || strcmp(ggml_backend_reg_name(reg), "CUDA") != 0) {
+            throw std::runtime_error("sequential loading currently requires native CUDA devices");
+        }
     }
     if (!params.use_mmap) {
         throw std::runtime_error("sequential MVP requires mmap");
