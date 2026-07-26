@@ -46,6 +46,11 @@ function(llama_test target)
     set_property(TEST ${TEST_NAME} PROPERTY LABELS ${LLAMA_TEST_LABEL})
 endfunction()
 
+add_executable(test-server-best-of-n test-server-best-of-n.cpp)
+target_include_directories(test-server-best-of-n PRIVATE ${CMAKE_SOURCE_DIR}/tools/server)
+target_link_libraries(test-server-best-of-n PRIVATE server-context)
+llama_test(test-server-best-of-n)
+
 function(llama_test_cmd target)
     include(CMakeParseArguments)
     set(options)

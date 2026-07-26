@@ -352,31 +352,29 @@ void server_response::terminate() {
 //
 
 void server_response_reader::post_task(server_task && task, bool front) {
-    GGML_ASSERT(id_tasks.empty() && "post_task() can only be called once per reader");
     GGML_ASSERT(!task.is_parent() && "not supported, use post_tasks() instead");
     task.index = 0;
     id_tasks.insert(task.id);
-    states.push_back(task.create_state());
+    states.emplace(task.id, task.create_state());
     queue_results.add_waiting_task_id(task.id);
     queue_tasks.post(std::move(task), front);
 }
 
 void server_response_reader::post_tasks(std::vector<server_task> && tasks, bool front) {
-    GGML_ASSERT(id_tasks.empty() && "post_tasks() can only be called once per reader");
-    id_tasks = server_task::get_list_id(tasks);
-    states.reserve(tasks.size());
+    const auto new_ids = server_task::get_list_id(tasks);
+    id_tasks.insert(new_ids.begin(), new_ids.end());
     size_t index = 0;
     for (auto & task : tasks) {
         task.index = index++;
-        states.push_back(task.create_state());
+        states.emplace(task.id, task.create_state());
         // for child tasks
         for (auto & child_task : task.child_tasks) {
             child_task.index = index++;
-            states.push_back(child_task.create_state());
+            states.emplace(child_task.id, child_task.create_state());
         }
     }
     GGML_ASSERT(states.size() == id_tasks.size());
-    queue_results.add_waiting_task_ids(id_tasks);
+    queue_results.add_waiting_task_ids(new_ids);
     queue_tasks.post(std::move(tasks), front);
 }
 
@@ -402,9 +400,9 @@ server_task_result_ptr server_response_reader::next(const std::function<bool()> 
             }
             if (!states.empty()) {
                 // update the generation state if needed
-                const size_t idx = result->index;
-                GGML_ASSERT(idx < states.size());
-                result->update(states[idx]);
+                auto state = states.find(result->id);
+                GGML_ASSERT(state != states.end());
+                result->update(state->second);
             }
             if (result->is_stop()) {
                 received_count++;

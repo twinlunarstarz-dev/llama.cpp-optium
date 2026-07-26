@@ -324,11 +324,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             if (llm_arch_is_hybrid(model->arch)) {
                 throw std::runtime_error("sequential MVP does not support hybrid models");
             }
-            if (fname.empty() || metadata != nullptr || file != nullptr || !ml.use_mmap) {
-                throw std::runtime_error("sequential MVP requires an mmap-backed path model source");
-            }
-            if (ml.use_direct_io) {
-                throw std::runtime_error("sequential MVP does not support direct I/O");
+            if (fname.empty() || metadata != nullptr || file != nullptr || (!ml.use_mmap && !ml.use_direct_io)) {
+                throw std::runtime_error("sequential loading requires an mmap or direct-I/O path model source");
             }
             if (params.use_mlock) {
                 throw std::runtime_error("sequential MVP does not support mlock");

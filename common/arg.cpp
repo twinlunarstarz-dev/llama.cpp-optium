@@ -1475,6 +1475,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_PREDICT"));
     add_opt(common_arg(
+        {"--passes"}, "N",
+        string_format("best-of-N hidden candidates selected by a same-model judge, 1 disables selection (default: %d, max: 16)", params.passes),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 16) {
+                throw std::invalid_argument("passes must be between 1 and 16");
+            }
+            params.passes = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-b", "--batch-size"}, "N",
         string_format("logical maximum batch size (default: %d)", params.n_batch),
         [](common_params & params, int value) {

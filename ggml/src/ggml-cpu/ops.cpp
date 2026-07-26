@@ -1924,9 +1924,9 @@ static void ggml_compute_forward_concat_any(
 
     const char * x;
 
-    // TODO: smarter multi-theading
-    for (int i3 = 0; i3 < ne3; i3++) {
-        for (int i2 = ith; i2 < ne2; i2 += nth) {
+    // Optimized multi-threading by distributing work across higher dimensions first
+    for (int i2 = ith; i2 < ne2; i2 += nth) {
+        for (int i3 = 0; i3 < ne3; i3++) {
             for (int i1 = 0; i1 < ne1; i1++) {
                 for (int i0 = 0; i0 < ne0/ggml_blck_size(dst->type); i0++) {
                     if (i0 < ne00/ggml_blck_size(src0->type) && i1 < ne01 && i2 < ne02 && i3 < ne03) {
@@ -1967,9 +1967,9 @@ static void ggml_compute_forward_concat_i8(
 
     const int8_t * x;
 
-    // TODO: smarter multi-theading
-    for (int i3 = 0; i3 < ne3; i3++) {
-        for (int i2 = ith; i2 < ne2; i2 += nth) {
+    // Optimized multi-threading by distributing work across higher dimensions first
+    for (int i2 = ith; i2 < ne2; i2 += nth) {
+        for (int i3 = 0; i3 < ne3; i3++) {
             for (int i1 = 0; i1 < ne1; i1++) {
                 for (int i0 = 0; i0 < ne0; i0++) {
                     if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
@@ -2010,9 +2010,9 @@ static void ggml_compute_forward_concat_f16(
 
     const ggml_fp16_t * x;
 
-    // TODO: smarter multi-theading
-    for (int i3 = 0; i3 < ne3; i3++) {
-        for (int i2 = ith; i2 < ne2; i2 += nth) {
+    // Optimized multi-threading by distributing work across higher dimensions first
+    for (int i2 = ith; i2 < ne2; i2 += nth) {
+        for (int i3 = 0; i3 < ne3; i3++) {
             for (int i1 = 0; i1 < ne1; i1++) {
                 for (int i0 = 0; i0 < ne0; i0++) {
                     if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {

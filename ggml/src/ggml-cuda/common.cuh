@@ -3,6 +3,9 @@
 #include "ggml.h"
 #include "ggml-impl.h"
 #include "ggml-cuda.h"
+#ifdef GGML_CUDA_USE_NVTX
+#include <nvtx3/nvToolsExt.h>
+#endif
 
 #include <cstdint>
 #include <cstdlib>
@@ -1396,6 +1399,18 @@ struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+    ggml_backend_cuda_metrics metrics = {};
+
+    void metric_add(uint64_t & counter, uint64_t value = 1) {
+        if (UINT64_MAX - counter < value) {
+            counter = UINT64_MAX;
+            if (metrics.counter_overflow != UINT64_MAX) {
+                ++metrics.counter_overflow;
+            }
+        } else {
+            counter += value;
+        }
+    }
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};

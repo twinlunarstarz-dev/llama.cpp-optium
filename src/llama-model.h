@@ -664,6 +664,7 @@ struct llama_model {
     const struct ggml_tensor * get_tensor(const char * name) const;
 
     bool is_sequential() const;
+    bool read_sequential_weight(const void * logical_src, void * dst, size_t size) const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;

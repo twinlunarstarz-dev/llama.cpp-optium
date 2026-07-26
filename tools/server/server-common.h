@@ -353,6 +353,11 @@ std::string format_anthropic_sse(const json & data);
 
 bool is_valid_utf8(const std::string & str);
 
+// Best-of-N judge helpers. Parsing accepts only an ASCII-whitespace-trimmed
+// decimal index covering the entire response.
+bool server_best_of_n_parse_index(const std::string & text, size_t candidate_count, size_t & index);
+std::string server_best_of_n_index_grammar(size_t candidate_count);
+
 //
 // formatting output responses
 // TODO: move these to server-task.cpp

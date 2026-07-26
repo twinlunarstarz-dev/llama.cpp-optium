@@ -9,6 +9,8 @@
 
 #include "server-common.h"
 
+#include <charconv>
+
 #include <random>
 #include <sstream>
 #include <fstream>
@@ -1584,4 +1586,48 @@ server_tokens format_prompt_rerank(
     }
 
     return result;
+}
+bool server_best_of_n_parse_index(const std::string & text, size_t candidate_count, size_t & index) {
+    if (candidate_count == 0) {
+        return false;
+    }
+    const auto is_ascii_space = [](unsigned char c) {
+        return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+    };
+    size_t begin = 0;
+    size_t end = text.size();
+    while (begin < end && is_ascii_space(text[begin])) {
+        ++begin;
+    }
+    while (end > begin && is_ascii_space(text[end - 1])) {
+        --end;
+    }
+    if (begin == end) {
+        return false;
+    }
+    if (end - begin > 1 && text[begin] == '0') {
+        return false;
+    }
+    size_t parsed = 0;
+    const char * first = text.data() + begin;
+    const char * last  = text.data() + end;
+    const auto result = std::from_chars(first, last, parsed, 10);
+    if (result.ec != std::errc() || result.ptr != last || parsed >= candidate_count) {
+        return false;
+    }
+    index = parsed;
+    return true;
+}
+
+std::string server_best_of_n_index_grammar(size_t candidate_count) {
+    GGML_ASSERT(candidate_count > 0);
+    std::string grammar = "root ::= (";
+    for (size_t i = 0; i < candidate_count; ++i) {
+        if (i != 0) {
+            grammar += " | ";
+        }
+        grammar += '\"' + std::to_string(i) + '\"';
+    }
+    grammar += ")";
+    return grammar;
 }

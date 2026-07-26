@@ -42,6 +42,31 @@ GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
 
+enum ggml_cuda_graph_reset_reason {
+    GGML_CUDA_GRAPH_RESET_NEW_KEY = 0,
+    GGML_CUDA_GRAPH_RESET_POINTER_OR_SHAPE,
+    GGML_CUDA_GRAPH_RESET_TOPOLOGY,
+    GGML_CUDA_GRAPH_RESET_UPDATE_FAILURE,
+    GGML_CUDA_GRAPH_RESET_INCOMPATIBLE,
+    GGML_CUDA_GRAPH_RESET_REASON_COUNT,
+};
+
+struct ggml_backend_cuda_metrics {
+    uint64_t mmid_mmvq;
+    uint64_t mmid_mmq;
+    uint64_t mmid_mmf;
+    uint64_t mmid_cpu_fallback;
+    uint64_t mmid_id_roundtrip_us;
+    uint64_t graph_reuse;
+    uint64_t graph_recapture;
+    uint64_t graph_reset[GGML_CUDA_GRAPH_RESET_REASON_COUNT];
+    uint64_t counter_overflow;
+};
+
+GGML_BACKEND_API bool ggml_backend_cuda_get_metrics(ggml_backend_t backend, struct ggml_backend_cuda_metrics * out);
+GGML_BACKEND_API bool ggml_backend_cuda_get_metrics_delta(ggml_backend_t backend, const struct ggml_backend_cuda_metrics * baseline, struct ggml_backend_cuda_metrics * out);
+GGML_BACKEND_API void ggml_backend_cuda_reset_metrics(ggml_backend_t backend);
+
 #ifdef  __cplusplus
 }
 #endif

@@ -455,6 +455,8 @@ Note for `multimodal_data` in JSON object prompts. This should be an array of st
 
 `n_predict`: Set the maximum number of tokens to predict when generating text. **Note:** May exceed the set limit slightly if the last token is a partial multibyte character. When 0, no tokens will be generated but the prompt is evaluated into the cache. Default: `-1`, where `-1` is infinity.
 
+`passes`: Best-of-N selection. At `1`, request behavior is unchanged. Values greater than `1` generate that many independent hidden candidates and ask the same loaded model to judge them; only the selected candidate is returned. Candidate and judge tokens are not streamed, so streaming responses remain silent (apart from SSE comment pings) until selection completes and then emit the winner. This increases latency and inference cost, is capped by the configured parallel slot count and `16`, and is incompatible with `n_cmpl`/OpenAI `n` greater than `1`. If the judge cannot produce a strict in-range integer index, candidate `0` is selected deterministically. Standard response usage remains winner-shaped. Default: `1`.
+
 `n_indent`: Specify the minimum line indentation for the generated text in number of whitespace characters. Useful for code completion tasks. Default: `0`
 
 `n_keep`: Specify the number of tokens from the prompt to retain when the context size is exceeded and tokens need to be discarded. The number excludes the BOS token.

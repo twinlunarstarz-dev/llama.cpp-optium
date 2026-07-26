@@ -65,6 +65,7 @@ json task_params::to_json(bool only_metrics) const {
             {"mirostat_eta",              sampling.mirostat_eta},
             {"max_tokens",                n_predict},
             {"n_predict",                 n_predict}, // TODO: deduplicate?
+            {"passes",                    passes},
             {"n_keep",                    n_keep},
             {"n_discard",                 n_discard},
             {"ignore_eos",                sampling.ignore_eos},
@@ -117,6 +118,7 @@ json task_params::to_json(bool only_metrics) const {
         {"stop",                      antiprompt},
         {"max_tokens",                n_predict},
         {"n_predict",                 n_predict}, // TODO: deduplicate?
+        {"passes",                    passes},
         {"n_keep",                    n_keep},
         {"n_discard",                 n_discard},
         {"ignore_eos",                sampling.ignore_eos},
@@ -1840,4 +1842,25 @@ void server_prompt_cache::update() {
         SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
                 (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(), state.size() / (1024.0 * 1024.0));
     }
+}
+std::vector<server_task> server_best_of_n_make_candidate_tasks(
+        const server_task & prototype,
+        const std::vector<int> & ids) {
+    std::vector<server_task> tasks;
+    tasks.reserve(ids.size());
+
+    for (size_t i = 0; i < ids.size(); ++i) {
+        server_task candidate(prototype.type);
+        candidate.id      = ids[i];
+        candidate.id_slot = i == 0 ? prototype.id_slot : -1;
+        candidate.params  = prototype.params;
+        candidate.tokens  = prototype.tokens.clone();
+
+        if (candidate.params.sampling.seed != LLAMA_DEFAULT_SEED) {
+            candidate.params.sampling.seed += (uint32_t) i;
+        }
+        tasks.push_back(std::move(candidate));
+    }
+
+    return tasks;
 }

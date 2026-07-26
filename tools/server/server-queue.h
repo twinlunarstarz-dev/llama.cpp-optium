@@ -175,7 +175,7 @@ struct server_response_reader {
 
     // tracking generation state and partial tool calls
     // only used by streaming completions
-    std::vector<task_result_state> states;
+    std::unordered_map<int, task_result_state> states;
 
     // should_stop function will be called each polling_interval_seconds
     server_response_reader(server_queue & queue_tasks, server_response & queue_results, int polling_interval_seconds)

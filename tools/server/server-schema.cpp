@@ -47,6 +47,10 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->add_alias("max_tokens")
         ->set_desc("Set the maximum number of tokens to predict. When 0, no tokens will be generated but the prompt is evaluated into the cache"));
 
+    add((new field_num("passes", params.passes))
+        ->set_hard_limits(1, 16)
+        ->set_desc("Generate this many hidden candidates and use the same model to select the best one"));
+
     add((new field_num("n_indent", params.n_indent))
         ->set_hard_limits(0, INT32_MAX)
         ->set_desc("Specify the minimum line indentation for the generated text in number of whitespace characters. Useful for code completion tasks"));
@@ -505,6 +509,7 @@ task_params eval_llama_cmpl_schema(
     params.speculative   = params_base.speculative;
     params.n_keep        = params_base.n_keep;
     params.n_predict     = params_base.n_predict;
+    params.passes        = params_base.passes;
     params.n_cache_reuse = params_base.n_cache_reuse;
     params.cache_prompt  = params_base.cache_prompt;
     params.antiprompt    = params_base.antiprompt;

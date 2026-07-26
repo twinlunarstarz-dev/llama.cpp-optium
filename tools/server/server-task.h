@@ -59,6 +59,7 @@ struct task_params {
     int32_t n_keep    =  0; // number of tokens to keep from initial prompt
     int32_t n_discard =  0; // number of tokens after n_keep that may be discarded when shifting context, 0 defaults to half
     int32_t n_predict = -1; // new tokens to predict
+    int32_t passes    =  1; // best-of-N candidates selected by a same-model judge
     int32_t n_indent  =  0; // minimum line indentation for the generated text in number of whitespace characters
     int32_t n_cmpl    =  1; // number of completions to generate from this prompt
 
@@ -258,6 +259,13 @@ struct server_task {
         return id_parent != -1;
     }
 };
+
+// Build independent best-of-N candidate tasks. Independent tasks are admitted by the
+// ordinary slot scheduler in waves, unlike parent/child tasks which require every
+// candidate slot to be available simultaneously.
+std::vector<server_task> server_best_of_n_make_candidate_tasks(
+        const server_task & prototype,
+        const std::vector<int> & ids);
 
 struct result_timings {
     int32_t cache_n = -1;

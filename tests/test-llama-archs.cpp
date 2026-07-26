@@ -487,24 +487,25 @@ static error_stats compare_logits(const std::vector<float> & expected, const std
     return result;
 }
 
-static ggml_backend_dev_t get_single_cuda_device() {
-    ggml_backend_dev_t result = nullptr;
+static std::vector<ggml_backend_dev_t> get_cuda_devices() {
+    std::vector<ggml_backend_dev_t> result;
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
         if (reg != nullptr && strcmp(ggml_backend_reg_name(reg), "CUDA") == 0) {
-            GGML_ASSERT(result == nullptr);
-            result = dev;
+            result.push_back(dev);
         }
     }
     return result;
 }
 
 static std::vector<float> load_file_and_decode(
-        const std::string & path, ggml_backend_dev_t cuda_dev, bool sequential, const std::vector<llama_token> & tokens) {
+        const std::string & path, const std::vector<ggml_backend_dev_t> & cuda_devices,
+        bool sequential, const std::vector<llama_token> & tokens) {
     llama_model_params model_params = llama_model_default_params();
-    ggml_backend_dev_t devices[] = { cuda_dev, nullptr };
-    model_params.devices = devices;
+    std::vector<ggml_backend_dev_t> devices = cuda_devices;
+    devices.push_back(nullptr);
+    model_params.devices = devices.data();
     model_params.sequential_load = sequential;
     model_params.use_mmap = true;
 
@@ -527,9 +528,9 @@ static int validate_sequential_fixture(const llm_arch arch, const size_t seed, c
     if (!llama_model_arch_supports_sequential_load(arch)) {
         throw std::runtime_error("architecture is not in the sequential allowlist");
     }
-    ggml_backend_dev_t cuda_dev = get_single_cuda_device();
-    if (cuda_dev == nullptr) {
-        throw std::runtime_error("exactly one visible CUDA device is required");
+    const std::vector<ggml_backend_dev_t> cuda_devices = get_cuda_devices();
+    if (cuda_devices.empty()) {
+        throw std::runtime_error("at least one visible CUDA device is required");
     }
 
     std::filesystem::create_directories(dir);
@@ -540,20 +541,20 @@ static int validate_sequential_fixture(const llm_arch arch, const size_t seed, c
     generated = {};
 
     const std::vector<llama_token> tokens = { 5, 6, 7, 8 };
-    const std::vector<float> ordinary = load_file_and_decode(path, cuda_dev, false, tokens);
+    const std::vector<float> ordinary = load_file_and_decode(path, cuda_devices, false, tokens);
 
     size_t free_before = 0;
     size_t total = 0;
-    ggml_backend_dev_memory(cuda_dev, &free_before, &total);
+    ggml_backend_dev_memory(cuda_devices.front(), &free_before, &total);
     error_stats worst;
     for (int cycle = 0; cycle < 3; ++cycle) {
-        const std::vector<float> sequential = load_file_and_decode(path, cuda_dev, true, tokens);
+        const std::vector<float> sequential = load_file_and_decode(path, cuda_devices, true, tokens);
         const error_stats current = compare_logits(ordinary, sequential);
         worst.max_abs = std::max(worst.max_abs, current.max_abs);
         worst.max_rel = std::max(worst.max_rel, current.max_rel);
     }
     size_t free_after = 0;
-    ggml_backend_dev_memory(cuda_dev, &free_after, &total);
+    ggml_backend_dev_memory(cuda_devices.front(), &free_after, &total);
     const int64_t drift = int64_t(free_before) - int64_t(free_after);
     const uintmax_t file_size = std::filesystem::file_size(path);
     printf("SEQUENTIAL_RESULT arch=%s bytes=%" PRIuMAX " ordinary=PASS sequential=PASS cycles=3 max_abs=%.9g max_rel=%.9g free_before=%zu free_after=%zu drift=%" PRId64 "\n",

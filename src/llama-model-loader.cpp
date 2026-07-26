@@ -1580,6 +1580,13 @@ bool llama_model_loader::load_all_data(
             const auto & file = files.at(weight->idx);
 
             if (ggml_backend_buffer_is_host(cur->buffer)) {
+                if (sequential_load && use_direct_io && cur->data != nullptr) {
+                    // The sequential direct-I/O path stores a logical source identity
+                    // in cur->data. Actual bytes are read on demand by the scheduler's
+                    // weight-read callback; never treat that identity as writable RAM.
+                    size_done += n_size;
+                    continue;
+                }
                 file->seek(weight->offs, SEEK_SET);
                 file->read_raw(cur->data, n_size);
                 if (check_tensors) {

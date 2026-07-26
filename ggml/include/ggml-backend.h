@@ -354,8 +354,22 @@ extern "C" {
     // Force host weight ops to higher-priority devices when possible.
     GGML_API void                 ggml_backend_sched_set_force_weight_offload(ggml_backend_sched_t sched, bool force);
 
+    // Distribute eligible forced host-weight offload using model-layer-aware placement.
+    // The weights are relative (not cumulative) and correspond to the non-CPU
+    // scheduler backends in priority order. Passing NULL or zero disables it.
+    GGML_API void                 ggml_backend_sched_set_force_weight_offload_split(
+            ggml_backend_sched_t sched, const float * weights, int n_weights);
+
     // Enable one-split lookahead async upload for host weights copied to device split inputs.
     GGML_API void                 ggml_backend_sched_set_async_weight_prefetch(ggml_backend_sched_t sched, bool prefetch);
+
+    // Optional source reader for storage-backed sequential weights. The callback
+    // copies exactly size bytes from the logical tensor address into dst and
+    // returns true when it handled the address. Unhandled addresses use memcpy.
+    typedef bool (*ggml_backend_sched_weight_read_callback)(
+            void * user_data, const void * logical_src, void * dst, size_t size);
+    GGML_API void                 ggml_backend_sched_set_weight_read_callback(
+            ggml_backend_sched_t sched, ggml_backend_sched_weight_read_callback callback, void * user_data);
 
     // Limit total weight bytes per accelerator scheduler split when force_weight_offload is active.
     // When non-zero, splits are broken when accumulated weight inputs exceed this limit.
@@ -374,6 +388,16 @@ extern "C" {
     // Enable bounded persistent scheduler-weight residency on one caller-qualified CUDA backend.
     GGML_API void                 ggml_backend_sched_set_weight_residency(
             ggml_backend_sched_t sched, ggml_backend_t backend, bool enabled);
+
+    // Keep resident host-weight copies across scheduler graph resets. The next
+    // graph reattaches matching source tensors to the retained device buffers.
+    GGML_API void                 ggml_backend_sched_set_persistent_weight_residency(
+            ggml_backend_sched_t sched, bool persistent);
+
+    // Print per-backend sequential weight transfer and residency counters.
+    GGML_API void                 ggml_backend_sched_print_transient_metrics(ggml_backend_sched_t sched);
+    // Reset interval counters while preserving live residency/window gauges.
+    GGML_API void                 ggml_backend_sched_reset_transient_metrics(ggml_backend_sched_t sched);
 
     //
     // Meta backend

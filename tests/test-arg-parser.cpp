@@ -88,6 +88,39 @@ static void test(void) {
 
     std::vector<std::string> argv;
 
+    printf("test-arg-parser: test server passes argument and preset\n\n");
+
+    params = common_params{};
+    assert(params.passes == 1);
+    argv = {"binary_name", "-m", "model.gguf", "--passes", "3"};
+    assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.passes == 3);
+
+    params = common_params{};
+    argv = {"binary_name", "-m", "model.gguf", "--passes", "0"};
+    assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
+    {
+        const auto ini_path = std::filesystem::temp_directory_path() / "llama-test-passes-preset.ini";
+        std::ofstream out(ini_path, std::ios::trunc);
+        out << "[model]\npasses = 3\n";
+        out.close();
+
+        common_preset_context preset_ctx(LLAMA_EXAMPLE_SERVER);
+        common_preset global;
+        const auto presets = preset_ctx.load_from_ini(ini_path.string(), global);
+        const auto & preset = presets.at("model");
+        common_params preset_params;
+        preset.apply_to_params(preset_params);
+        assert(preset_params.passes == 3);
+        const auto args = preset.to_args();
+        assert(std::find(args.begin(), args.end(), "--passes") != args.end());
+        assert(preset.to_ini().find("passes = 3") != std::string::npos);
+
+        std::error_code ec;
+        std::filesystem::remove(ini_path, ec);
+    }
+
     printf("test-arg-parser: test sequential argument contract\n\n");
 
     params = common_params{};

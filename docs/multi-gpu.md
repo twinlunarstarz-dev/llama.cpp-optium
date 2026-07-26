@@ -51,6 +51,28 @@ As for any CUDA program, the environment variable `CUDA_VISIBLE_DEVICES` can be 
 
 ## Recipes
 
+### Storage-backed sequential loading
+
+This fork can keep model weights mmap-backed and stream transient weight windows through one or more native CUDA devices. This is intended for models larger than combined VRAM and system RAM:
+
+```bash
+llama-server -m model.gguf --sequential --device CUDA0,CUDA1 --split-mode layer --tensor-split 22,10
+```
+
+- Select at least one native CUDA device. Multi-GPU sequential loading accepts every selected CUDA device and creates one transient weight window per device.
+- Keep mmap enabled and do not combine `--sequential` with `--direct-io`, `--mlock`, or `--no-alloc`.
+- Sequential mode does not use ordinary persistent GPU layer placement. An inherited explicit `--n-gpu-layers` value therefore does not make all selected layers resident: weights remain mmap-backed and scheduler split copies provide transient CUDA residency.
+- Sequential mode disables pipeline parallel graph copies. Transient weight ownership currently requires a single scheduler copy even when several CUDA devices provide independent weight windows.
+- Forced offload assigns eligible MoE expert matmuls across CUDA devices according to `--tensor-split`; it no longer intentionally sends every eligible weight operation to the first CUDA backend. The assignment is interleaved across layers. Attention and dense activation chains remain on the primary GPU because duplicating their full-context compute arena can exceed a smaller secondary GPU's VRAM. Assignment is only a scheduling policy; verify actual work with the per-device counters rather than compute-buffer sizes.
+- For one-row token-generation graphs, complete layer operations are eligible for the weighted assignment because their activation arena is much smaller. The scheduler detects this from the graph shape; no deployment option is required.
+- Context and server request timing output includes per-device total/transient splits, uploads, logical/backend bytes, residency hits/misses/evictions, and transfer/compute waits for profiling. These counters show scheduler activity but are not a substitute for hardware utilization telemetry.
+- Upload submission time is reported separately. A large value with a small transfer-completion wait means the mmap source is pageable and the host call is synchronously faulting or staging pages before CUDA can overlap the DMA. Event-based lookahead alone cannot remove that cost; bounded pinned staging is required.
+- The KV cache and compute buffers are allocated independently of model weights and must fit their selected memory tier. In sequential mode, model layers are CPU-backed, so layer-affine KV caches also use CPU buffers even when KV offload is enabled. A large configured context can therefore require substantial RAM or swap without requiring equivalent VRAM.
+- `--ctx-size` is the configured usable context. It can be smaller than the model's trained context reported in metadata; this does not prevent the configured context from being allocated in full.
+- If `--spec-type draft-mtp` is inherited but the selected GGUF has no MTP layers, the server logs a warning and continues without MTP. An explicitly configured separate draft model is still treated as required and fails normally if it cannot be loaded.
+
+The ordinary multi-GPU modes described below remain appropriate when the model can be resident in available memory.
+
 ### 1. Default - pipeline parallel across all visible GPUs
 
 ```bash
@@ -124,4 +146,6 @@ P2P requires driver support (usually restricted to workstation/datacenter GPUs) 
 | CUDA OOM at startup or during prefill in `--split-mode tensor` | Auto-fit is disabled in this mode, so reduce memory pressure yourself. In order from least to most disruptive: lower `--ctx-size` (`-c`) (KV cache is roughly proportional to `n_ctx`); for `llama-server`, lower `--parallel` (`-np`) (a slot KV cache is allocated per concurrent sequence); as a last resort, reduce `--n-gpu-layers` (`-ngl`) (the remaining layers run on CPU and inference will be much slower). |
 | Performance is worse with multi-GPU than single-GPU | The performance is bottlenecked by GPU interconnect speed. For `--split-mode tensor`, verify that NCCL is being used. Try `--split-mode layer` (less communication than `tensor`). Increase GPU interconnect speed via more PCIe lanes or e.g. NVLink (if available). |
 | GPU not used at all | `--n-gpu-layers` is `0` or too low - try explicitly setting `-ngl all`. Or you are accidentally hiding the GPUs via an environment variable like `CUDA_VISIBLE_DEVICES=-1`. Or your build doesn't include support for the relevant backend. |
+| Sequential context fails with *"unsupported non-CPU backend"* | Use native CUDA devices only and ensure the build contains the multi-GPU sequential context fix. ACCEL, RPC, Meta/tensor-parallel, and other non-CUDA devices are not supported by the sequential path. |
+| Sequential startup fails with *"does not support direct I/O"* | Remove `--direct-io`. Sequential weights require mmap-backed file mappings. |
 | Crashes or corrupted outputs after setting `GGML_CUDA_P2P=1` | Some motherboards and BIOS settings (e.g. with IOMMU enabled) don't support CUDA peer-to-peer reliably. Unset `GGML_CUDA_P2P`. |

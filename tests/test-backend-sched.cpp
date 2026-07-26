@@ -25,6 +25,10 @@ struct mock_context {
     std::vector<ggml_tensor *> transferred;
     std::vector<size_t> transfer_sizes;
     std::vector<ggml_tensor *> computed_transients;
+    int event_records = 0;
+    int event_synchronizes = 0;
+    std::vector<int64_t> computed_expert_counts;
+    std::vector<int32_t> computed_ids;
 };
 
 struct mock_buffer_context {
@@ -36,6 +40,8 @@ static const char * mock_buft_name(ggml_backend_buffer_type_t) { return "mock-de
 static size_t mock_buft_alignment(ggml_backend_buffer_type_t) { return 16; }
 static size_t mock_buft_alloc_size(ggml_backend_buffer_type_t, const ggml_tensor * tensor) { return ggml_nbytes(tensor) + 16; }
 static bool mock_buft_is_host(ggml_backend_buffer_type_t) { return false; }
+static const char * mock_host_buft_name(ggml_backend_buffer_type_t) { return "mock-pinned-host"; }
+static bool mock_host_buft_is_host(ggml_backend_buffer_type_t) { return true; }
 static void mock_buffer_free(ggml_backend_buffer_t buffer) {
     auto * ctx = (mock_buffer_context *) buffer->context;
     ctx->owner->frees++;
@@ -94,15 +100,40 @@ static ggml_backend_buffer_t mock_buft_alloc(ggml_backend_buffer_type_t buft, si
     return ggml_backend_buffer_init(buft, iface, ctx, size);
 }
 
+static ggml_backend_buffer_t mock_host_buft_alloc(ggml_backend_buffer_type_t buft, size_t size) {
+    auto * ctx = new mock_buffer_context{(mock_context *) buft->context, malloc(size)};
+    GGML_ASSERT(ctx->data != nullptr);
+    ggml_backend_buffer_i iface{};
+    iface.free_buffer = [](ggml_backend_buffer_t buffer) {
+        auto * context = (mock_buffer_context *) buffer->context;
+        free(context->data);
+        delete context;
+    };
+    iface.get_base = mock_buffer_base;
+    return ggml_backend_buffer_init(buft, iface, ctx, size);
+}
+
 static const char * mock_backend_name(ggml_backend_t) { return "mock"; }
 static void mock_set_async(ggml_backend_t, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     mock_buffer_set(tensor->buffer, tensor, data, offset, size);
 }
 static void mock_synchronize(ggml_backend_t backend) { ((mock_context *) backend->context)->synchronizes++; }
+static void mock_event_record(ggml_backend_t backend, ggml_backend_event_t) { ((mock_context *) backend->context)->event_records++; }
+static void mock_event_wait(ggml_backend_t, ggml_backend_event_t) {}
 static ggml_status mock_compute(ggml_backend_t backend, ggml_cgraph * graph) {
     auto * ctx = (mock_context *) backend->context;
     ctx->computes++;
     for (int i = 0; i < graph->n_nodes; ++i) {
+        if (graph->nodes[i]->op == GGML_OP_MUL_MAT_ID) {
+            const ggml_tensor * weights = graph->nodes[i]->src[0];
+            const ggml_tensor * ids = graph->nodes[i]->src[2];
+            ctx->computed_expert_counts.push_back(weights->ne[2]);
+            for (int64_t i1 = 0; i1 < ids->ne[1]; ++i1) {
+                for (int64_t i0 = 0; i0 < ids->ne[0]; ++i0) {
+                    ctx->computed_ids.push_back(*(const int32_t *) ((const char *) ids->data + i1*ids->nb[1] + i0*ids->nb[0]));
+                }
+            }
+        }
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
             ggml_tensor * src = graph->nodes[i]->src[j];
             if (src != nullptr && (src->flags & GGML_TENSOR_FLAG_NO_ALLOC)) {
@@ -127,11 +158,19 @@ static void mock_dev_props(ggml_backend_dev_t dev, ggml_backend_dev_props * prop
 static bool mock_supports_op(ggml_backend_dev_t, const ggml_tensor *) { return true; }
 static bool mock_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) { return buft->device == dev; }
 static bool mock_offload_op(ggml_backend_dev_t, const ggml_tensor *) { return true; }
+static ggml_backend_event_t mock_event_new(ggml_backend_dev_t dev) {
+    return new ggml_backend_event{dev, dev->context};
+}
+static void mock_event_free(ggml_backend_dev_t, ggml_backend_event_t event) { delete event; }
+static void mock_event_synchronize(ggml_backend_dev_t, ggml_backend_event_t event) {
+    ((mock_context *) event->context)->event_synchronizes++;
+}
 
 struct mock_backend {
     mock_context ctx;
     ggml_backend_device device{};
     ggml_backend_buffer_type buft{};
+    ggml_backend_buffer_type host_buft{};
     ggml_backend backend{};
 
     mock_backend() {
@@ -144,6 +183,13 @@ struct mock_backend {
         device.iface.supports_op = mock_supports_op;
         device.iface.supports_buft = mock_supports_buft;
         device.iface.offload_op = mock_offload_op;
+        device.iface.get_host_buffer_type = [](ggml_backend_dev_t dev) {
+            auto * self = (mock_backend *) ((char *) dev->context - offsetof(mock_backend, ctx));
+            return &self->host_buft;
+        };
+        device.iface.event_new = mock_event_new;
+        device.iface.event_free = mock_event_free;
+        device.iface.event_synchronize = mock_event_synchronize;
         buft.device = &device;
         buft.context = &ctx;
         buft.iface.get_name = mock_buft_name;
@@ -151,11 +197,19 @@ struct mock_backend {
         buft.iface.get_alignment = mock_buft_alignment;
         buft.iface.get_alloc_size = mock_buft_alloc_size;
         buft.iface.is_host = mock_buft_is_host;
+        host_buft.device = &device;
+        host_buft.context = &ctx;
+        host_buft.iface.get_name = mock_host_buft_name;
+        host_buft.iface.alloc_buffer = mock_host_buft_alloc;
+        host_buft.iface.get_alignment = mock_buft_alignment;
+        host_buft.iface.is_host = mock_host_buft_is_host;
         backend.device = &device;
         backend.context = &ctx;
         backend.iface.get_name = mock_backend_name;
         backend.iface.set_tensor_async = mock_set_async;
         backend.iface.synchronize = mock_synchronize;
+        backend.iface.event_record = mock_event_record;
+        backend.iface.event_wait = mock_event_wait;
         backend.iface.graph_compute = mock_compute;
     }
 };
@@ -175,6 +229,10 @@ struct test_env {
 
     ggml_tensor * weight_1d(int64_t ne) {
         return ggml_new_tensor_1d(weight_ctx.get(), GGML_TYPE_F32, ne);
+    }
+
+    ggml_tensor * weight_3d(int64_t ne0, int64_t ne1, int64_t ne2) {
+        return ggml_new_tensor_3d(weight_ctx.get(), GGML_TYPE_F32, ne0, ne1, ne2);
     }
 
     void allocate_weights() {
@@ -252,6 +310,26 @@ static bool stop_after_first_callback(ggml_tensor *, bool ask, void *) {
     return ask;
 }
 
+static void test_metrics_phase_delta_reset_and_saturation() {
+    test_env env(4);
+    ggml_backend_sched_t sched = make_sched(env);
+    assert_zero_metrics(sched);
+
+    const auto baseline = get_metrics(sched);
+    auto snapshot = baseline;
+    ggml_backend_sched_test_counter_add(sched, &snapshot.backends[0].upload_count, UINT64_MAX);
+    ggml_backend_sched_test_counter_add(sched, &snapshot.backends[0].upload_count, 1);
+    GGML_ASSERT(snapshot.backends[0].upload_count == UINT64_MAX);
+    GGML_ASSERT(get_metrics(sched).backends[0].upload_count == 0);
+
+    ggml_backend_sched_reset_transient_metrics(sched);
+    assert_zero_metrics(sched);
+    ggml_backend_sched_transient_metrics delta{};
+    GGML_ASSERT(ggml_backend_sched_get_transient_metrics_delta(sched, &baseline, &delta));
+    GGML_ASSERT(delta.graph_compute_count == 0 && delta.backends[0].upload_count == 0);
+    ggml_backend_sched_free(sched);
+}
+
 static void test_transient_success_and_failures() {
     test_env env(4);
     ggml_tensor * weight_a = env.weight_1d(16);
@@ -281,7 +359,9 @@ static void test_transient_success_and_failures() {
     GGML_ASSERT(first.allocation_count == 2 && first.upload_count == 2);
     GGML_ASSERT(first.upload_chunk_count == 2 && first.max_upload_chunk_bytes == 64);
     GGML_ASSERT(first.uploaded_logical_bytes == 128 && first.uploaded_backend_bytes == 160);
-    GGML_ASSERT(first.transfer_completion_wait_count == 1 && first.compute_completion_wait_count == 1);
+    GGML_ASSERT(first.staged_upload_chunk_count == 2 && first.staged_upload_bytes == 128);
+    GGML_ASSERT(first.staging_buffer_bytes == 128 && env.mock.ctx.event_records == 2);
+    GGML_ASSERT(first.transfer_completion_wait_count == 0 && first.compute_completion_wait_count == 1);
     GGML_ASSERT(first.transient_split_count == 1 && first.drain_count[GGML_BACKEND_SCHED_TRANSIENT_DRAIN_NORMAL] == 1);
 
     GGML_ASSERT(ggml_backend_sched_graph_compute_async(sched, graph) == GGML_STATUS_SUCCESS);
@@ -351,14 +431,52 @@ static void test_weight_upload_fast_path() {
     ggml_backend_sched_t sched = make_sched(env);
     GGML_ASSERT(ggml_backend_sched_alloc_graph(sched, graph));
     GGML_ASSERT(ggml_backend_sched_graph_compute_async(sched, graph) == GGML_STATUS_SUCCESS);
-    GGML_ASSERT(env.mock.ctx.transfer_sizes.size() == 1);
-    GGML_ASSERT(env.mock.ctx.transfer_sizes[0] == CHUNK + sizeof(float));
+    GGML_ASSERT(env.mock.ctx.transfer_sizes.size() == 2);
+    GGML_ASSERT(env.mock.ctx.transfer_sizes[0] == CHUNK);
+    GGML_ASSERT(env.mock.ctx.transfer_sizes[1] == sizeof(float));
 
     const auto metrics = get_metrics(sched);
     const auto & row = metrics.backends[0];
-    GGML_ASSERT(row.upload_count == 1 && row.upload_chunk_count == 1);
+    GGML_ASSERT(row.upload_count == 1 && row.upload_chunk_count == 2);
     GGML_ASSERT(row.uploaded_logical_bytes == CHUNK + sizeof(float));
-    GGML_ASSERT(row.max_upload_chunk_bytes == CHUNK + sizeof(float));
+    GGML_ASSERT(row.max_upload_chunk_bytes == CHUNK);
+    GGML_ASSERT(row.staged_upload_chunk_count == 2 && row.staged_upload_bytes == CHUNK + sizeof(float));
+    GGML_ASSERT(row.staging_buffer_bytes == CHUNK + sizeof(float));
+
+    ggml_backend_sched_free(sched);
+    GGML_ASSERT(env.mock.ctx.allocations == env.mock.ctx.frees);
+}
+
+static void test_sequential_weights_coalesce_until_input_limit() {
+    constexpr int N_WEIGHTS = 4;
+    test_env env(N_WEIGHTS);
+    ggml_tensor * weights[N_WEIGHTS];
+    for (int i = 0; i < N_WEIGHTS; ++i) {
+        weights[i] = env.weight_1d(16);
+    }
+    env.allocate_weights();
+
+    ggml_init_params graph_params{ 32 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+    ggml_context_ptr graph_ctx(ggml_init(graph_params));
+    ggml_tensor * node = ggml_sqr(graph_ctx.get(), weights[0]);
+    for (int i = 1; i < N_WEIGHTS; ++i) {
+        node = ggml_add(graph_ctx.get(), node, weights[i]);
+    }
+    ggml_cgraph * graph = ggml_new_graph(graph_ctx.get());
+    ggml_build_forward_expand(graph, node);
+
+    ggml_backend_sched_t sched = make_sched(env);
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched, graph));
+    GGML_ASSERT(ggml_backend_sched_get_n_splits(sched) == 1);
+    GGML_ASSERT(ggml_backend_sched_graph_compute_async(sched, graph) == GGML_STATUS_SUCCESS);
+    GGML_ASSERT(env.mock.ctx.transfers == N_WEIGHTS);
+
+    const auto metrics = get_metrics(sched);
+    const auto & row = metrics.backends[0];
+    GGML_ASSERT(row.split_reason_count[GGML_BACKEND_SCHED_SPLIT_EXPLICIT_MANUAL] == 1);
+    GGML_ASSERT(row.split_reason_count[GGML_BACKEND_SCHED_SPLIT_INCOMPATIBLE_BUFFER_OP] == 0);
+    GGML_ASSERT(row.split_weight_bytes_total == N_WEIGHTS * 16 * sizeof(float));
+    GGML_ASSERT(row.transient_split_count == 1);
 
     ggml_backend_sched_free(sched);
     GGML_ASSERT(env.mock.ctx.allocations == env.mock.ctx.frees);
@@ -649,6 +767,7 @@ static void test_warm_resident_callback_and_compute_failure() {
 
     ggml_backend_sched_t sched = make_sched(env);
     enable_residency(sched, env, 80);
+    ggml_backend_sched_set_persistent_weight_residency(sched, true);
     GGML_ASSERT(ggml_backend_sched_alloc_graph(sched, graph));
     ggml_tensor * copy = node->src[0];
 
@@ -817,6 +936,39 @@ static void test_warm_resident_reset_and_direct_destruction() {
     }
 }
 
+static void test_persistent_residency_survives_graph_reset() {
+    test_env env(2);
+    ggml_tensor * weight = env.weight_1d(16);
+    ggml_set_name(weight, "blk.0.weight");
+    env.allocate_weights();
+
+    ggml_init_params graph_params{ 12 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+    ggml_context_ptr graph_ctx(ggml_init(graph_params));
+    ggml_tensor * node = ggml_sqr(graph_ctx.get(), weight);
+    ggml_cgraph * graph = ggml_new_graph(graph_ctx.get());
+    ggml_build_forward_expand(graph, node);
+
+    ggml_backend_sched_t sched = make_sched(env);
+    enable_residency(sched, env, 80);
+    ggml_backend_sched_set_persistent_weight_residency(sched, true);
+    GGML_ASSERT(ggml_backend_sched_graph_compute_async(sched, graph) == GGML_STATUS_SUCCESS);
+    GGML_ASSERT(env.mock.ctx.transfers == 1);
+
+    ggml_backend_sched_reset(sched);
+    GGML_ASSERT(get_metrics(sched).current_resident_records == 1);
+    ggml_init_params rebuilt_params{ 12 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+    ggml_context_ptr rebuilt_ctx(ggml_init(rebuilt_params));
+    ggml_tensor * rebuilt_node = ggml_sqr(rebuilt_ctx.get(), weight);
+    ggml_cgraph * rebuilt_graph = ggml_new_graph(rebuilt_ctx.get());
+    ggml_build_forward_expand(rebuilt_graph, rebuilt_node);
+    GGML_ASSERT(ggml_backend_sched_graph_compute_async(sched, rebuilt_graph) == GGML_STATUS_SUCCESS);
+    GGML_ASSERT(env.mock.ctx.transfers == 1);
+    GGML_ASSERT(get_metrics(sched).backends[0].residency_hit_count == 1);
+
+    ggml_backend_sched_free(sched);
+    GGML_ASSERT(env.mock.ctx.allocations == env.mock.ctx.frees);
+}
+
 static void test_persistent_residency_lru_eviction() {
     constexpr size_t MIB = 1024u * 1024u;
     test_env env(6);
@@ -854,8 +1006,171 @@ static void test_persistent_residency_lru_eviction() {
     GGML_ASSERT(env.mock.ctx.allocations == env.mock.ctx.frees);
 }
 
+static void test_compact_moe_nonconsecutive_duplicate_and_reuse() {
+    test_env env(4);
+    ggml_tensor * weights = env.weight_3d(4, 2, 8);
+    env.allocate_weights();
+
+    ggml_init_params graph_params{ 24 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, false };
+    ggml_context_ptr graph_ctx(ggml_init(graph_params));
+    ggml_tensor * activations = ggml_new_tensor_3d(graph_ctx.get(), GGML_TYPE_F32, 4, 1, 2);
+    ggml_tensor * ids = ggml_new_tensor_2d(graph_ctx.get(), GGML_TYPE_I32, 4, 2);
+    const int32_t original_ids[] = { 7, 2, 7, 4, 2, 4, 2, 7 };
+    memcpy(ids->data, original_ids, sizeof(original_ids));
+    ggml_tensor * node = ggml_mul_mat_id(graph_ctx.get(), weights, activations, ids);
+    ggml_cgraph * graph = ggml_new_graph(graph_ctx.get());
+    ggml_build_forward_expand(graph, node);
+
+    ggml_backend_sched_t sched = make_sched(env);
+    enable_residency(sched, env, 112);
+    ggml_backend_sched_set_persistent_weight_residency(sched, true);
+    GGML_ASSERT(ggml_backend_sched_graph_compute_async(sched, graph) == GGML_STATUS_SUCCESS);
+    GGML_ASSERT(env.mock.ctx.computed_expert_counts.back() == 3);
+    const int32_t expected_remap[] = { 2, 0, 2, 1, 0, 1, 0, 2 };
+    GGML_ASSERT(std::equal(env.mock.ctx.computed_ids.end() - 8, env.mock.ctx.computed_ids.end(), expected_remap));
+    GGML_ASSERT(node->src[2] != nullptr && node->src[2]->data == ids->data);
+    auto metrics = get_metrics(sched);
+    GGML_ASSERT(metrics.backends[0].compact_expert_miss_count == 3);
+    GGML_ASSERT(metrics.backends[0].compact_physical_bytes == 112);
+    GGML_ASSERT(metrics.backends[0].compact_avoided_full_allocation_bytes == 160);
+
+    GGML_ASSERT(ggml_backend_sched_graph_compute_async(sched, graph) == GGML_STATUS_SUCCESS);
+    metrics = get_metrics(sched);
+    GGML_ASSERT(metrics.backends[0].compact_expert_hit_count == 3);
+    GGML_ASSERT(metrics.backends[0].residency_hit_count == 1);
+
+    ggml_backend_sched_reset(sched);
+    ggml_backend_sched_free(sched);
+    GGML_ASSERT(env.mock.ctx.allocations == env.mock.ctx.frees);
+}
+
+static void test_compact_moe_changed_set_and_fallback() {
+    test_env env(4);
+    ggml_tensor * weights = env.weight_3d(4, 2, 10);
+    env.allocate_weights();
+    ggml_init_params graph_params{ 24 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, false };
+    ggml_context_ptr graph_ctx(ggml_init(graph_params));
+    ggml_tensor * activations = ggml_new_tensor_3d(graph_ctx.get(), GGML_TYPE_F32, 4, 1, 1);
+    ggml_tensor * ids = ggml_new_tensor_2d(graph_ctx.get(), GGML_TYPE_I32, 3, 1);
+    ((int32_t *) ids->data)[0] = 1;
+    ((int32_t *) ids->data)[1] = 7;
+    ((int32_t *) ids->data)[2] = 1;
+    ggml_tensor * node = ggml_mul_mat_id(graph_ctx.get(), weights, activations, ids);
+    ggml_cgraph * graph = ggml_new_graph(graph_ctx.get());
+    ggml_build_forward_expand(graph, node);
+    ggml_backend_sched_t sched = make_sched(env);
+    enable_residency(sched, env, 80);
+    ggml_backend_sched_set_persistent_weight_residency(sched, true);
+    GGML_ASSERT(ggml_backend_sched_graph_compute_async(sched, graph) == GGML_STATUS_SUCCESS);
+    ((int32_t *) ids->data)[0] = 7;
+    ((int32_t *) ids->data)[1] = 9;
+    ((int32_t *) ids->data)[2] = 7;
+    GGML_ASSERT(ggml_backend_sched_graph_compute_async(sched, graph) == GGML_STATUS_SUCCESS);
+    auto metrics = get_metrics(sched);
+    GGML_ASSERT(metrics.backends[0].compact_expert_miss_count == 3);
+    GGML_ASSERT(metrics.backends[0].compact_expert_hit_count == 1);
+    GGML_ASSERT(metrics.backends[0].compact_expert_eviction_count == 1);
+    GGML_ASSERT(metrics.backends[0].residency_eviction_count == 0);
+    const int32_t expected_remap[] = { 1, 0, 1 };
+    GGML_ASSERT(std::equal(env.mock.ctx.computed_ids.end() - 3, env.mock.ctx.computed_ids.end(), expected_remap));
+    GGML_ASSERT(env.mock.ctx.transfers == 5); // two ID uploads and three expert-slice uploads; expert 7 is not repeated
+
+    ggml_backend_sched_reset(sched);
+    GGML_ASSERT(ggml_backend_sched_graph_compute_async(sched, graph) == GGML_STATUS_SUCCESS);
+    metrics = get_metrics(sched);
+    GGML_ASSERT(metrics.backends[0].compact_expert_hit_count == 1);
+    GGML_ASSERT(metrics.backends[0].compact_expert_miss_count == 3);
+    ggml_backend_sched_free(sched);
+    GGML_ASSERT(env.mock.ctx.allocations == env.mock.ctx.frees);
+}
+
+static void test_compact_moe_larger_routing_set_grows_slab() {
+    test_env env(4);
+    ggml_tensor * weights = env.weight_3d(4, 2, 10);
+    env.allocate_weights();
+    ggml_init_params graph_params{ 24 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, false };
+    ggml_context_ptr graph_ctx(ggml_init(graph_params));
+    ggml_tensor * activations = ggml_new_tensor_3d(graph_ctx.get(), GGML_TYPE_F32, 4, 1, 1);
+    ggml_tensor * ids = ggml_new_tensor_2d(graph_ctx.get(), GGML_TYPE_I32, 3, 1);
+    int32_t * ids_data = (int32_t *) ids->data;
+    ids_data[0] = 1;
+    ids_data[1] = 7;
+    ids_data[2] = 1;
+    ggml_tensor * node = ggml_mul_mat_id(graph_ctx.get(), weights, activations, ids);
+    ggml_cgraph * graph = ggml_new_graph(graph_ctx.get());
+    ggml_build_forward_expand(graph, node);
+    ggml_backend_sched_t sched = make_sched(env);
+    // Three compact experts require a 112-byte backend allocation (including
+    // mock-buffer alignment). Leave enough window capacity for the replacement
+    // slab while still proving that the initial two-expert slab is evicted.
+    enable_residency(sched, env, 112);
+    ggml_backend_sched_set_persistent_weight_residency(sched, true);
+
+    GGML_ASSERT(ggml_backend_sched_graph_compute_async(sched, graph) == GGML_STATUS_SUCCESS);
+    GGML_ASSERT(env.mock.ctx.computed_expert_counts.back() == 2);
+
+    // The initial compact slab has two slots. A later prompt requiring three
+    // simultaneous experts must replace it with a larger compact slab rather
+    // than remapping an ID beyond the old allocation or loading all experts.
+    ids_data[0] = 1;
+    ids_data[1] = 7;
+    ids_data[2] = 9;
+    GGML_ASSERT(ggml_backend_sched_graph_compute_async(sched, graph) == GGML_STATUS_SUCCESS);
+    GGML_ASSERT(env.mock.ctx.computed_expert_counts.back() == 3);
+    GGML_ASSERT(get_metrics(sched).backends[0].compact_fallback_count == 0);
+    GGML_ASSERT(get_metrics(sched).backends[0].residency_eviction_count == 1);
+    GGML_ASSERT(node->src[2] == ids);
+
+    ggml_backend_sched_reset(sched);
+    ggml_backend_sched_free(sched);
+    GGML_ASSERT(env.mock.ctx.allocations == env.mock.ctx.frees);
+}
+
+static void test_compact_moe_repeated_graph_rebuild_reset_and_free() {
+    test_env env(4);
+    ggml_tensor * weights = env.weight_3d(4, 2, 10);
+    env.allocate_weights();
+    ggml_backend_sched_t sched = make_sched(env);
+    enable_residency(sched, env, 80);
+    ggml_backend_sched_set_persistent_weight_residency(sched, true);
+
+    constexpr int iterations = 64;
+    for (int iteration = 0; iteration < iterations; ++iteration) {
+        ggml_init_params graph_params{ 24 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, false };
+        ggml_context_ptr graph_ctx(ggml_init(graph_params));
+        ggml_tensor * activations = ggml_new_tensor_3d(graph_ctx.get(), GGML_TYPE_F32, 4, 1, 1);
+        ggml_tensor * ids = ggml_new_tensor_2d(graph_ctx.get(), GGML_TYPE_I32, 3, 1);
+        int32_t * ids_data = (int32_t *) ids->data;
+        if ((iteration & 1) == 0) {
+            ids_data[0] = 1;
+            ids_data[1] = 7;
+            ids_data[2] = 1;
+        } else {
+            // Expert 9 is the final source expert and is deliberately remapped into
+            // a non-final slab slot after the first iteration.
+            ids_data[0] = 7;
+            ids_data[1] = 9;
+            ids_data[2] = 7;
+        }
+        ggml_tensor * node = ggml_mul_mat_id(graph_ctx.get(), weights, activations, ids);
+        ggml_cgraph * graph = ggml_new_graph(graph_ctx.get());
+        ggml_build_forward_expand(graph, node);
+
+        GGML_ASSERT(ggml_backend_sched_graph_compute_async(sched, graph) == GGML_STATUS_SUCCESS);
+        GGML_ASSERT(node->src[2] == ids);
+        GGML_ASSERT(get_metrics(sched).current_resident_bytes <= 80);
+        ggml_backend_sched_reset(sched);
+        GGML_ASSERT(get_metrics(sched).current_resident_bytes <= 80);
+    }
+
+    ggml_backend_sched_free(sched);
+    GGML_ASSERT(env.mock.ctx.allocations == env.mock.ctx.frees);
+}
+
 int main() {
+    test_metrics_phase_delta_reset_and_saturation();
     test_weight_upload_fast_path();
+    test_sequential_weights_coalesce_until_input_limit();
     test_transient_success_and_failures();
     test_two_device_splits_recopy_tied_weight();
     test_parallel_fails_closed_to_ordinary_ownership();
@@ -868,6 +1183,11 @@ int main() {
     test_resident_admission_failures_drain_existing();
     test_resident_graph_rebuild_and_source_mismatch();
     test_warm_resident_reset_and_direct_destruction();
+    test_persistent_residency_survives_graph_reset();
     test_persistent_residency_lru_eviction();
+    test_compact_moe_nonconsecutive_duplicate_and_reuse();
+    test_compact_moe_changed_set_and_fallback();
+    test_compact_moe_larger_routing_set_grows_slab();
+    test_compact_moe_repeated_graph_rebuild_reset_and_free();
     return 0;
 }

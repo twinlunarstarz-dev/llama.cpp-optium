@@ -1,5 +1,7 @@
 #include "llama-context.h"
 
+#include "ggml-cuda.h"
+
 #include "ggml.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
@@ -327,7 +329,21 @@ llama_context::llama_context(
 
     if (!hparams.vocab_only) {
         // GPU backends
-        for (const auto & dev : model.devices) {
+        std::vector<llama_device> context_devices = model.devices;
+        if (cparams.ctx_other != nullptr) {
+            const llama_model * model_other = llama_get_model(cparams.ctx_other);
+            for (const auto & dev : model_other->devices) {
+                const bool already_present = std::any_of(context_devices.begin(), context_devices.end(),
+                    [&](const llama_device & current) { return current.dev == dev.dev; });
+                if (!already_present) {
+                    // Shared-memory draft architectures can reference target KV tensors allocated
+                    // on a target GPU that is not selected for draft weights. The scheduler must
+                    // still contain that backend so pre-allocated shared tensors remain executable.
+                    context_devices.push_back(dev);
+                }
+            }
+        }
+        for (const auto & dev : context_devices) {
             ggml_backend_t backend = ggml_backend_dev_init(dev.dev, nullptr);
             if (backend == nullptr) {
                 throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev.dev)));
@@ -373,7 +389,10 @@ llama_context::llama_context(
                 }
                 throw std::runtime_error("sequential MVP context contains an unsupported non-CPU backend");
             }
-            if (n_cpu != 1 || n_cuda != 1) {
+            // Sequential loading supports every native CUDA device selected on the model.
+            // Require one CPU backend and a matching CUDA backend for each selected device;
+            // rejecting n_cuda > 1 here made the multi-GPU path fail during context creation.
+            if (n_cpu != 1 || n_cuda != model.devices.size()) {
                 throw std::runtime_error("sequential MVP context contains an unsupported non-CPU backend");
             }
             if (!model.loras.empty()) {
@@ -454,6 +473,7 @@ llama_context::llama_context(
         // TODO: move these checks to ggml_backend_sched
         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
         bool pipeline_parallel =
+            !model.is_sequential() &&
             model.n_devices() > 1 &&
             model.n_gpu_layers() > model.hparams.n_layer_all &&
             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
@@ -632,6 +652,8 @@ void llama_context::sched_reserve() {
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
     if (model.is_sequential()) {
         ggml_backend_sched_set_force_weight_offload(sched.get(), true);
+        ggml_backend_sched_set_force_weight_offload_split(
+            sched.get(), model.tensor_split(), (int) model.n_devices());
         ggml_backend_sched_set_async_weight_prefetch(sched.get(), false);
         if (ggml_backend_sched_get_n_copies(sched.get()) != 1) {
             throw std::runtime_error("sequential MVP requires scheduler n_copies=1");
@@ -674,6 +696,8 @@ void llama_context::sched_reserve() {
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
                 if (model.is_sequential()) {
                     ggml_backend_sched_set_force_weight_offload(sched.get(), true);
+                    ggml_backend_sched_set_force_weight_offload_split(
+                        sched.get(), model.tensor_split(), (int) model.n_devices());
                     ggml_backend_sched_set_async_weight_prefetch(sched.get(), false);
                     if (ggml_backend_sched_get_n_copies(sched.get()) != 1) {
                         throw std::runtime_error("sequential MVP requires scheduler n_copies=1");
@@ -748,6 +772,14 @@ void llama_context::sched_reserve() {
                 safety_reserve_bytes / 1024.0 / 1024.0, window_bytes / 1024.0 / 1024.0,
                 memory_valid ? "yes" : "no");
         }
+        ggml_backend_sched_set_persistent_weight_residency(sched.get(), true);
+        ggml_backend_sched_set_weight_read_callback(sched.get(),
+            [](void * user_data, const void * logical_src, void * dst, size_t size) {
+                return ((const llama_model *) user_data)->read_sequential_weight(logical_src, dst, size);
+            }, (void *) &model);
+        // Enable bounded one-split storage lookahead after graph reservation. The
+        // scheduler keeps at most one 64 MiB O_DIRECT read in flight per device.
+        ggml_backend_sched_set_async_weight_prefetch(sched.get(), true);
     }
 
     if (n_nodes_pp == n_nodes_tg) {
@@ -4190,6 +4222,56 @@ void llama_perf_context_print(const llama_context * ctx) {
             __func__, data.t_eval_ms, data.n_eval, data.t_eval_ms / data.n_eval, 1e3 / data.t_eval_ms * data.n_eval);
     LLAMA_LOG_INFO("%s:       total time = %10.2f ms / %5d tokens\n", __func__, (t_end_ms - data.t_start_ms), (data.n_p_eval + data.n_eval));
     LLAMA_LOG_INFO("%s:    graphs reused = %10d\n", __func__, data.n_reused);
+    llama_perf_context_print_backend_metrics(ctx);
+}
+
+void llama_perf_context_print_backend_metrics(const llama_context * ctx) {
+    if (ctx != nullptr) {
+        ggml_backend_sched_t sched = ctx->get_sched();
+        ggml_backend_sched_print_transient_metrics(sched);
+
+        for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+            ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+            using get_metrics_fn = bool (*)(ggml_backend_t, ggml_backend_cuda_metrics *);
+            auto get_metrics = (get_metrics_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_get_metrics");
+            if (get_metrics == nullptr) {
+                continue;
+            }
+
+            ggml_backend_cuda_metrics metrics = {};
+            if (get_metrics(backend, &metrics)) {
+                LLAMA_LOG_INFO(
+                    "%s: backend=%s mmid(mmvq/mmq/mmf/cpu)=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64
+                    " id-roundtrip=%.3fs cuda-graph(reuse/recapture)=%" PRIu64 "/%" PRIu64
+                    " resets(new/pointer/topology/update/incompatible)=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64
+                    " overflows=%" PRIu64 "\n",
+                    __func__, ggml_backend_name(backend), metrics.mmid_mmvq, metrics.mmid_mmq, metrics.mmid_mmf,
+                    metrics.mmid_cpu_fallback, metrics.mmid_id_roundtrip_us / 1e6, metrics.graph_reuse,
+                    metrics.graph_recapture, metrics.graph_reset[GGML_CUDA_GRAPH_RESET_NEW_KEY],
+                    metrics.graph_reset[GGML_CUDA_GRAPH_RESET_POINTER_OR_SHAPE],
+                    metrics.graph_reset[GGML_CUDA_GRAPH_RESET_TOPOLOGY],
+                    metrics.graph_reset[GGML_CUDA_GRAPH_RESET_UPDATE_FAILURE],
+                    metrics.graph_reset[GGML_CUDA_GRAPH_RESET_INCOMPATIBLE], metrics.counter_overflow);
+            }
+        }
+    }
+}
+
+void llama_perf_context_reset_backend_metrics(llama_context * ctx) {
+    if (ctx != nullptr) {
+        ggml_backend_sched_t sched = ctx->get_sched();
+        ggml_backend_sched_reset_transient_metrics(sched);
+        for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+            ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+            using reset_metrics_fn = void (*)(ggml_backend_t);
+            auto reset_metrics = (reset_metrics_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_reset_metrics");
+            if (reset_metrics != nullptr) {
+                reset_metrics(backend);
+            }
+        }
+    }
 }
 
 void llama_perf_context_reset(llama_context * ctx) {

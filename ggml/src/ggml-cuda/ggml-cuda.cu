@@ -1870,6 +1870,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             if (ggml_is_quantized(src0->type)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
+                    ctx.metric_add(ctx.metrics.mmid_mmvq);
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
                     return;
                 }
@@ -1882,11 +1883,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         }
 
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+            ctx.metric_add(ctx.metrics.mmid_mmq);
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
         }
 
         if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
+            ctx.metric_add(ctx.metrics.mmid_mmf);
             ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
             return;
         }
@@ -1919,9 +1922,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     ggml_cuda_pool_alloc<char> src1_sorted(ctx.pool(), ne12*n_expert_used*ne10*ts_src1_sorted);
     ggml_cuda_pool_alloc<char>  dst_sorted(ctx.pool(), ne2 *n_expert_used* ne0*ts_dst_sorted);
 
+    ctx.metric_add(ctx.metrics.mmid_cpu_fallback);
+    const int64_t id_roundtrip_start = ggml_time_us();
     std::vector<char> ids_host(ggml_nbytes(ids));
     CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
+    ctx.metric_add(ctx.metrics.mmid_id_roundtrip_us,
+        ggml_time_us() >= id_roundtrip_start ? (uint64_t) (ggml_time_us() - id_roundtrip_start) : 0);
 
     for (int64_t i02 = 0; i02 < ne02; ++i02) { // expert matrices
         for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
@@ -4087,6 +4094,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+#ifdef GGML_CUDA_USE_NVTX
+    const bool nvtx_enabled = getenv("GGML_CUDA_NVTX") != nullptr;
+    if (nvtx_enabled) {
+        nvtxRangePushA("ggml.split_compute");
+    }
+#endif
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
@@ -4110,6 +4123,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
                     use_cuda_graph = true;
                     cuda_graph_update_required = true;
+                    cuda_ctx->metric_add(cuda_ctx->metrics.graph_recapture);
                 }
                 // else: properties changed or first call - execute directly (use_cuda_graph stays false)
             } else {
@@ -4117,12 +4131,20 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 if (properties_changed) {
                     // Properties changed - reset warmup, execute directly until stable again
                     graph->warmup_complete = false;
+                    cuda_ctx->metric_add(cuda_ctx->metrics.graph_reset[GGML_CUDA_GRAPH_RESET_POINTER_OR_SHAPE]);
                     GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
                 } else {
                     use_cuda_graph = true;
                     cuda_graph_update_required = graph->instance == nullptr;
+                    if (cuda_graph_update_required) {
+                        cuda_ctx->metric_add(cuda_ctx->metrics.graph_recapture);
+                    } else {
+                        cuda_ctx->metric_add(cuda_ctx->metrics.graph_reuse);
+                    }
                 }
             }
+        } else {
+            cuda_ctx->metric_add(cuda_ctx->metrics.graph_reset[GGML_CUDA_GRAPH_RESET_INCOMPATIBLE]);
         }
     }
 #endif // USE_CUDA_GRAPH
@@ -4138,8 +4160,40 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+#ifdef GGML_CUDA_USE_NVTX
+    if (nvtx_enabled) {
+        nvtxRangePop();
+    }
+#endif
 
     return GGML_STATUS_SUCCESS;
+}
+
+bool ggml_backend_cuda_get_metrics(ggml_backend_t backend, struct ggml_backend_cuda_metrics * out) {
+    if (!ggml_backend_is_cuda(backend) || out == nullptr) {
+        return false;
+    }
+    *out = ((ggml_backend_cuda_context *) backend->context)->metrics;
+    return true;
+}
+
+bool ggml_backend_cuda_get_metrics_delta(ggml_backend_t backend, const struct ggml_backend_cuda_metrics * baseline, struct ggml_backend_cuda_metrics * out) {
+    if (!ggml_backend_cuda_get_metrics(backend, out) || baseline == nullptr) {
+        return false;
+    }
+    uint64_t * current = &out->mmid_mmvq;
+    const uint64_t * base = &baseline->mmid_mmvq;
+    const size_t count = sizeof(*out) / sizeof(uint64_t);
+    for (size_t i = 0; i < count; ++i) {
+        current[i] = current[i] >= base[i] ? current[i] - base[i] : current[i];
+    }
+    return true;
+}
+
+void ggml_backend_cuda_reset_metrics(ggml_backend_t backend) {
+    if (ggml_backend_is_cuda(backend)) {
+        ((ggml_backend_cuda_context *) backend->context)->metrics = {};
+    }
 }
 
 static void ggml_backend_cuda_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
@@ -5301,6 +5355,15 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_cuda_get_metrics") == 0) {
+        return (void *)ggml_backend_cuda_get_metrics;
+    }
+    if (strcmp(name, "ggml_backend_cuda_get_metrics_delta") == 0) {
+        return (void *)ggml_backend_cuda_get_metrics_delta;
+    }
+    if (strcmp(name, "ggml_backend_cuda_reset_metrics") == 0) {
+        return (void *)ggml_backend_cuda_reset_metrics;
     }
     return nullptr;
 }

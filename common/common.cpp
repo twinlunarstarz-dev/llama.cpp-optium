@@ -1235,11 +1235,8 @@ static void common_validate_sequential_params(const common_params & params) {
             throw std::runtime_error("sequential loading currently requires native CUDA devices");
         }
     }
-    if (!params.use_mmap) {
-        throw std::runtime_error("sequential MVP requires mmap");
-    }
-    if (params.use_direct_io) {
-        throw std::runtime_error("sequential MVP does not support direct I/O");
+    if (!params.use_mmap && !params.use_direct_io) {
+        throw std::runtime_error("sequential loading requires mmap or direct I/O");
     }
     if (params.use_mlock) {
         throw std::runtime_error("sequential MVP does not support mlock");

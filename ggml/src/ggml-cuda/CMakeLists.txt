@@ -135,6 +135,11 @@ if (CUDAToolkit_FOUND)
         add_compile_definitions(GGML_CUDA_USE_GRAPHS)
     endif()
 
+    if (GGML_CUDA_NVTX AND TARGET CUDA::nvtx3)
+        target_link_libraries(ggml-cuda PRIVATE CUDA::nvtx3)
+        target_compile_definitions(ggml-cuda PRIVATE GGML_CUDA_USE_NVTX)
+    endif()
+
     if (GGML_CUDA_FORCE_MMQ)
         add_compile_definitions(GGML_CUDA_FORCE_MMQ)
     endif()

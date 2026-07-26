@@ -1550,6 +1550,11 @@ extern "C" {
 
     LLAMA_API struct llama_perf_context_data llama_perf_context      (const struct llama_context * ctx);
     LLAMA_API void                           llama_perf_context_print(const struct llama_context * ctx);
+    // Print scheduler/backend counters collected by the context. This is separate from
+    // llama_perf_context_print() so server request timing can expose backend activity
+    // without duplicating the context-level prompt and generation timing report.
+    LLAMA_API void                           llama_perf_context_print_backend_metrics(const struct llama_context * ctx);
+    LLAMA_API void                           llama_perf_context_reset_backend_metrics(struct llama_context * ctx);
     LLAMA_API void                           llama_perf_context_reset(      struct llama_context * ctx);
 
     // NOTE: the following work only with samplers constructed via llama_sampler_chain_init
