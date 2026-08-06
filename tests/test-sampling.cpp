@@ -158,6 +158,39 @@ static void test_penalties(
     tester.check();
 }
 
+static void test_penalties_clone() {
+    constexpr int32_t penalty_last_n = 4;
+
+    auto * sampler = llama_sampler_init_penalties(penalty_last_n, 1.0f, 1.0f, 0.0f);
+    llama_sampler_accept(sampler, 0);
+    llama_sampler_accept(sampler, 1);
+    llama_sampler_accept(sampler, 0);
+
+    auto * clone = llama_sampler_clone(sampler);
+
+    // Make the clone evict a token that existed before cloning. If token_count is not
+    // cloned together with prev, this creates a negative count and apply() asserts.
+    llama_sampler_accept(clone, 2);
+    llama_sampler_accept(clone, 3);
+
+    std::vector<llama_token_data> data = {
+        { 0, 0.0f, 0.0f },
+        { 1, 0.0f, 0.0f },
+        { 2, 0.0f, 0.0f },
+        { 3, 0.0f, 0.0f },
+    };
+    llama_token_data_array cur_p = { data.data(), data.size(), -1, false };
+    llama_sampler_apply(clone, &cur_p);
+
+    // The last four accepted tokens are 1, 0, 2, 3, each with count one.
+    for (const auto & token : data) {
+        GGML_ASSERT(token.logit == -1.0f);
+    }
+
+    llama_sampler_free(clone);
+    llama_sampler_free(sampler);
+}
+
 static void test_dry(
     const std::vector<float> & probs, const std::vector<llama_token> & last_tokens,
     const std::vector<float> & expected_probs, float dry_multiplier, float dry_base,
@@ -352,6 +385,7 @@ int main(void) {
     test_penalties({0.2f, 0.2f, 0.2f, 0.2f, 0.2f}, {0},             {0.000011f, 0.249997f, 0.249997f, 0.249997f, 0.249997f}, 1.0f, 5.0f, 5.0f);
     test_penalties({0.2f, 0.2f, 0.2f, 0.2f, 0.2f}, {0, 1, 2},       {0.000023f, 0.000023f, 0.000023f, 0.499966f, 0.499966f}, 1.0f, 5.0f, 5.0f);
     test_penalties({0.2f, 0.2f, 0.2f, 0.2f, 0.2f}, {0, 1, 2, 0, 0}, {0.000000f, 0.000023f, 0.000023f, 0.499977f, 0.499977f}, 1.0f, 5.0f, 5.0f);
+    test_penalties_clone();
 
 
     test_dry({0.25f, 0.25f, 0.25f, 0.25f}, {0, 1}, {0.25f, 0.25f, 0.25f, 0.25f}, 1.0f, 1.1f, 2, 4, {});

@@ -35,6 +35,10 @@ add_library(llama
             llama-model-saver.cpp
             llama-model.cpp
             llama-quant.cpp
+            llama-train-quant.cpp
+            llama-train-identity.cpp
+            llama-train-state.cpp
+            llama-train-checkpoint.cpp
             llama-sampler.cpp
             llama-vocab.cpp
             unicode-data.cpp
@@ -54,6 +58,14 @@ target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
+
+# P2: Link OpenSSL for SHA-256 hashing in llama-train-identity.cpp
+if (LLAMA_OPENSSL)
+    find_package(OpenSSL QUIET)
+    if (OPENSSL_FOUND)
+        target_link_libraries(llama PRIVATE OpenSSL::Crypto)
+    endif()
+endif()
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)

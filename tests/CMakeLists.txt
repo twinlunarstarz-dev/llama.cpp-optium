@@ -295,6 +295,14 @@ if (NOT GGML_BACKEND_DL)
     llama_build_and_test(test-quantize-perf.cpp)
     llama_build_and_test(test-rope.cpp)
     llama_build_and_test(test-col2im-1d.cpp)
+
+    # P1: Quantized training primitives (reference/CPU layer)
+    llama_build_and_test(test-train-quant.cpp)
+    target_include_directories(test-train-quant PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+    # P2: State & Checkpointing (stable identity, optimizer state, transactional checkpointing)
+    llama_build_and_test(test-train-state-checkpoint.cpp)
+    target_include_directories(test-train-state-checkpoint PRIVATE ${CMAKE_SOURCE_DIR}/src)
 endif()
 
 # libmtmd
