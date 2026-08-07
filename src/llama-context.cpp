@@ -4198,6 +4198,61 @@ int32_t llama_decode(
 // perf
 //
 
+template<typename F>
+static void llama_backend_for_each_simple(ggml_backend_t backend, const F & fn) {
+    if (ggml_backend_is_meta(backend)) {
+        const size_t n_backends = ggml_backend_meta_n_backends(backend);
+        for (size_t i = 0; i < n_backends; ++i) {
+            fn(ggml_backend_meta_simple_backend(backend, i));
+        }
+        return;
+    }
+
+    fn(backend);
+}
+
+static void llama_backend_print_metrics(ggml_backend_t backend) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+    if (reg == nullptr) {
+        return;
+    }
+
+    using get_metrics_fn = bool (*)(ggml_backend_t, ggml_backend_cuda_metrics *);
+    auto get_metrics = (get_metrics_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_get_metrics");
+    if (get_metrics == nullptr) {
+        return;
+    }
+
+    ggml_backend_cuda_metrics metrics = {};
+    if (get_metrics(backend, &metrics)) {
+        LLAMA_LOG_INFO(
+            "%s: backend=%s mmid(mmvq/mmq/mmf/cpu)=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64
+            " id-roundtrip=%.3fs cuda-graph(reuse/recapture)=%" PRIu64 "/%" PRIu64
+            " resets(new/pointer/topology/update/incompatible)=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64
+            " overflows=%" PRIu64 "\n",
+            __func__, ggml_backend_name(backend), metrics.mmid_mmvq, metrics.mmid_mmq, metrics.mmid_mmf,
+            metrics.mmid_cpu_fallback, metrics.mmid_id_roundtrip_us / 1e6, metrics.graph_reuse,
+            metrics.graph_recapture, metrics.graph_reset[GGML_CUDA_GRAPH_RESET_NEW_KEY],
+            metrics.graph_reset[GGML_CUDA_GRAPH_RESET_POINTER_OR_SHAPE],
+            metrics.graph_reset[GGML_CUDA_GRAPH_RESET_TOPOLOGY],
+            metrics.graph_reset[GGML_CUDA_GRAPH_RESET_UPDATE_FAILURE],
+            metrics.graph_reset[GGML_CUDA_GRAPH_RESET_INCOMPATIBLE], metrics.counter_overflow);
+    }
+}
+
+static void llama_backend_reset_metrics(ggml_backend_t backend) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+    if (reg == nullptr) {
+        return;
+    }
+
+    using reset_metrics_fn = void (*)(ggml_backend_t);
+    auto reset_metrics = (reset_metrics_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_reset_metrics");
+    if (reset_metrics != nullptr) {
+        reset_metrics(backend);
+    }
+}
+
 llama_perf_context_data llama_perf_context(const llama_context * ctx) {
     llama_perf_context_data data = {};
 
@@ -4232,28 +4287,7 @@ void llama_perf_context_print_backend_metrics(const llama_context * ctx) {
 
         for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
             ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
-            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
-            using get_metrics_fn = bool (*)(ggml_backend_t, ggml_backend_cuda_metrics *);
-            auto get_metrics = (get_metrics_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_get_metrics");
-            if (get_metrics == nullptr) {
-                continue;
-            }
-
-            ggml_backend_cuda_metrics metrics = {};
-            if (get_metrics(backend, &metrics)) {
-                LLAMA_LOG_INFO(
-                    "%s: backend=%s mmid(mmvq/mmq/mmf/cpu)=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64
-                    " id-roundtrip=%.3fs cuda-graph(reuse/recapture)=%" PRIu64 "/%" PRIu64
-                    " resets(new/pointer/topology/update/incompatible)=%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64
-                    " overflows=%" PRIu64 "\n",
-                    __func__, ggml_backend_name(backend), metrics.mmid_mmvq, metrics.mmid_mmq, metrics.mmid_mmf,
-                    metrics.mmid_cpu_fallback, metrics.mmid_id_roundtrip_us / 1e6, metrics.graph_reuse,
-                    metrics.graph_recapture, metrics.graph_reset[GGML_CUDA_GRAPH_RESET_NEW_KEY],
-                    metrics.graph_reset[GGML_CUDA_GRAPH_RESET_POINTER_OR_SHAPE],
-                    metrics.graph_reset[GGML_CUDA_GRAPH_RESET_TOPOLOGY],
-                    metrics.graph_reset[GGML_CUDA_GRAPH_RESET_UPDATE_FAILURE],
-                    metrics.graph_reset[GGML_CUDA_GRAPH_RESET_INCOMPATIBLE], metrics.counter_overflow);
-            }
+            llama_backend_for_each_simple(backend, llama_backend_print_metrics);
         }
     }
 }
@@ -4264,12 +4298,7 @@ void llama_perf_context_reset_backend_metrics(llama_context * ctx) {
         ggml_backend_sched_reset_transient_metrics(sched);
         for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
             ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
-            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
-            using reset_metrics_fn = void (*)(ggml_backend_t);
-            auto reset_metrics = (reset_metrics_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_reset_metrics");
-            if (reset_metrics != nullptr) {
-                reset_metrics(backend);
-            }
+            llama_backend_for_each_simple(backend, llama_backend_reset_metrics);
         }
     }
 }

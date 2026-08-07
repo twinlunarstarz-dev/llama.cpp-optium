@@ -200,6 +200,11 @@ extern "C" {
     GGML_API ggml_backend_dev_t ggml_backend_reg_dev_get(ggml_backend_reg_t reg, size_t index);
     GGML_API void *             ggml_backend_reg_get_proc_address(ggml_backend_reg_t reg, const char * name);
 
+    // Composite backends expose their constituent backends for operations that are implemented by a backend registry.
+    GGML_API bool           ggml_backend_is_meta               (ggml_backend_t backend);
+    GGML_API size_t         ggml_backend_meta_n_backends       (ggml_backend_t meta_backend);
+    GGML_API ggml_backend_t ggml_backend_meta_simple_backend   (ggml_backend_t meta_backend, size_t index);
+
     // Common functions that may be obtained using ggml_backend_reg_get_proc_address
 
     // Context management and operations for faster communication between backends, used for tensor parallelism (meta backend)

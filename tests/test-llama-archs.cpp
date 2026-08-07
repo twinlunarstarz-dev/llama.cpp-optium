@@ -301,6 +301,8 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     if (!lctx) {
         throw std::runtime_error("failed to create llama context");
     }
+    llama_perf_context_reset_backend_metrics(lctx.get());
+    llama_perf_context_print_backend_metrics(lctx.get());
     return std::make_pair(std::move(model), std::move(lctx));
 }
 
