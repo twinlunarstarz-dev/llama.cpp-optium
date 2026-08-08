@@ -1012,22 +1012,30 @@ static bool ggml_backend_cuda_comm_allreduce_nccl(
     }
 
     // For small tensors, simply reduce them as FP32.
-    // The following heuristic for how "small" a tensor should be is based on RTX 4090s connected via 16x PCIe 4.0.
-    if ((n_backends <= 2 && ne < 32768) || (n_backends == 3 && ne < 131072) || (n_backends >= 4 && ne < 262144)) {
-        for (size_t i = 0; i < n_backends; ++i) {
-            if ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
-                ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
-                ggml_cuda_set_device(cuda_ctx->device);
-                CUDA_CHECK(cudaMemsetAsync(tensors[i]->data, 0, ggml_nbytes(tensors[i]), cuda_ctx->stream()));
+    // The hardcoded heuristics below were tuned for RTX 4090s on PCIe 4.0;
+    // override via GGML_CUDA_NCCL_BF16_THRESHOLD (element count) to adapt
+    // to your own topology -- a value of 0 disables the FP32-fast path.
+    {
+        static const char * e = getenv("GGML_CUDA_NCCL_BF16_THRESHOLD");
+        static const int64_t t = (e && e[0]) ? std::stoll(e) : -1;
+        const int64_t threshold = (t >= 0) ? t :
+            ((n_backends <= 2) ? 32768 : ((n_backends == 3) ? 131072 : 262144));
+        if (ne < threshold) {
+            for (size_t i = 0; i < n_backends; ++i) {
+                if ((tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
+                    ggml_cuda_set_device(cuda_ctx->device);
+                    CUDA_CHECK(cudaMemsetAsync(tensors[i]->data, 0, ggml_nbytes(tensors[i]), cuda_ctx->stream()));
+                }
             }
+            NCCL_CHECK(ncclGroupStart());
+            for (size_t i = 0; i < n_backends; ++i) {
+                ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
+                NCCL_CHECK(ncclAllReduce(tensors[i]->data, tensors[i]->data, ne, ncclFloat, ncclSum, comm_ctx->comms[i], cuda_ctx->stream()));
+            }
+            NCCL_CHECK(ncclGroupEnd());
+            return true;
         }
-        NCCL_CHECK(ncclGroupStart());
-        for (size_t i = 0; i < n_backends; ++i) {
-            ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
-            NCCL_CHECK(ncclAllReduce(tensors[i]->data, tensors[i]->data, ne, ncclFloat, ncclSum, comm_ctx->comms[i], cuda_ctx->stream()));
-        }
-        NCCL_CHECK(ncclGroupEnd());
-        return true;
     }
 
     // For large tensors it's faster to compress them to BF16 for the reduction:

@@ -70,10 +70,14 @@ static __device__ __forceinline__ int ggml_cuda_ar_signal_get(const int * p) {
 // false-sharing stalls on the polling GPU.
 static constexpr size_t GGML_CUDA_AR_ARRIVAL_STRIDE = 64;
 
-// Number of blocks the chunked kernel launches with.  Each block stripes a
-// disjoint slice of the data and synchronizes through its own arrival-token
-// slot so multiple SMs can pump PCIe stores in parallel.
+// Fixed compile-time block count used to size the arrival ring (it must be a
+// constant because the ring is allocated once at init).  The actual launch
+// count may differ at runtime if GGML_CUDA_AR_KERNEL_BLOCKS is set.
 static constexpr int GGML_CUDA_AR_KERNEL_BLOCKS = 8;
+
+// Default runtime launch count: fewer blocks = less spin-wait waste during
+// decode (small tensors, latency-sensitive); prefill can raise via env var.
+static constexpr int GGML_CUDA_AR_KERNEL_BLOCKS_DEFAULT = 4;
 
 // ---------------------------------------------------------------------------
 // Chunked kernel AllReduce -- 2 GPUs, supports float, half, and bfloat16.
@@ -221,13 +225,11 @@ static __global__ void ggml_cuda_ar_add_kernel(
 // Pipeline structure
 // ---------------------------------------------------------------------------
 
-// Number of slots in the event / arrival ring.  Two slots is sufficient:
-// lockstep guarantees the two GPUs are at most one AR (or chunk) apart, so
-// slot[N%2] is always safe to reuse -- peer has already consumed slot[N%2]
-// from AR N-2 by the time we get to AR N.  acquire_slot's
-// cudaEventSynchronize on ev.ker for both devices makes that consumption
-// explicit before we overwrite host_buf[slot] for the new AR.
-static constexpr int GGML_CUDA_AR_POOL_SIZE = 2;
+// Number of slots in the event / arrival ring.  Four slots lets the CPU
+// submit work ahead of the GPUs without stalling: slot N can be acquired as
+// soon as AR N-4 finished, which is checked via a device-side event
+// dependency rather than a host-blocking cudaEventSynchronize.
+static constexpr int GGML_CUDA_AR_POOL_SIZE = 4;
 
 // Maximum chunk size (bytes per GPU) handled by one chunked kernel launch.
 // Larger tensors are reduced by issuing multiple chunked launches.
@@ -304,6 +306,7 @@ struct ggml_cuda_ar_pipeline {
     size_t   copy_threshold;
     size_t   copy_chunk_bytes;
     size_t   bf16_threshold; // tensors >= this size (bytes) are reduced via FP32->BF16 round-trip; 0 disables
+    int      ar_blocks;      // block count for the chunked kernel (env: GGML_CUDA_AR_KERNEL_BLOCKS)
     uint64_t call_count;
 
     // Per-device resources.
@@ -358,18 +361,31 @@ struct ggml_cuda_ar_slot_info {
 };
 
 static ggml_cuda_ar_slot_info ggml_cuda_ar_acquire_slot(ggml_cuda_ar_pipeline * p) {
-    const int  slot        = static_cast<int>(p->call_count % GGML_CUDA_AR_POOL_SIZE);
-    const bool pool_lapped = p->call_count >= GGML_CUDA_AR_POOL_SIZE;
-    p->call_count++;
+    const uint64_t call  = p->call_count++;
+    const int      slot  = static_cast<int>(call % GGML_CUDA_AR_POOL_SIZE);
 
-    if (pool_lapped) {
+    // Record ev.ker early (before this AR's work) so the next acquire that
+    // wraps around this slot can see "previous AR finished" via a device-side
+    // wait instead of blocking the CPU.  Re-recording an already-recorded
+    // event is safe and cheap.
+    for (int i = 0; i < p->n_devices; ++i) {
+        ggml_cuda_set_device(p->devices[i]);
+        CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].ker, p->streams[i]));
+    }
+
+    // Slot N may be reused as soon as AR N-POOL_SIZE completed.  Enforce that
+    // with a device-side dependency so the CPU never blocks.
+    if (call >= GGML_CUDA_AR_POOL_SIZE) {
+        const int prev = static_cast<int>((call - GGML_CUDA_AR_POOL_SIZE) %
+                                          GGML_CUDA_AR_POOL_SIZE);
         for (int i = 0; i < p->n_devices; ++i) {
             ggml_cuda_set_device(p->devices[i]);
-            CUDA_CHECK(cudaEventSynchronize(p->ev_pool[i][slot].ker));
+            CUDA_CHECK(cudaStreamWaitEvent(p->streams[i],
+                                           p->ev_pool[i][prev].ker, 0));
         }
     }
 
-    return { slot, (int) p->call_count };
+    return { slot, static_cast<int>(call + 1) };
 }
 
 // Per-AR copy-engine chunk size: env-var override if set, else heuristic
@@ -424,10 +440,16 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
                       __func__, p->copy_chunk_bytes, GGML_CUDA_AR_COPY_CHUNK_BYTES_MIN);
         p->copy_chunk_bytes = GGML_CUDA_AR_COPY_CHUNK_BYTES_MIN;
     }
-    // Default 1: BF16 round-trip is always on for F32 inputs (any non-zero
-    // ne).  Set GGML_CUDA_AR_BF16_THRESHOLD=0 to disable, or to a larger
-    // byte threshold to opt out for small tensors.
-    p->bf16_threshold   = ggml_cuda_ar_env_u64("GGML_CUDA_AR_BF16_THRESHOLD", 1);
+    // BF16 round-trip: default is 64 KB so decode's tiny F32 collectives
+    // skip the two extra conversion kernels (F32->BF16 and back).  Older
+    // default of 1 (always-on) adds launch overhead that hurts TG more than
+    // it helps for small tensors.  Set to 0 to disable, or 1 to restore the
+    // old always-on behavior.
+    p->bf16_threshold   = ggml_cuda_ar_env_u64("GGML_CUDA_AR_BF16_THRESHOLD", 65536);
+
+    // Kernel block count: fewer blocks = less spin-wait thread waste during
+    // decode (small tensors, latency-sensitive).  Prefill can raise this.
+    p->ar_blocks        = (int) ggml_cuda_ar_env_u64("GGML_CUDA_AR_KERNEL_BLOCKS", GGML_CUDA_AR_KERNEL_BLOCKS_DEFAULT);
     for (size_t i = 0; i < n_devices; ++i) {
         p->devices[i] = devices[i];
     }
@@ -916,8 +938,12 @@ bool ggml_cuda_ar_allreduce(
                     CUDA_CHECK(cudaMemsetAsync(data, 0, chunk_dst_bytes, stream));
                 }
 
+                // Capture block count before the macro, since macros expand
+                // textually and can't dereference p->ar_blocks themselves.
+                const int ar_blocks = p->ar_blocks;
+
 #define LAUNCH_AR_KERNEL(T_dst, T_wire) \
-                ggml_cuda_ar_kernel<T_dst, T_wire><<<dim3(GGML_CUDA_AR_KERNEL_BLOCKS), dim3(256), 0, stream>>>( \
+                ggml_cuda_ar_kernel<T_dst, T_wire><<<dim3(ar_blocks), dim3(256), 0, stream>>>( \
                     reinterpret_cast<const T_dst *>(data), \
                     reinterpret_cast<T_dst *>(data), \
                     reinterpret_cast<T_wire *>(p->host_buf[i].dev + (size_t) slot * p->buf_bytes), \
