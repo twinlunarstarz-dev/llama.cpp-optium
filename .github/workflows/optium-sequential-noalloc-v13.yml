@@ -4,13 +4,13 @@ on:
   pull_request:
     branches: [master]
     paths:
-      - .github/OPTIUM_SEQUENTIAL_REPAIR_V12
+      - .github/OPTIUM_COMPAT_V13
 
 permissions:
   contents: write
 
 concurrency:
-  group: optium-sequential-port-integration
+  group: optium-sequential-compat-v13
   cancel-in-progress: true
 
 jobs:
