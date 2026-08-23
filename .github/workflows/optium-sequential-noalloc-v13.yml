@@ -1,10 +1,10 @@
-name: Optium sequential NO_ALLOC compatibility v13
+name: Optium sequential allocation compatibility v13
 
 on:
   pull_request:
     branches: [master]
     paths:
-      - .github/OPTIUM_SEQUENTIAL_NOALLOC_V13
+      - .github/OPTIUM_SEQUENTIAL_REPAIR_V12
 
 permissions:
   contents: write
@@ -81,7 +81,7 @@ jobs:
         run: |
           set -euo pipefail
           {
-            echo '# Sequential NO_ALLOC compatibility validation'; echo
+            echo '# Sequential allocation compatibility validation'; echo
             echo '- driver: v13'
             echo "- configure rc: $(cat /tmp/configure.rc)"
             echo "- build rc: $(cat /tmp/build.rc)"
@@ -97,5 +97,5 @@ jobs:
             fi
           } > integration/VALIDATION.md
           git add integration/VALIDATION.md
-          git commit -m 'test: record sequential NO_ALLOC compatibility validation'
+          git commit -m 'test: record sequential allocation compatibility validation'
           git push origin HEAD:opt/cuda-sequential-integration-2026-08-22
