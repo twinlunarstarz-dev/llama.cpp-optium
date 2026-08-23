@@ -4,6 +4,8 @@
 
 #include "ggml-backend.h"
 
+#include <stdint.h>
+
 #ifdef  __cplusplus
 extern "C" {
 #endif
@@ -13,6 +15,16 @@ extern "C" {
     // Internal scheduler observability. Callers must serialize snapshots with
     // all other scheduler operations. These definitions are not a stable API.
     #define GGML_BACKEND_SCHED_TRANSIENT_MAX_BACKENDS 16
+    #define GGML_BACKEND_SCHED_SPLIT_HISTOGRAM_BUCKETS 8
+
+    enum ggml_backend_sched_split_reason {
+        GGML_BACKEND_SCHED_SPLIT_BACKEND_TRANSITION = 0,
+        GGML_BACKEND_SCHED_SPLIT_INCOMPATIBLE_BUFFER_OP,
+        GGML_BACKEND_SCHED_SPLIT_INPUT_LIMIT,
+        GGML_BACKEND_SCHED_SPLIT_SEQUENTIAL_BYTE_CAP,
+        GGML_BACKEND_SCHED_SPLIT_EXPLICIT_MANUAL,
+        GGML_BACKEND_SCHED_SPLIT_REASON_COUNT,
+    };
 
     enum ggml_backend_sched_transient_drain_reason {
         GGML_BACKEND_SCHED_TRANSIENT_DRAIN_NORMAL = 0,
@@ -57,7 +69,11 @@ extern "C" {
         uint64_t uploaded_backend_bytes;
         uint64_t upload_count;
         uint64_t upload_chunk_count;
+        uint64_t upload_submission_time_us;
         size_t max_upload_chunk_bytes;
+        uint64_t staged_upload_chunk_count;
+        uint64_t staged_upload_bytes;
+        size_t staging_buffer_bytes;
         uint64_t transfer_completion_wait_count;
         uint64_t transfer_completion_wait_us;
         uint64_t compute_completion_wait_count;
@@ -71,8 +87,29 @@ extern "C" {
         uint64_t residency_eviction_count;
         uint64_t residency_fallback_count;
         uint64_t residency_drain_count;
+        uint64_t compact_physical_bytes;
+        uint64_t compact_avoided_full_allocation_bytes;
+        uint64_t compact_expert_hit_count;
+        uint64_t compact_expert_miss_count;
+        uint64_t compact_expert_eviction_count;
+        uint64_t compact_fallback_count;
+        uint64_t compact_remap_stall_count;
+        uint64_t compact_remap_stall_us;
         uint64_t drain_count[GGML_BACKEND_SCHED_TRANSIENT_DRAIN_REASON_COUNT];
         uint64_t drain_time_us[GGML_BACKEND_SCHED_TRANSIENT_DRAIN_REASON_COUNT];
+        uint64_t split_reason_count[GGML_BACKEND_SCHED_SPLIT_REASON_COUNT];
+        uint64_t split_nodes_count;
+        uint64_t split_nodes_max;
+        uint64_t split_nodes_histogram[GGML_BACKEND_SCHED_SPLIT_HISTOGRAM_BUCKETS];
+        uint64_t split_weight_bytes_count;
+        uint64_t split_weight_bytes_total;
+        uint64_t split_weight_bytes_max;
+        uint64_t split_weight_bytes_histogram[GGML_BACKEND_SCHED_SPLIT_HISTOGRAM_BUCKETS];
+        uint64_t mmap_minor_faults;
+        uint64_t mmap_major_faults;
+        uint64_t mmap_readahead_calls;
+        uint64_t mmap_readahead_bytes;
+        uint64_t mmap_readahead_time_us;
     };
 
     struct ggml_backend_sched_transient_metrics {
@@ -95,6 +132,12 @@ extern "C" {
 
     GGML_API bool ggml_backend_sched_get_transient_metrics(
             ggml_backend_sched_t sched, struct ggml_backend_sched_transient_metrics * out);
+    GGML_API bool ggml_backend_sched_get_transient_metrics_delta(
+            ggml_backend_sched_t sched,
+            const struct ggml_backend_sched_transient_metrics * baseline,
+            struct ggml_backend_sched_transient_metrics * out);
+    GGML_API void ggml_backend_sched_reset_transient_metrics(ggml_backend_sched_t sched);
+    GGML_API void ggml_backend_sched_test_counter_add(ggml_backend_sched_t sched, uint64_t * counter, uint64_t value);
 
     //
     // Backend buffer type
@@ -174,12 +217,8 @@ extern "C" {
     // Backend (meta)
     //
 
-    GGML_API bool ggml_backend_is_meta       (ggml_backend_t backend);
     GGML_API bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf);
     GGML_API bool ggml_backend_buft_is_meta  (ggml_backend_buffer_type_t buft);
-
-    GGML_API size_t         ggml_backend_meta_n_backends    (ggml_backend_t meta_backend);
-    GGML_API ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index);
 
     // temporary workaround to statically allocate tensors from a context in a deduplicated way:
     GGML_API struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struct ggml_context * ctx, ggml_backend_buffer_type_t buft);
