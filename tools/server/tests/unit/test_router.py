@@ -596,6 +596,12 @@ def test_router_delete_model():
     assert MODEL_DOWNLOAD_ID not in ids, f"{MODEL_DOWNLOAD_ID} still present after deletion"
 
 
+def _get_model_entry(model_id: str) -> dict:
+    res = server.make_request("GET", "/models")
+    assert res.status_code == 200
+    return next(item for item in res.body["data"] if item["id"] == model_id)
+
+
 def test_router_models_preset_sequential_load():
     """Legacy sequential_load is canonicalized without changing router capacity."""
     global server
@@ -607,6 +613,9 @@ def test_router_models_preset_sequential_load():
             "[model-seq]\n"
             "hf-repo = ggml-org/test-model-stories260K\n"
             "sequential_load = true\n"
+            "device = CUDA0\n"
+            "alias = seq-alias\n"
+            "ctx-size = 128\n"
         )
 
     server.models_preset = preset_path
@@ -615,8 +624,8 @@ def test_router_models_preset_sequential_load():
     try:
         entry = _get_model_entry("model-seq")
         args = entry["status"]["args"]
-        assert args.count("--sequential") == 1
-        assert "--sequential-load" not in args
+        assert args.count("--sequential-load") == 1
+        assert "--sequential" not in args
         assert "--no-sequential" not in args
         assert args[args.index("--device") + 1] == "CUDA0"
         # Router CLI values keep their documented precedence over model INI.
@@ -647,7 +656,7 @@ def test_router_sequential_false_or_absent_stays_disabled(sequential_line: str):
         entry = _get_model_entry("model-ordinary")
         args = entry["status"]["args"]
         assert "--sequential" not in args
-        assert args.count("--no-sequential") == (1 if sequential_line else 0)
+        assert args.count("--no-sequential-load") == (1 if sequential_line else 0)
         assert args[args.index("--ctx-size") + 1] == "1024"
         assert "ordinary-alias" in entry["aliases"]
         assert entry["status"]["value"] == "unloaded"
@@ -659,7 +668,7 @@ def test_router_sequential_false_or_absent_stays_disabled(sequential_line: str):
 
 @pytest.mark.parametrize(
     "cli_value,ini_value,expected",
-    [(False, "true", "--no-sequential"), (True, "false", "--sequential")],
+    [(False, "true", "--no-sequential-load"), (True, "false", "--sequential-load")],
 )
 def test_router_sequential_cli_precedence(cli_value: bool, ini_value: str, expected: str):
     preset_path = os.path.join(TMP_DIR, "test_sequential_precedence.ini")
@@ -714,14 +723,20 @@ def test_router_sequential_invalid_device_rejected(device: str | None):
     os.remove(log_path)
 
 
-def test_router_sequential_multi_cuda_device_list_accepted():
+@pytest.mark.parametrize(
+    "device,global_device",
+    [("CUDA0,CUDA1", False), ("CUDA1, CUDA0", False), ("CUDA1, CUDA0", True)],
+)
+def test_router_sequential_multi_cuda_device_list_accepted(device: str, global_device: bool):
     preset_path = os.path.join(TMP_DIR, "test_sequential_multi_cuda.ini")
+    global_section = f"[*]\ndevice = {device}\n\n" if global_device else ""
+    model_device = "" if global_device else f"device = {device}\n"
     with open(preset_path, "w") as f:
-        f.write("[model-seq]\nhf-repo = local/test\nsequential-load = true\ndevice = CUDA0,CUDA1\n")
+        f.write(f"{global_section}[model-seq]\nhf-repo = local/test\nsequential-load = true\n{model_device}")
     server.models_preset = preset_path
     server.start()
     try:
         args = _get_model_entry("model-seq")["status"]["args"]
-        assert args[args.index("--device") + 1] == "CUDA0,CUDA1"
+        assert args[args.index("--device") + 1] == device
     finally:
         os.remove(preset_path)

@@ -363,7 +363,7 @@ static bool is_explicit_cuda_device_list(const std::string & value) {
     size_t begin = 0;
     while (begin < value.size()) {
         const size_t end = value.find(',', begin);
-        const std::string item = value.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
+        const std::string item = string_strip(value.substr(begin, end == std::string::npos ? std::string::npos : end - begin));
         if (item.rfind("CUDA", 0) != 0 || item.size() == 4 ||
                 !std::all_of(item.begin() + 4, item.end(), [](unsigned char c) { return std::isdigit(c); })) {
             return false;

@@ -94,6 +94,8 @@ class ServerProcess:
     models_max: int | None = None
     models_preset: str | None = None
     no_models_autoload: bool | None = None
+    sequential: bool | None = None
+    device: str | None = None
     lora_files: List[str] | None = None
     enable_ctx_shift: int | None = False
     spec_type: str | None = None
@@ -182,6 +184,12 @@ class ServerProcess:
             server_args.extend(["--models-preset", self.models_preset])
         if self.cors_origins:
             server_args.extend(["--cors-origins", self.cors_origins])
+        if self.sequential is True:
+            server_args.append("--sequential")
+        elif self.sequential is False:
+            server_args.append("--no-sequential")
+        if self.device is not None:
+            server_args.extend(["--device", self.device])
         if self.n_batch:
             server_args.extend(["--batch-size", self.n_batch])
         if self.n_ubatch:

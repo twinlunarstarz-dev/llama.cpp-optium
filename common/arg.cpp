@@ -1123,7 +1123,8 @@ static std::vector<ggml_backend_dev_t> parse_device_list(const std::string & val
         devices.push_back(nullptr);
     } else {
         ggml_backend_load_all();
-        for (const auto & device : dev_names) {
+        for (const auto & device_raw : dev_names) {
+            const std::string device = string_strip(device_raw);
             auto * dev = ggml_backend_dev_by_name(device.c_str());
             if (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
                 throw std::invalid_argument(string_format("invalid device: %s", device.c_str()));
@@ -1161,7 +1162,9 @@ void common_print_available_devices() {
 }
 
 void common_params_resolve_devices(common_params & params) {
-    params.devices = parse_device_list(params.device_raw);
+    if (!params.device_raw.empty()) {
+        params.devices = parse_device_list(params.device_raw);
+    }
 }
 
 
