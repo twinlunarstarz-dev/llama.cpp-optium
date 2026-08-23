@@ -5,450 +5,128 @@ def replace_once(path, old, new):
     p = Path(path)
     s = p.read_text()
     if old not in s:
-        raise SystemExit(f'anchor not found in {path}: {old[:100]!r}')
+        raise SystemExit(f'anchor not found in {path}: {old[:120]!r}')
     p.write_text(s.replace(old, new, 1))
 
 
-# Public scheduler API: keep the exact reader for compatibility and add a padded
-# reader so O_DIRECT can target aligned bytes inside a reusable pinned allocation.
-replace_once(
-    'ggml/include/ggml-backend.h',
-    '''    // Optional source reader for storage-backed sequential weights. The callback\n    // copies exactly size bytes from the logical tensor address into dst and\n    // returns true when it handled the address. Unhandled addresses use memcpy.\n    typedef bool (*ggml_backend_sched_weight_read_callback)(\n            void * user_data, const void * logical_src, void * dst, size_t size);\n    GGML_API void                 ggml_backend_sched_set_weight_read_callback(\n            ggml_backend_sched_t sched, ggml_backend_sched_weight_read_callback callback, void * user_data);\n''',
-    '''    // Optional source readers for storage-backed sequential weights. The exact\n    // callback copies size bytes to dst. The padded callback may place those bytes\n    // at data_offset inside a larger destination allocation, which lets aligned\n    // direct I/O read into pinned host memory without an intermediate host copy.\n    typedef bool (*ggml_backend_sched_weight_read_callback)(\n            void * user_data, const void * logical_src, void * dst, size_t size);\n    typedef bool (*ggml_backend_sched_weight_read_padded_callback)(\n            void * user_data, const void * logical_src, void * dst, size_t capacity,\n            size_t size, size_t * data_offset);\n    GGML_API void                 ggml_backend_sched_set_weight_read_callback(\n            ggml_backend_sched_t sched, ggml_backend_sched_weight_read_callback callback, void * user_data);\n    GGML_API void                 ggml_backend_sched_set_weight_read_padded_callback(\n            ggml_backend_sched_t sched, ggml_backend_sched_weight_read_padded_callback callback, void * user_data);\n''')
-
-# Model exposes whether its sequential logical pointers are storage identities
-# rather than directly readable mmap addresses.
-replace_once(
-    'src/llama-model.h',
-    '''    bool is_sequential() const;\n    bool read_sequential_weight(const void * logical_src, void * dst, size_t size) const;\n''',
-    '''    bool is_sequential() const;\n    bool is_sequential_direct_io() const;\n    bool read_sequential_weight(const void * logical_src, void * dst, size_t size) const;\n''')
-replace_once(
-    'src/llama-model.cpp',
-    '''bool llama_model::is_sequential() const {\n    return pimpl->sequential_load;\n}\n\n\nbool llama_model::read_sequential_weight''',
-    '''bool llama_model::is_sequential() const {\n    return pimpl->sequential_load;\n}\n\nbool llama_model::is_sequential_direct_io() const {\n    return pimpl->sequential_load && !pimpl->direct_io_regions.empty();\n}\n\nbool llama_model::read_sequential_weight''')
-
-# Scheduler storage/pinned state: four reusable slots, one storage task per slot,
-# and a proper C++ object lifetime for std::thread members.
+# Remove the fixed dense/expert cache percentages. Residency now uses the whole
+# measured post-reservation weight window and globally evicts the coldest completed
+# entry until the current allocation passes both the ownership and live-memory guards.
 replace_once(
     'ggml/src/ggml-backend.cpp',
-    '''using ggml_backend_sched_resident_map = std::unordered_map<\n    ggml_backend_sched_resident_key, ggml_backend_sched_resident, ggml_backend_sched_resident_key_hash>;\n\nstruct ggml_backend_sched_staging {\n    ggml_backend_buffer_t buffers[2];\n    ggml_backend_event_t events[2];\n    size_t capacities[2];\n    bool pending[2];\n    int next;\n};\n\nstruct ggml_backend_sched_storage_prefetch {\n    std::thread worker;\n    std::vector<uint8_t> data;\n    const uint8_t * logical_src;\n    size_t size;\n    size_t consumed;\n    bool active;\n    bool success;\n};\n''',
-    '''using ggml_backend_sched_resident_map = std::unordered_map<\n    ggml_backend_sched_resident_key, ggml_backend_sched_resident, ggml_backend_sched_resident_key_hash>;\n\nstatic constexpr int GGML_BACKEND_SCHED_STAGING_SLOTS = 4;\nstatic constexpr size_t GGML_BACKEND_SCHED_STORAGE_PADDING = (size_t) 2 * 1024 * 1024;\n\nstruct ggml_backend_sched_staging {\n    ggml_backend_buffer_t buffers[GGML_BACKEND_SCHED_STAGING_SLOTS];\n    ggml_backend_event_t events[GGML_BACKEND_SCHED_STAGING_SLOTS];\n    size_t capacities[GGML_BACKEND_SCHED_STAGING_SLOTS];\n    bool pending[GGML_BACKEND_SCHED_STAGING_SLOTS];\n    bool reserved[GGML_BACKEND_SCHED_STAGING_SLOTS];\n    int next;\n};\n\nstruct ggml_backend_sched_storage_prefetch {\n    std::thread worker;\n    const uint8_t * logical_src;\n    size_t size;\n    size_t data_offset;\n    int split_id;\n    int input_id;\n    bool active;\n    bool success;\n};\n''')
+    '''static bool ggml_backend_sched_make_resident_space(\n        ggml_backend_sched_t sched, int backend_id, size_t request, bool expert_tier) {\n    const size_t window = sched->weight_window_limit[backend_id];\n    // Keep dense/recurrent weights and compact expert slabs in independent tiers. A\n    // scan-resistant dense tier is deliberately not evicted by a one-use cyclic\n    // stream: once admitted, its stable subset produces hits on every later token.\n    // Expert slabs retain LFU/LRU replacement because their active set is dynamic.\n    const bool partitioned = window >= (size_t) 1024 * 1024 * 1024;\n    // Reserve half of the window for the currently executing split. DeepSeek V4\n    // has individual sequential allocations above 2 GiB on a roughly 4 GiB\n    // CUDA0 window, so filling most of the window with cache makes forward\n    // progress impossible even though cache admission itself succeeded.\n    const size_t tier_limit = !partitioned ? window :\n        (expert_tier ? window / 10 : (window * 4) / 10);\n    while (true) {\n        size_t tier_owned = 0;\n        for (const auto & entry : *sched->residents) {\n            const auto & resident = entry.second;\n            if (resident.backend_id == backend_id && resident.expert_tier == expert_tier) {\n                tier_owned += resident.allocation_size;\n            }\n        }\n        if (request <= tier_limit && tier_owned <= tier_limit - request) {\n            bool unknown = false;\n            bool live_rejected = false;\n            return ggml_backend_sched_weight_window_admit(sched, backend_id, request, &unknown, &live_rejected);\n        }\n        if (partitioned && !expert_tier) {\n            return false;\n        }\n        auto victim = sched->residents->end();\n        for (auto it = sched->residents->begin(); it != sched->residents->end(); ++it) {\n            if (it->second.backend_id == backend_id && it->second.expert_tier == expert_tier && !it->second.executing &&\n                    (victim == sched->residents->end() || it->second.frequency < victim->second.frequency ||\n                     (it->second.frequency == victim->second.frequency &&\n                      it->second.completed_use < victim->second.completed_use))) {\n                victim = it;\n            }\n        }\n        if (victim == sched->residents->end()) {\n            return false;\n        }\n        ggml_backend_sched_evict_resident(sched, victim);\n    }\n}\n''',
+    '''static bool ggml_backend_sched_make_resident_space(\n        ggml_backend_sched_t sched, int backend_id, size_t request) {\n    const size_t window = sched->weight_window_limit[backend_id];\n    if (!sched->weight_window_configured[backend_id] || !sched->weight_window_memory_valid[backend_id] ||\n            request == 0 || request > window) {\n        return false;\n    }\n    while (true) {\n        bool unknown = false;\n        bool live_rejected = false;\n        if (ggml_backend_sched_weight_window_admit(\n                sched, backend_id, request, &unknown, &live_rejected)) {\n            return true;\n        }\n        if (unknown) {\n            return false;\n        }\n\n        // Dense weights and expert slabs share one global budget. Frequency first\n        // makes repeated dense weights scan-resistant, while completed-use breaks\n        // ties in LRU order for the changing MoE active set. Executing entries are\n        // part of the current working set and are never eviction candidates.\n        auto victim = sched->residents->end();\n        for (auto it = sched->residents->begin(); it != sched->residents->end(); ++it) {\n            if (it->second.backend_id != backend_id || it->second.executing) {\n                continue;\n            }\n            if (victim == sched->residents->end() || it->second.frequency < victim->second.frequency ||\n                    (it->second.frequency == victim->second.frequency &&\n                     it->second.completed_use < victim->second.completed_use)) {\n                victim = it;\n            }\n        }\n        if (victim == sched->residents->end()) {\n            return false;\n        }\n        ggml_backend_sched_evict_resident(sched, victim);\n    }\n}\n''')
 replace_once(
     'ggml/src/ggml-backend.cpp',
-    '''    ggml_backend_sched_weight_read_callback weight_read_callback;\n    void * weight_read_callback_user_data;\n''',
-    '''    ggml_backend_sched_weight_read_callback weight_read_callback;\n    ggml_backend_sched_weight_read_padded_callback weight_read_padded_callback;\n    void * weight_read_callback_user_data;\n''')
+    '''            const bool resident_admitted = cache_eligible && alloc_size > 0 &&\n                ggml_backend_sched_make_resident_space(sched, split_backend_id, alloc_size, expert_tier);\n''',
+    '''            const bool resident_admitted = cache_eligible && alloc_size > 0 &&\n                ggml_backend_sched_make_resident_space(sched, split_backend_id, alloc_size);\n''')
+
+# Coalesce compact expert misses when both source expert ids and destination slots
+# are adjacent. This converts many small storage/H2D operations into one contiguous
+# transfer without changing the compact slot layout.
 replace_once(
     'ggml/src/ggml-backend.cpp',
-    '''    struct ggml_backend_sched_staging staging[GGML_SCHED_MAX_BACKENDS];\n    struct ggml_backend_sched_storage_prefetch storage_prefetch[GGML_SCHED_MAX_BACKENDS];\n''',
-    '''    struct ggml_backend_sched_staging staging[GGML_SCHED_MAX_BACKENDS];\n    struct ggml_backend_sched_storage_prefetch\n        storage_prefetch[GGML_SCHED_MAX_BACKENDS][GGML_BACKEND_SCHED_STAGING_SLOTS];\n''')
+    '''                        for (size_t compact_id = 0; compact_id < compact_experts.size(); ++compact_id) {\n                            if (!compact_misses[compact_id]) {\n                                continue;\n                            }\n                            const size_t src_offset = (size_t) compact_experts[compact_id] * expert_size;\n                            const size_t dst_offset = (size_t) compact_slots[compact_id] * expert_size;\n                            // Every compact slot contains a complete expert, so there is no unused\n                            // inter-slot padding to initialize. Extending this copy according to the\n                            // destination slot can read past a final source expert and overwrite the\n                            // following resident slot when source and destination orders differ.\n                            ggml_backend_sched_weight_upload_chunked(sched, split_backend, split_backend_id,\n                                input_cpy, (const uint8_t *) input->data + src_offset, dst_offset,\n                                expert_size, split->input_transient[input_id]);\n                        }\n''',
+    '''                        for (size_t compact_id = 0; compact_id < compact_experts.size();) {\n                            if (!compact_misses[compact_id]) {\n                                ++compact_id;\n                                continue;\n                            }\n                            size_t last = compact_id;\n                            while (last + 1 < compact_experts.size() && compact_misses[last + 1] &&\n                                    compact_experts[last + 1] == compact_experts[last] + 1 &&\n                                    compact_slots[last + 1] == compact_slots[last] + 1) {\n                                ++last;\n                            }\n                            const size_t src_offset = (size_t) compact_experts[compact_id] * expert_size;\n                            const size_t dst_offset = (size_t) compact_slots[compact_id] * expert_size;\n                            const size_t copy_size = (last - compact_id + 1) * expert_size;\n                            ggml_backend_sched_weight_upload_chunked(sched, split_backend, split_backend_id,\n                                input_cpy, (const uint8_t *) input->data + src_offset, dst_offset,\n                                copy_size, split->input_transient[input_id]);\n                            compact_id = last + 1;\n                        }\n''')
 
-# Replace vector-backed one-task prefetch + two-slot staging with direct reads into
-# reserved pinned slots. A prefetch worker may wait on the slot's previous H2D event;
-# that wait happens off the scheduler thread and therefore overlaps GPU compute.
+# Conservative hybrid overflow: before pass 4 propagates backend assignments to
+# sources, move a routed-MoE op to another GPU with sufficient sequential budget,
+# or to CPU as a final fallback, when its worst-case active expert set cannot fit
+# the selected GPU's current weight window. This is only active in forced sequential
+# offload and leaves normal scheduling unchanged.
 p = Path('ggml/src/ggml-backend.cpp')
 s = p.read_text()
-start = s.index('static void ggml_backend_sched_storage_prefetch_finish(')
-end = s.index('static void ggml_backend_sched_weight_upload_chunked(', start)
-new_helpers = r'''static void ggml_backend_sched_storage_prefetch_finish(ggml_backend_sched_storage_prefetch & prefetch) {
-    if (prefetch.worker.joinable()) {
-        prefetch.worker.join();
-    }
-}
-
-static void ggml_backend_sched_storage_prefetch_release(
-        ggml_backend_sched_t sched, int backend_id, int slot) {
-    auto & task = sched->storage_prefetch[backend_id][slot];
-    if (!task.active && !task.worker.joinable()) {
-        return;
-    }
-    ggml_backend_sched_storage_prefetch_finish(task);
-    // A storage worker waits for the previous H2D event before touching the slot.
-    // Once joined, that old transfer is complete even when the read itself failed.
-    sched->staging[backend_id].pending[slot] = false;
-    sched->staging[backend_id].reserved[slot] = false;
-    task.active = false;
-    task.success = false;
-    task.logical_src = NULL;
-    task.size = 0;
-    task.data_offset = 0;
-    task.split_id = -1;
-    task.input_id = -1;
-}
-
-static size_t ggml_backend_sched_staging_required_capacity(ggml_backend_sched_t sched, size_t size) {
-    if (sched->weight_read_padded_callback == NULL) {
-        return size;
-    }
-    return size <= SIZE_MAX - GGML_BACKEND_SCHED_STORAGE_PADDING ?
-        size + GGML_BACKEND_SCHED_STORAGE_PADDING : SIZE_MAX;
-}
-
-static void ggml_backend_sched_staging_metrics_update(ggml_backend_sched_t sched, int backend_id) {
-    size_t bytes = 0;
-    for (int slot = 0; slot < GGML_BACKEND_SCHED_STAGING_SLOTS; ++slot) {
-        bytes += sched->staging[backend_id].capacities[slot];
-    }
-    sched->transient_metrics.backends[backend_id].staging_buffer_bytes = bytes;
-}
-
-static bool ggml_backend_sched_staging_prepare(
-        ggml_backend_sched_t sched, int backend_id, int slot, size_t size, bool wait_pending) {
-    auto & staging = sched->staging[backend_id];
-    ggml_backend_t backend = sched->backends[backend_id];
-    if (staging.reserved[slot] || backend->iface.event_record == NULL || staging.events[slot] == NULL) {
-        return false;
-    }
-    const size_t required = ggml_backend_sched_staging_required_capacity(sched, size);
-    if (required == SIZE_MAX) {
-        return false;
-    }
-    if (staging.pending[slot]) {
-        // Prefetch workers can reserve an already-large-enough slot and wait for its
-        // previous H2D event themselves. Reallocation, however, must happen here only
-        // after the prior transfer is complete.
-        if (!wait_pending && staging.capacities[slot] >= required) {
-            return true;
-        }
-        if (!wait_pending) {
-            return false;
-        }
-        ggml_backend_event_synchronize(staging.events[slot]);
-        staging.pending[slot] = false;
-    }
-    if (staging.capacities[slot] >= required) {
-        return true;
-    }
-    ggml_backend_buffer_free(staging.buffers[slot]);
-    staging.buffers[slot] = NULL;
-    staging.capacities[slot] = 0;
-    ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(backend));
-    if (host_buft == NULL) {
-        return false;
-    }
-    staging.buffers[slot] = ggml_backend_buft_alloc_buffer(host_buft, required);
-    if (staging.buffers[slot] == NULL || !ggml_backend_buffer_is_host(staging.buffers[slot])) {
-        ggml_backend_buffer_free(staging.buffers[slot]);
-        staging.buffers[slot] = NULL;
-        return false;
-    }
-    staging.capacities[slot] = ggml_backend_buffer_get_size(staging.buffers[slot]);
-    ggml_backend_sched_staging_metrics_update(sched, backend_id);
-    return staging.capacities[slot] >= required;
-}
-
-static int ggml_backend_sched_staging_acquire(
-        ggml_backend_sched_t sched, int backend_id, size_t size, bool for_prefetch) {
-    auto & staging = sched->staging[backend_id];
-    for (int pass = 0; pass < (for_prefetch ? 1 : 2); ++pass) {
-        for (int n = 0; n < GGML_BACKEND_SCHED_STAGING_SLOTS; ++n) {
-            const int slot = (staging.next + n) % GGML_BACKEND_SCHED_STAGING_SLOTS;
-            if (staging.reserved[slot]) {
+anchor = '    // pass 4: assign backends to remaining src from dst and view_src\n'
+insert = r'''    if (sched->force_weight_offload) {
+        const int cpu_backend_id = sched->n_backends - 1;
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            struct ggml_tensor * node = graph->nodes[i];
+            if (node->op != GGML_OP_MUL_MAT_ID || node->src[0] == NULL || node->src[2] == NULL) {
                 continue;
             }
-            if (pass == 0 && staging.pending[slot] && !for_prefetch) {
+            int * node_backend_id = &tensor_backend_id(node);
+            if (*node_backend_id < 0 || *node_backend_id == cpu_backend_id) {
                 continue;
             }
-            if (!ggml_backend_sched_staging_prepare(sched, backend_id, slot, size, !for_prefetch)) {
+            const ggml_tensor * weights = node->src[0];
+            const ggml_tensor * ids = node->src[2];
+            if (weights->buffer == NULL || !ggml_backend_buffer_is_host(weights->buffer) ||
+                    weights->ne[2] <= 1 || weights->nb[2] == 0 || ids->ne[0] <= 0 || ids->ne[1] <= 0) {
                 continue;
             }
-            staging.reserved[slot] = true;
-            staging.next = (slot + 1) % GGML_BACKEND_SCHED_STAGING_SLOTS;
-            return slot;
-        }
-    }
-    return -1;
-}
-
-static bool ggml_backend_sched_storage_task_exists(
-        ggml_backend_sched_t sched, int backend_id, const uint8_t * logical_src, size_t size) {
-    for (int slot = 0; slot < GGML_BACKEND_SCHED_STAGING_SLOTS; ++slot) {
-        const auto & task = sched->storage_prefetch[backend_id][slot];
-        if (task.active && task.logical_src == logical_src && task.size == size) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static int ggml_backend_sched_storage_prefetch_consume(
-        ggml_backend_sched_t sched, int backend_id, const uint8_t * logical_src, size_t size,
-        const uint8_t ** data) {
-    for (int slot = 0; slot < GGML_BACKEND_SCHED_STAGING_SLOTS; ++slot) {
-        auto & task = sched->storage_prefetch[backend_id][slot];
-        if (!task.active || task.logical_src != logical_src || task.size != size) {
-            continue;
-        }
-        ggml_backend_sched_storage_prefetch_finish(task);
-        auto & staging = sched->staging[backend_id];
-        // The worker waits on the old upload before reading, so the slot is no
-        // longer pending at this point. Keep it reserved until the new H2D is queued.
-        staging.pending[slot] = false;
-        if (!task.success || task.data_offset > staging.capacities[slot] ||
-                size > staging.capacities[slot] - task.data_offset) {
-            staging.reserved[slot] = false;
-            task.active = false;
-            task.success = false;
-            return -1;
-        }
-        *data = (const uint8_t *) ggml_backend_buffer_get_base(staging.buffers[slot]) + task.data_offset;
-        task.active = false;
-        task.success = false;
-        return slot;
-    }
-    return -1;
-}
-
-static bool ggml_backend_sched_read_storage_into_slot(
-        ggml_backend_sched_t sched, int backend_id, int slot,
-        const uint8_t * logical_src, size_t size, const uint8_t ** data) {
-    auto & staging = sched->staging[backend_id];
-    void * base = ggml_backend_buffer_get_base(staging.buffers[slot]);
-    size_t data_offset = 0;
-    bool ok = false;
-    if (sched->weight_read_padded_callback != NULL) {
-        ok = sched->weight_read_padded_callback(sched->weight_read_callback_user_data,
-            logical_src, base, staging.capacities[slot], size, &data_offset);
-    } else if (sched->weight_read_callback != NULL) {
-        ok = sched->weight_read_callback(sched->weight_read_callback_user_data,
-            logical_src, base, size);
-    }
-    if (!ok || data_offset > staging.capacities[slot] || size > staging.capacities[slot] - data_offset) {
-        return false;
-    }
-    *data = (const uint8_t *) base + data_offset;
-    return true;
-}
-
-'''
-s = s[:start] + new_helpers + s[end:]
-p.write_text(s)
-
-# Replace the upload function body through its next helper. This version consumes
-# prefetched pinned slots directly and otherwise reads synchronously into one free
-# pinned slot. No storage-backed path falls back to dereferencing a logical pointer.
-p = Path('ggml/src/ggml-backend.cpp')
-s = p.read_text()
-start = s.index('static void ggml_backend_sched_weight_upload_chunked(')
-end = s.index('static size_t ggml_backend_sched_weight_window_safety_reserve(', start)
-new_upload = r'''static void ggml_backend_sched_weight_upload_chunked(
-        ggml_backend_sched_t sched,
-        ggml_backend_t backend,
-        int backend_id,
-        struct ggml_tensor * dst,
-        const void * src,
-        size_t offset,
-        size_t size,
-        bool instrument) {
-    const uint8_t * src_bytes = (const uint8_t *) src;
-    size_t copied = 0;
-    const int64_t upload_start_us = instrument ? ggml_time_us() : 0;
-    const ggml_backend_sched_fault_sample faults_before = instrument ? ggml_backend_sched_faults() : ggml_backend_sched_fault_sample{};
-    const bool storage_read = sched->weight_read_callback != NULL || sched->weight_read_padded_callback != NULL;
-    if (instrument && !storage_read) {
-        ggml_backend_sched_readahead(sched, backend_id, src, size);
-    }
-    while (copied < size) {
-        const size_t chunk_size = instrument || storage_read ? GGML_BACKEND_SCHED_WEIGHT_UPLOAD_CHUNK_SIZE :
-            (size > GGML_BACKEND_SCHED_WEIGHT_UPLOAD_CHUNK_THRESHOLD ? GGML_BACKEND_SCHED_WEIGHT_UPLOAD_CHUNK_SIZE : size);
-        const size_t chunk = std::min(chunk_size, size - copied);
-        const uint8_t * staged_data = NULL;
-        int slot = storage_read ? ggml_backend_sched_storage_prefetch_consume(
-            sched, backend_id, src_bytes + copied, chunk, &staged_data) : -1;
-        if (slot < 0 && (instrument || storage_read)) {
-            slot = ggml_backend_sched_staging_acquire(sched, backend_id, chunk, false);
-            if (slot >= 0) {
-                auto & staging = sched->staging[backend_id];
-                if (storage_read) {
-                    if (!ggml_backend_sched_read_storage_into_slot(
-                            sched, backend_id, slot, src_bytes + copied, chunk, &staged_data)) {
-                        staging.reserved[slot] = false;
-                        GGML_ASSERT(false && "storage-backed weight callback rejected its logical source");
-                    }
-                } else {
-                    staged_data = (const uint8_t *) ggml_backend_buffer_get_base(staging.buffers[slot]);
-                    memcpy((void *) staged_data, src_bytes + copied, chunk);
-                }
-            }
-        }
-        if (slot >= 0) {
-            auto & staging = sched->staging[backend_id];
-            ggml_backend_tensor_set_async(backend, dst, staged_data, offset + copied, chunk);
-            ggml_backend_event_record(staging.events[slot], backend);
-            staging.pending[slot] = true;
-            staging.reserved[slot] = false;
-            if (instrument) {
-                auto & metrics = sched->transient_metrics.backends[backend_id];
-                ggml_backend_sched_counter_add(sched, &metrics.staged_upload_chunk_count, 1);
-                ggml_backend_sched_counter_add(sched, &metrics.staged_upload_bytes, chunk);
-            }
-        } else {
-            GGML_ASSERT(!storage_read && "storage-backed weights require a scheduler staging slot");
-            ggml_backend_tensor_set_async(backend, dst, src_bytes + copied, offset + copied, chunk);
-        }
-        if (instrument) {
-            auto & metrics = sched->transient_metrics.backends[backend_id];
-            ggml_backend_sched_counter_add(sched, &metrics.upload_chunk_count, 1);
-            ggml_backend_sched_counter_add(sched, &metrics.uploaded_logical_bytes, chunk);
-            metrics.max_upload_chunk_bytes = std::max(metrics.max_upload_chunk_bytes, chunk);
-        }
-        copied += chunk;
-    }
-    if (instrument) {
-        const ggml_backend_sched_fault_sample faults_after = ggml_backend_sched_faults();
-        auto & metrics = sched->transient_metrics.backends[backend_id];
-        ggml_backend_sched_counter_add(sched, &metrics.mmap_minor_faults,
-            faults_after.minor >= faults_before.minor ? faults_after.minor - faults_before.minor : 0);
-        ggml_backend_sched_counter_add(sched, &metrics.mmap_major_faults,
-            faults_after.major >= faults_before.major ? faults_after.major - faults_before.major : 0);
-        ggml_backend_sched_counter_add(sched,
-            &metrics.upload_submission_time_us,
-            ggml_backend_sched_elapsed_us(upload_start_us));
-    }
-}
-
-'''
-s = s[:start] + new_upload + s[end:]
-p.write_text(s)
-
-# Replace the one-split/vector storage prefetch function with a bounded three-task
-# lookahead per backend. Each task reads one scheduler upload chunk directly into
-# its reserved pinned slot.
-p = Path('ggml/src/ggml-backend.cpp')
-s = p.read_text()
-start = s.index('static void ggml_backend_sched_prefetch_storage_input(')
-end = s.index('// assigns backends to ops and splits the graph into subgraphs', start)
-new_prefetch = r'''static int ggml_backend_sched_storage_prefetch_active_count(ggml_backend_sched_t sched, int backend_id) {
-    int count = 0;
-    for (int slot = 0; slot < GGML_BACKEND_SCHED_STAGING_SLOTS; ++slot) {
-        count += sched->storage_prefetch[backend_id][slot].active ? 1 : 0;
-    }
-    return count;
-}
-
-static void ggml_backend_sched_prefetch_storage_inputs(ggml_backend_sched_t sched, int start_split_id) {
-    if (!sched->async_weight_prefetch ||
-            (sched->weight_read_callback == NULL && sched->weight_read_padded_callback == NULL) ||
-            start_split_id < 0 || start_split_id >= sched->n_splits) {
-        return;
-    }
-
-    const int max_active = GGML_BACKEND_SCHED_STAGING_SLOTS - 1;
-    for (int split_id = start_split_id; split_id < sched->n_splits; ++split_id) {
-        auto * split = &sched->splits[split_id];
-        const int backend_id = split->backend_id;
-        if (ggml_backend_sched_storage_prefetch_active_count(sched, backend_id) >= max_active) {
-            continue;
-        }
-        for (int input_id = 0; input_id < split->n_inputs; ++input_id) {
-            ggml_tensor * input = split->inputs[input_id];
-            ggml_tensor * input_cpy = tensor_copy(input, backend_id, 0);
-            if (!split->input_transient[input_id] ||
-                    ggml_backend_sched_split_input_is_moe(split, input_id, input_cpy) ||
-                    input == NULL || input->data == NULL || input_cpy == NULL) {
+            const uint64_t n_ids = (uint64_t) ids->ne[0] > UINT64_MAX / (uint64_t) ids->ne[1] ?
+                UINT64_MAX : (uint64_t) ids->ne[0] * (uint64_t) ids->ne[1];
+            const uint64_t n_active = std::min<uint64_t>((uint64_t) weights->ne[2], n_ids);
+            const uint64_t estimate = n_active > UINT64_MAX / weights->nb[2] ?
+                UINT64_MAX : n_active * weights->nb[2];
+            auto backend_limit = [&](int backend_id) -> size_t {
+                return sched->weight_window_configured[backend_id] ?
+                    sched->weight_window_limit[backend_id] : sched->max_weight_bytes_per_split[backend_id];
+            };
+            const size_t selected_limit = backend_limit(*node_backend_id);
+            if (selected_limit == 0 || estimate <= selected_limit) {
                 continue;
             }
-            const size_t total = ggml_nbytes(input_cpy);
-            for (size_t copied = 0; copied < total; copied += GGML_BACKEND_SCHED_WEIGHT_UPLOAD_CHUNK_SIZE) {
-                if (ggml_backend_sched_storage_prefetch_active_count(sched, backend_id) >= max_active) {
-                    break;
-                }
-                const size_t size = std::min(GGML_BACKEND_SCHED_WEIGHT_UPLOAD_CHUNK_SIZE, total - copied);
-                const uint8_t * logical_src = (const uint8_t *) input->data + copied;
-                if (ggml_backend_sched_storage_task_exists(sched, backend_id, logical_src, size)) {
+
+            int overflow_backend = -1;
+            for (int candidate = 0; candidate < cpu_backend_id; ++candidate) {
+                if (candidate == *node_backend_id || !ggml_backend_supports_op(sched->backends[candidate], node)) {
                     continue;
                 }
-                const int slot = ggml_backend_sched_staging_acquire(sched, backend_id, size, true);
-                if (slot < 0) {
+                const size_t limit = backend_limit(candidate);
+                if (limit > 0 && estimate <= limit) {
+                    overflow_backend = candidate;
                     break;
                 }
-                auto & task = sched->storage_prefetch[backend_id][slot];
-                task.logical_src = logical_src;
-                task.size = size;
-                task.data_offset = 0;
-                task.split_id = split_id;
-                task.input_id = input_id;
-                task.active = true;
-                task.success = false;
-                task.worker = std::thread([sched, backend_id, slot]() {
-                    auto & staging = sched->staging[backend_id];
-                    auto & task = sched->storage_prefetch[backend_id][slot];
-                    if (staging.pending[slot]) {
-                        ggml_backend_event_synchronize(staging.events[slot]);
-                    }
-                    void * base = ggml_backend_buffer_get_base(staging.buffers[slot]);
-                    size_t data_offset = 0;
-                    if (sched->weight_read_padded_callback != NULL) {
-                        task.success = sched->weight_read_padded_callback(
-                            sched->weight_read_callback_user_data, task.logical_src,
-                            base, staging.capacities[slot], task.size, &data_offset);
-                    } else {
-                        task.success = sched->weight_read_callback(
-                            sched->weight_read_callback_user_data, task.logical_src, base, task.size);
-                    }
-                    task.data_offset = data_offset;
-                });
+            }
+            if (overflow_backend < 0 && ggml_backend_supports_op(sched->backends[cpu_backend_id], node)) {
+                overflow_backend = cpu_backend_id;
+            }
+            if (overflow_backend >= 0) {
+                GGML_LOG_DEBUG("sequential MoE overflow: %s estimated active weights=%" PRIu64
+                    " bytes exceed backend %s limit=%zu; routing to %s\n",
+                    node->name, estimate, ggml_backend_name(sched->backends[*node_backend_id]), selected_limit,
+                    ggml_backend_name(sched->backends[overflow_backend]));
+                *node_backend_id = overflow_backend;
+                SET_CAUSE(node, "3.moe-overflow");
             }
         }
     }
-}
 
 '''
-s = s[:start] + new_prefetch + s[end:]
-s = s.replace('ggml_backend_sched_prefetch_storage_input(sched, 0);',
-              'ggml_backend_sched_prefetch_storage_inputs(sched, 0);', 1)
-s = s.replace('ggml_backend_sched_prefetch_storage_input(sched, split_id + 1);',
-              'ggml_backend_sched_prefetch_storage_inputs(sched, split_id + 1);', 1)
-# General prefetch eligibility should be disabled for either storage callback.
-s = s.replace('if (!sched->async_weight_prefetch || sched->weight_read_callback != NULL ||\n',
-              'if (!sched->async_weight_prefetch || sched->weight_read_callback != NULL || sched->weight_read_padded_callback != NULL ||\n', 1)
-# A split completion event covers all earlier H2D submissions on the backend stream.
-s = s.replace('''            sched->staging[split_backend_id].pending[0] = false;\n            sched->staging[split_backend_id].pending[1] = false;\n''',
-'''            for (int slot = 0; slot < GGML_BACKEND_SCHED_STAGING_SLOTS; ++slot) {\n                if (!sched->staging[split_backend_id].reserved[slot]) {\n                    sched->staging[split_backend_id].pending[slot] = false;\n                }\n            }\n''', 1)
+if anchor not in s:
+    raise SystemExit('scheduler pass4 anchor not found')
+s = s.replace(anchor, insert + anchor, 1)
 p.write_text(s)
 
-# Properly construct/destruct the scheduler and expand all staging init/free/reset loops.
+# Avoid cast-qual warnings introduced by the pinned staging path.
 p = Path('ggml/src/ggml-backend.cpp')
 s = p.read_text()
-s = s.replace('''    struct ggml_backend_sched * sched = (ggml_backend_sched *) calloc(1, sizeof(struct ggml_backend_sched));\n''',
-              '''    struct ggml_backend_sched * sched = new ggml_backend_sched{};\n''', 1)
-s = s.replace('''        if (ggml_backend_dev_type(backends[b]->device) != GGML_BACKEND_DEVICE_TYPE_CPU) {\n            sched->staging[b].events[0] = ggml_backend_event_new(backends[b]->device);\n            sched->staging[b].events[1] = ggml_backend_event_new(backends[b]->device);\n        }\n''',
-'''        if (ggml_backend_dev_type(backends[b]->device) != GGML_BACKEND_DEVICE_TYPE_CPU) {\n            for (int slot = 0; slot < GGML_BACKEND_SCHED_STAGING_SLOTS; ++slot) {\n                sched->staging[b].events[slot] = ggml_backend_event_new(backends[b]->device);\n            }\n        }\n''', 1)
-s = s.replace('''    for (int b = 0; b < sched->n_backends; b++) {\n        ggml_backend_sched_storage_prefetch_finish(sched->storage_prefetch[b]);\n        for (int c = 0; c < sched->n_copies; c++) {\n''',
-'''    for (int b = 0; b < sched->n_backends; b++) {\n        for (int slot = 0; slot < GGML_BACKEND_SCHED_STAGING_SLOTS; ++slot) {\n            ggml_backend_sched_storage_prefetch_release(sched, b, slot);\n        }\n        for (int c = 0; c < sched->n_copies; c++) {\n''', 1)
-s = s.replace('''        for (int c = 0; c < 2; ++c) {\n            if (sched->staging[b].pending[c]) {\n                ggml_backend_event_synchronize(sched->staging[b].events[c]);\n            }\n            ggml_backend_buffer_free(sched->staging[b].buffers[c]);\n            ggml_backend_event_free(sched->staging[b].events[c]);\n        }\n''',
-'''        for (int slot = 0; slot < GGML_BACKEND_SCHED_STAGING_SLOTS; ++slot) {\n            if (sched->staging[b].pending[slot]) {\n                ggml_backend_event_synchronize(sched->staging[b].events[slot]);\n            }\n            ggml_backend_buffer_free(sched->staging[b].buffers[slot]);\n            ggml_backend_event_free(sched->staging[b].events[slot]);\n        }\n''', 1)
-s = s.replace('''    delete sched->transient_sources_seen;\n    delete sched->residents;\n    free(sched);\n''',
-'''    delete sched->transient_sources_seen;\n    delete sched->residents;\n    delete sched;\n''', 1)
-s = s.replace('''    for (int b = 0; b < sched->n_backends; ++b) {\n        ggml_backend_sched_storage_prefetch_finish(sched->storage_prefetch[b]);\n        sched->storage_prefetch[b].active = false;\n    }\n''',
-'''    for (int b = 0; b < sched->n_backends; ++b) {\n        for (int slot = 0; slot < GGML_BACKEND_SCHED_STAGING_SLOTS; ++slot) {\n            ggml_backend_sched_storage_prefetch_release(sched, b, slot);\n        }\n    }\n''', 1)
+s = s.replace('const uint8_t ** data) {', 'uint8_t ** data) {', 2)
+s = s.replace('*data = (const uint8_t *) ggml_backend_buffer_get_base(staging.buffers[slot]) + task.data_offset;',
+              '*data = (uint8_t *) ggml_backend_buffer_get_base(staging.buffers[slot]) + task.data_offset;', 1)
+s = s.replace('*data = (const uint8_t *) base + data_offset;', '*data = (uint8_t *) base + data_offset;', 1)
+s = s.replace('const uint8_t * staged_data = NULL;', 'uint8_t * staged_data = NULL;', 1)
+s = s.replace('staged_data = (const uint8_t *) ggml_backend_buffer_get_base(staging.buffers[slot]);\n                    memcpy((void *) staged_data, src_bytes + copied, chunk);',
+              'staged_data = (uint8_t *) ggml_backend_buffer_get_base(staging.buffers[slot]);\n                    memcpy(staged_data, src_bytes + copied, chunk);', 1)
 p.write_text(s)
 
-# Residency is intentionally compatible with async storage/H2D prefetch: resident
-# hits skip uploads, misses use the same bounded staging ring.
-replace_once(
-    'ggml/src/ggml-backend.cpp',
-    '''    GGML_ASSERT(backend_id >= 0);\n    GGML_ASSERT(!sched->async_weight_prefetch);\n    if (!enabled) {\n''',
-    '''    GGML_ASSERT(backend_id >= 0);\n    if (!enabled) {\n''')
-replace_once(
-    'ggml/src/ggml-backend.cpp',
-    '''void ggml_backend_sched_set_weight_read_callback(\n        ggml_backend_sched_t sched, ggml_backend_sched_weight_read_callback callback, void * user_data) {\n    GGML_ASSERT(sched);\n    sched->weight_read_callback = callback;\n    sched->weight_read_callback_user_data = user_data;\n}\n''',
-    '''void ggml_backend_sched_set_weight_read_callback(\n        ggml_backend_sched_t sched, ggml_backend_sched_weight_read_callback callback, void * user_data) {\n    GGML_ASSERT(sched);\n    sched->weight_read_callback = callback;\n    sched->weight_read_callback_user_data = user_data;\n}\n\nvoid ggml_backend_sched_set_weight_read_padded_callback(\n        ggml_backend_sched_t sched, ggml_backend_sched_weight_read_padded_callback callback, void * user_data) {\n    GGML_ASSERT(sched);\n    sched->weight_read_padded_callback = callback;\n    sched->weight_read_callback_user_data = user_data;\n}\n''')
-
-# Wire direct-I/O model readers into every sequential scheduler instance, preserve
-# residents across generation graph rebuilds, and keep mmap mode on the ordinary
-# directly-addressable host path.
 p = Path('src/llama-context.cpp')
 s = p.read_text()
-needle = '''        ggml_backend_sched_set_force_weight_offload(sched.get(), true);\n        ggml_backend_sched_set_async_weight_prefetch(sched.get(), true);\n'''
-insert = '''        ggml_backend_sched_set_force_weight_offload(sched.get(), true);\n        ggml_backend_sched_set_async_weight_prefetch(sched.get(), true);\n        ggml_backend_sched_set_persistent_weight_residency(sched.get(), true);\n        if (model.is_sequential_direct_io()) {\n            ggml_backend_sched_set_weight_read_callback(sched.get(),\n                [](void * user_data, const void * logical_src, void * dst, size_t size) {\n                    return static_cast<const llama_model *>(user_data)->read_sequential_weight(logical_src, dst, size);\n                }, (void *) &model);\n            ggml_backend_sched_set_weight_read_padded_callback(sched.get(),\n                [](void * user_data, const void * logical_src, void * dst, size_t capacity, size_t size, size_t * data_offset) {\n                    return static_cast<const llama_model *>(user_data)->read_sequential_weight_padded(\n                        logical_src, dst, capacity, size, data_offset);\n                }, (void *) &model);\n        }\n'''
-count = s.count(needle)
-if count != 1:
-    raise SystemExit(f'expected one top-level sequential scheduler setup block, found {count}')
-s = s.replace(needle, insert, 1)
-nested_needle = ''.join(('            ' + line) if line.strip() else line for line in needle.splitlines(True))
-nested_insert = ''.join(('            ' + line) if line.strip() else line for line in insert.splitlines(True))
-count_nested = s.count(nested_needle)
-if count_nested != 1:
-    raise SystemExit(f'expected one nested sequential scheduler setup block, found {count_nested}')
-s = s.replace(nested_needle, nested_insert, 1)
+s = s.replace('(void *) &model);', 'const_cast<llama_model *>(&model));')
 p.write_text(s)
+
+# Sequential-only resource fallback: if context reservation fails, retry with a
+# smaller physical microbatch rather than giving up immediately. The successful
+# value is reflected back into common_params so server diagnostics are truthful.
+replace_once(
+    'common/common.cpp',
+    '''    llama_context * lctx = llama_init_from_model(model, cparams);\n    if (lctx == NULL) {\n        COM_ERR("failed to create context with model '%s'\\n", params.model.path.c_str());\n        return;\n    }\n''',
+    '''    llama_context * lctx = nullptr;\n    while (true) {\n        lctx = llama_init_from_model(model, cparams);\n        if (lctx != nullptr || !params.sequential_load || cparams.n_ubatch <= 32) {\n            break;\n        }\n        const uint32_t next_ubatch = std::max<uint32_t>(32, cparams.n_ubatch / 2);\n        if (next_ubatch >= cparams.n_ubatch) {\n            break;\n        }\n        COM_WRN("sequential context allocation failed with ubatch=%u; retrying with ubatch=%u\\n",\n            cparams.n_ubatch, next_ubatch);\n        cparams.n_ubatch = next_ubatch;\n        params.n_ubatch = (int32_t) next_ubatch;\n    }\n    if (lctx == NULL) {\n        COM_ERR("failed to create context with model '%s'\\n", params.model.path.c_str());\n        return;\n    }\n''')
+
+# Repair the unrelated full-test build regression exposed by the validation run:
+# test-chat directly includes server-common.h, which directly includes mtmd.h.
+replace_once(
+    'tests/CMakeLists.txt',
+    '''    target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)\n''',
+    '''    target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server ${PROJECT_SOURCE_DIR}/tools/mtmd)\n''')
