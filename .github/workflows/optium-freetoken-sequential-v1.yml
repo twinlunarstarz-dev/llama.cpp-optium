@@ -23,262 +23,14 @@ jobs:
           fetch-depth: 0
           ref: opt/sequential-freetoken-stack-2026-08-22
 
-      - name: Port direct-I/O source ownership and bounded host L2
+      - name: Apply source integration
         shell: bash
         run: |
-          set -Eeuo pipefail
+          set -euo pipefail
           git config user.name "llama.cpp-optium integration"
           git config user.email "actions@users.noreply.github.com"
-          python3 - <<'PY'
-          from pathlib import Path
-
-          def rep(path, old, new, count=1):
-              p = Path(path); s = p.read_text()
-              if old not in s:
-                  raise SystemExit(f"anchor not found in {path}: {old[:120]!r}")
-              p.write_text(s.replace(old, new, count))
-
-          def insert_after(path, anchor, text):
-              p = Path(path); s = p.read_text()
-              if text.strip() in s:
-                  return
-              if anchor not in s:
-                  raise SystemExit(f"anchor not found in {path}: {anchor[:120]!r}")
-              p.write_text(s.replace(anchor, anchor + text, 1))
-
-          # ---- baseline current-upstream API compatibility ----
-          p = Path('src/llama.cpp'); s = p.read_text()
-          if 'static bool llama_model_arch_supports_sequential_load(const llm_arch arch);' not in s:
-              marker = '// Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback\n'
-              if marker not in s: raise SystemExit('llama.cpp forward-decl marker missing')
-              s = s.replace(marker, 'static bool llama_model_arch_supports_sequential_load(const llm_arch arch);\n\n' + marker, 1)
-          s = s.replace('params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides)',
-                        'params.check_tensors, params.no_alloc, false, params.kv_overrides, params.tensor_buft_overrides)', 1)
-          s = s.replace('''            if (fname.empty() || metadata != nullptr || file != nullptr || !ml.use_mmap) {\n                throw std::runtime_error("sequential MVP requires an mmap-backed path model source");\n            }\n            if (ml.use_direct_io) {\n                throw std::runtime_error("sequential MVP does not support direct I/O");\n            }\n            if (params.use_mlock) {\n                throw std::runtime_error("sequential MVP does not support mlock");\n            }\n''', '''            if (fname.empty() || metadata != nullptr || file != nullptr || (!ml.use_mmap && !ml.use_direct_io)) {\n                throw std::runtime_error("sequential loading requires an mmap or direct-I/O path model source");\n            }\n            if (params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK) {\n                throw std::runtime_error("sequential loading does not support mlock");\n            }\n''', 1)
-          s = s.replace('bool llama_model_arch_supports_sequential_load(const llm_arch arch) {',
-                        'static bool llama_model_arch_supports_sequential_load(const llm_arch arch) {', 1)
-          p.write_text(s)
-
-          # ---- llama_file positional + direct-into-padded-buffer API ----
-          insert_after('src/llama-mmap.h', '    void read_aligned_chunk(void * dest, size_t size);\n',
-              '    void read_at(void * ptr, size_t len, size_t offset) const;\n'
-              '    bool read_at_padded(void * base, size_t capacity, size_t len, size_t offset, size_t * data_offset) const;\n')
-
-          p = Path('src/llama-mmap.cpp'); s = p.read_text()
-          if 'bool llama_file::read_at_padded(' not in s:
-              marker = 'bool llama_file::has_direct_io() const { return pimpl->has_direct_io(); }\n'
-              if marker not in s: raise SystemExit('llama-mmap.cpp method marker missing')
-              code = r'''
-
-void llama_file::read_at(void * ptr, size_t len, size_t offset) const {
-#ifdef __linux__
-    if (pimpl->fd != -1) {
-        const size_t alignment = pimpl->alignment;
-        if (len == 0) return;
-        if (offset > pimpl->size) throw std::runtime_error("direct pread offset exceeds file size");
-        const size_t aligned_offset = offset & ~(alignment - 1);
-        const size_t prefix = offset - aligned_offset;
-        const size_t aligned_size = (prefix + len + alignment - 1) & ~(alignment - 1);
-        void * raw = nullptr;
-        const int rc = posix_memalign(&raw, alignment, aligned_size);
-        if (rc != 0) throw std::runtime_error(format("posix_memalign failed with error %d", rc));
-        std::unique_ptr<void, decltype(&free)> buffer(raw, free);
-        size_t done = 0;
-        while (done < aligned_size) {
-            const ssize_t n = pread(pimpl->fd, static_cast<uint8_t *>(raw) + done,
-                                    aligned_size - done, aligned_offset + done);
-            if (n < 0 && errno == EINTR) continue;
-            if (n < 0) throw std::runtime_error(format("direct pread error: %s", strerror(errno)));
-            if (n == 0) { memset(static_cast<uint8_t *>(raw) + done, 0, aligned_size - done); break; }
-            done += static_cast<size_t>(n);
-        }
-        memcpy(ptr, static_cast<uint8_t *>(raw) + prefix, len);
-        return;
-    }
-#endif
-    const size_t saved = tell();
-    seek(offset, SEEK_SET);
-    const_cast<llama_file *>(this)->read_raw(ptr, len);
-    seek(saved, SEEK_SET);
-}
-
-bool llama_file::read_at_padded(void * base, size_t capacity, size_t len, size_t offset, size_t * data_offset) const {
-    if (data_offset == nullptr || base == nullptr || capacity < len) return false;
-#ifdef __linux__
-    if (pimpl->fd != -1) {
-        const size_t alignment = pimpl->alignment;
-        if (len == 0) { *data_offset = 0; return true; }
-        if (offset > pimpl->size) throw std::runtime_error("direct pread offset exceeds file size");
-        const size_t aligned_offset = offset & ~(alignment - 1);
-        const size_t prefix = offset - aligned_offset;
-        const size_t aligned_size = (prefix + len + alignment - 1) & ~(alignment - 1);
-        const uintptr_t begin = reinterpret_cast<uintptr_t>(base);
-        const uintptr_t aligned_ptr = (begin + alignment - 1) & ~(uintptr_t) (alignment - 1);
-        const size_t leading = aligned_ptr - begin;
-        if (leading <= capacity && aligned_size <= capacity - leading) {
-            size_t done = 0;
-            while (done < aligned_size) {
-                const ssize_t n = pread(pimpl->fd, reinterpret_cast<uint8_t *>(aligned_ptr) + done,
-                                        aligned_size - done, aligned_offset + done);
-                if (n < 0 && errno == EINTR) continue;
-                if (n < 0) throw std::runtime_error(format("direct pread error: %s", strerror(errno)));
-                if (n == 0) { memset(reinterpret_cast<uint8_t *>(aligned_ptr) + done, 0, aligned_size - done); break; }
-                done += static_cast<size_t>(n);
-            }
-            *data_offset = leading + prefix;
-            return true;
-        }
-    }
-#endif
-    read_at(base, len, offset);
-    *data_offset = 0;
-    return true;
-}
-'''
-              s = s.replace(marker, marker + code, 1)
-              p.write_text(s)
-
-          # ---- model direct-I/O ownership + bounded host L2 ----
-          p = Path('src/llama-model.h'); s = p.read_text()
-          if 'read_sequential_weight(' not in s:
-              s = s.replace('    bool is_sequential() const;\n',
-                  '    bool is_sequential() const;\n'
-                  '    bool read_sequential_weight(const void * logical_src, void * dst, size_t size) const;\n'
-                  '    bool read_sequential_weight_padded(const void * logical_src, void * dst, size_t capacity, size_t size, size_t * data_offset) const;\n', 1)
-              p.write_text(s)
-
-          p = Path('src/llama-model.cpp'); s = p.read_text()
-          if '#include <list>' not in s:
-              s = s.replace('#include <map>\n', '#include <list>\n#include <map>\n#include <mutex>\n', 1)
-          old = '''        if (!ml.use_mmap) {\n            LLAMA_LOG_WARN("%s: sequential load requires mmap, forcing use_mmap = true\\n", __func__);\n        }\n        ml.use_mmap    = true;\n        ml.use_direct_io = false;\n        params.use_mlock = false;\n'''
-          new = '''        if (!ml.use_mmap && !ml.use_direct_io) {\n            LLAMA_LOG_WARN("%s: sequential load requires mmap or direct I/O; forcing mmap\\n", __func__);\n            ml.use_mmap = true;\n        }\n'''
-          if old in s: s = s.replace(old, new, 1)
-          if 'struct direct_io_region {' not in s:
-              anchor = '    bool sequential_load = false;\n'
-              fields = r'''
-    struct direct_io_region {
-        uintptr_t logical_begin;
-        size_t size;
-        size_t file_offset;
-        llama_file * file;
-    };
-    struct direct_io_cache_key {
-        uintptr_t logical_begin;
-        size_t size;
-        bool operator==(const direct_io_cache_key & other) const {
-            return logical_begin == other.logical_begin && size == other.size;
-        }
-    };
-    struct direct_io_cache_key_hash {
-        size_t operator()(const direct_io_cache_key & key) const {
-            size_t h = std::hash<uintptr_t>{}(key.logical_begin);
-            return h ^ (std::hash<size_t>{}(key.size) + 0x9e3779b9 + (h << 6) + (h >> 2));
-        }
-    };
-    struct direct_io_cache_entry {
-        std::shared_ptr<std::vector<uint8_t>> data;
-        std::list<direct_io_cache_key>::iterator lru;
-    };
-    std::vector<direct_io_region> direct_io_regions;
-    std::vector<std::unique_ptr<llama_file>> direct_io_files;
-    mutable std::mutex direct_io_cache_mutex;
-    mutable std::unordered_map<direct_io_cache_key, direct_io_cache_entry, direct_io_cache_key_hash> direct_io_cache;
-    mutable std::list<direct_io_cache_key> direct_io_cache_lru;
-    mutable size_t direct_io_cache_bytes = 0;
-    size_t direct_io_cache_limit = (size_t) 4 * 1024 * 1024 * 1024;
-'''
-              if anchor not in s: raise SystemExit('llama-model.cpp pimpl anchor missing')
-              s = s.replace(anchor, anchor + fields, 1)
-
-          oldbuf = '''        } else if (ml.sequential_load && ggml_backend_buft_is_host(buft)) {\n            // sequential mode: CPU tensors point directly to mmap (no RAM copy)\n            // tensors retain their GGUF file offsets as data pointers\n            GGML_ASSERT(!ml.no_alloc);\n            ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer\n            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {\n                t->buffer = buf;\n                const auto * weight = ml.get_weight(ggml_get_name(t));\n                if (weight && weight->idx < ml.mappings.size()) {\n                    const auto & mapping = ml.mappings.at(weight->idx);\n                    t->data = (uint8_t *)mapping->addr() + weight->offs;\n                }\n            }\n            LLAMA_LOG_INFO("%s: sequential load: CPU tensors mapped directly to mmap (no RAM allocation)\\n", __func__);\n'''
-          newbuf = '''        } else if (ml.sequential_load && ggml_backend_buft_is_host(buft)) {\n            GGML_ASSERT(!ml.no_alloc);\n            ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // logical-source buffer\n            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {\n                t->buffer = buf;\n                const auto * weight = ml.get_weight(ggml_get_name(t));\n                if (weight == nullptr) {\n                    throw std::runtime_error(format("sequential tensor '%s' has no GGUF source", t->name));\n                }\n                if (ml.use_direct_io) {\n                    const uintptr_t logical = (((uintptr_t) weight->idx + 1) << 48) | weight->offs;\n                    t->data = reinterpret_cast<void *>(logical);\n                    pimpl->direct_io_regions.push_back({logical, ggml_nbytes(t), weight->offs, ml.files.at(weight->idx).get()});\n                } else {\n                    if (weight->idx >= ml.mappings.size() || ml.mappings.at(weight->idx) == nullptr) {\n                        throw std::runtime_error(format("sequential tensor '%s' has no stable mapped GGUF source", t->name));\n                    }\n                    const auto & mapping = ml.mappings.at(weight->idx);\n                    t->data = (uint8_t *) mapping->addr() + weight->offs;\n                }\n            }\n            LLAMA_LOG_INFO("%s: sequential load: CPU tensors use %s sources (no model-sized RAM allocation)\\n",\n                __func__, ml.use_direct_io ? "direct-I/O" : "mmap");\n'''
-          if oldbuf not in s: raise SystemExit('sequential tensor buffer block missing')
-          s = s.replace(oldbuf, newbuf, 1)
-          endanchor = '''    if (use_mmap_buffer) {\n        for (auto & mapping : ml.mappings) {\n            pimpl->mappings.emplace_back(std::move(mapping));\n        }\n    }\n\n    return true;\n}\n'''
-          endnew = '''    if (use_mmap_buffer) {\n        for (auto & mapping : ml.mappings) {\n            pimpl->mappings.emplace_back(std::move(mapping));\n        }\n    }\n    if (pimpl->sequential_load && ml.use_direct_io) {\n        for (auto & file : ml.files) {\n            pimpl->direct_io_files.emplace_back(std::move(file));\n        }\n    }\n\n    return true;\n}\n'''
-          if endanchor not in s: raise SystemExit('model load end anchor missing')
-          s = s.replace(endanchor, endnew, 1)
-
-          if 'bool llama_model::read_sequential_weight(' not in s:
-              marker = '''bool llama_model::is_sequential() const {\n    return pimpl->sequential_load;\n}\n'''
-              methods = r'''
-
-bool llama_model::read_sequential_weight(const void * logical_src, void * dst, size_t size) const {
-    size_t data_offset = 0;
-    return read_sequential_weight_padded(logical_src, dst, size, size, &data_offset) && data_offset == 0;
-}
-
-bool llama_model::read_sequential_weight_padded(
-        const void * logical_src, void * dst, size_t capacity, size_t size, size_t * data_offset) const {
-    if (dst == nullptr || data_offset == nullptr || capacity < size) return false;
-    const uintptr_t begin = reinterpret_cast<uintptr_t>(logical_src);
-    const impl::direct_io_cache_key key{begin, size};
-    std::shared_ptr<std::vector<uint8_t>> cached;
-    {
-        std::lock_guard<std::mutex> lock(pimpl->direct_io_cache_mutex);
-        auto hit = pimpl->direct_io_cache.find(key);
-        if (hit != pimpl->direct_io_cache.end()) {
-            cached = hit->second.data;
-            pimpl->direct_io_cache_lru.splice(pimpl->direct_io_cache_lru.begin(),
-                pimpl->direct_io_cache_lru, hit->second.lru);
-        }
-    }
-    if (cached) {
-        memcpy(dst, cached->data(), size);
-        *data_offset = 0;
-        return true;
-    }
-    for (const auto & region : pimpl->direct_io_regions) {
-        if (begin >= region.logical_begin && begin - region.logical_begin <= region.size &&
-                size <= region.size - (begin - region.logical_begin)) {
-            const size_t file_offset = region.file_offset + (begin - region.logical_begin);
-            if (!region.file->read_at_padded(dst, capacity, size, file_offset, data_offset)) return false;
-            const char * env = getenv("LLAMA_SEQUENTIAL_HOST_CACHE_MB");
-            size_t limit = pimpl->direct_io_cache_limit;
-            if (env != nullptr && env[0] != '\0') {
-                char * end = nullptr;
-                const unsigned long long mb = strtoull(env, &end, 10);
-                if (end != env) limit = mb > SIZE_MAX / (1024ull * 1024ull) ? SIZE_MAX : (size_t) mb * 1024ull * 1024ull;
-            }
-            if (limit > 0 && size <= limit) {
-                auto data = std::make_shared<std::vector<uint8_t>>(size);
-                memcpy(data->data(), static_cast<uint8_t *>(dst) + *data_offset, size);
-                std::lock_guard<std::mutex> lock(pimpl->direct_io_cache_mutex);
-                auto existing = pimpl->direct_io_cache.find(key);
-                if (existing == pimpl->direct_io_cache.end()) {
-                    while (!pimpl->direct_io_cache_lru.empty() && pimpl->direct_io_cache_bytes > limit - size) {
-                        const auto victim_key = pimpl->direct_io_cache_lru.back();
-                        auto victim = pimpl->direct_io_cache.find(victim_key);
-                        GGML_ASSERT(victim != pimpl->direct_io_cache.end());
-                        pimpl->direct_io_cache_bytes -= victim->second.data->size();
-                        pimpl->direct_io_cache.erase(victim);
-                        pimpl->direct_io_cache_lru.pop_back();
-                    }
-                    pimpl->direct_io_cache_lru.push_front(key);
-                    pimpl->direct_io_cache.emplace(key, impl::direct_io_cache_entry{data, pimpl->direct_io_cache_lru.begin()});
-                    pimpl->direct_io_cache_bytes += size;
-                }
-            }
-            return true;
-        }
-    }
-    return false;
-}
-'''
-              if marker not in s: raise SystemExit('is_sequential marker missing')
-              s = s.replace(marker, marker + methods, 1)
-          p.write_text(s)
-
-          # Loader: direct-I/O logical tensors must never be treated as writable host RAM.
-          p = Path('src/llama-model-loader.cpp'); s = p.read_text()
-          old = '''            if (ggml_backend_buffer_is_host(cur->buffer)) {\n                file->seek(weight->offs, SEEK_SET);\n                file->read_raw(cur->data, n_size);\n'''
-          new = '''            if (ggml_backend_buffer_is_host(cur->buffer)) {\n                if (sequential_load && use_direct_io && cur->data != nullptr) {\n                    size_done += n_size;\n                    continue;\n                }\n                file->seek(weight->offs, SEEK_SET);\n                file->read_raw(cur->data, n_size);\n'''
-          if old not in s: raise SystemExit('loader direct-I/O skip anchor missing')
-          s = s.replace(old, new, 1)
-          p.write_text(s)
-
-          Path('integration/FREETOKEN_STACK.md').write_text('''# FreeToken-inspired sequential stack\n\nPhase 1 ports storage-backed direct I/O, lifetime-safe file ownership, padded reads directly into reusable host buffers, and a bounded host L2 cache. The complete model remains storage-backed and is not required to fit host RAM or VRAM.\n''')
-          PY
+          python3 -m py_compile integration/apply_freetoken_v1.py
+          python3 integration/apply_freetoken_v1.py
           git diff --check
           git add src/llama.cpp src/llama-mmap.h src/llama-mmap.cpp src/llama-model.h src/llama-model.cpp src/llama-model-loader.cpp integration/FREETOKEN_STACK.md
           git commit -m 'sequential: add direct-I/O source tier and bounded host cache'
@@ -299,7 +51,18 @@ bool llama_model::read_sequential_weight_padded(
         shell: bash
         run: |
           set -euo pipefail
-          { echo '# FreeToken sequential v1 validation'; echo; echo "- configure rc: $(cat /tmp/configure.rc)"; echo "- build rc: $(cat /tmp/build.rc)"; if [ "$(cat /tmp/build.rc)" != 0 ]; then echo; echo '```text'; tail -n 500 /tmp/build.log; echo '```'; fi; } > integration/FREETOKEN_VALIDATION.md
+          {
+            echo '# FreeToken sequential v1 validation'
+            echo
+            echo "- configure rc: $(cat /tmp/configure.rc)"
+            echo "- build rc: $(cat /tmp/build.rc)"
+            if [ "$(cat /tmp/build.rc)" != 0 ]; then
+              echo
+              echo '```text'
+              tail -n 600 /tmp/build.log
+              echo '```'
+            fi
+          } > integration/FREETOKEN_VALIDATION.md
           git add integration/FREETOKEN_VALIDATION.md
           git commit -m 'test: record FreeToken sequential v1 checkpoint'
           git push origin HEAD:opt/sequential-freetoken-stack-2026-08-22
