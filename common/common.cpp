@@ -1307,14 +1307,18 @@ static void common_validate_sequential_params(const common_params & params) {
             throw std::runtime_error("sequential loading currently requires native CUDA devices");
         }
     }
-    if (!params.use_mmap) {
-        throw std::runtime_error("sequential MVP requires mmap");
-    }
-    if (params.use_direct_io) {
-        throw std::runtime_error("sequential MVP does not support direct I/O");
-    }
-    if (params.use_mlock) {
-        throw std::runtime_error("sequential MVP does not support mlock");
+    switch (params.load_mode) {
+        case LLAMA_LOAD_MODE_AUTO:
+        case LLAMA_LOAD_MODE_MMAP:
+        case LLAMA_LOAD_MODE_DIRECT_IO:
+            break;
+        case LLAMA_LOAD_MODE_MLOCK:
+        case LLAMA_LOAD_MODE_MMAP_MLOCK:
+            throw std::runtime_error("sequential loading does not support mlock");
+        case LLAMA_LOAD_MODE_NONE:
+            throw std::runtime_error("sequential loading requires mmap or direct I/O");
+        default:
+            throw std::runtime_error("sequential loading received an unsupported load mode");
     }
     if (params.no_alloc) {
         throw std::runtime_error("sequential MVP does not support no-alloc model loading");
@@ -1365,11 +1369,10 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             has_draft || spec_mtp ? &extra : nullptr,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
 
-        // sequential mode requires mmap and non-no_alloc - restore after fit probing
+        // sequential mode requires real tensor descriptors after fit probing.
         if (params.sequential_load) {
-            mparams.use_mmap  = true;
+            mparams.load_mode = params.load_mode;
             mparams.no_alloc  = false;
-            mparams.use_mlock = false;
         }
     }
 
@@ -1442,7 +1445,21 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         cparams.n_samplers = pimpl->samplers_seq_config.size();
     }
 
-    llama_context * lctx = llama_init_from_model(model, cparams);
+    llama_context * lctx = nullptr;
+    while (true) {
+        lctx = llama_init_from_model(model, cparams);
+        if (lctx != nullptr || !params.sequential_load || cparams.n_ubatch <= 32) {
+            break;
+        }
+        const uint32_t next_ubatch = std::max<uint32_t>(32, cparams.n_ubatch / 2);
+        if (next_ubatch >= cparams.n_ubatch) {
+            break;
+        }
+        COM_WRN("sequential context allocation failed with ubatch=%u; retrying with ubatch=%u\n",
+            cparams.n_ubatch, next_ubatch);
+        cparams.n_ubatch = next_ubatch;
+        params.n_ubatch = (int32_t) next_ubatch;
+    }
     if (lctx == NULL) {
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
         return;
@@ -1736,9 +1753,6 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.split_mode      = params.split_mode;
     mparams.load_mode       = params.load_mode;
     mparams.tensor_split    = params.tensor_split;
-    mparams.use_mmap        = params.use_mmap || params.sequential_load; // force mmap for streaming
-    mparams.use_direct_io   = params.sequential_load ? false : params.use_direct_io;
-    mparams.use_mlock       = params.sequential_load ? false : params.use_mlock; // no mlock for streaming
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;

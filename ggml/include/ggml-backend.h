@@ -370,13 +370,19 @@ extern "C" {
     // Enable one-split lookahead async upload for host weights copied to device split inputs.
     GGML_API void                 ggml_backend_sched_set_async_weight_prefetch(ggml_backend_sched_t sched, bool prefetch);
 
-    // Optional source reader for storage-backed sequential weights. The callback
-    // copies exactly size bytes from the logical tensor address into dst and
-    // returns true when it handled the address. Unhandled addresses use memcpy.
+    // Optional source readers for storage-backed sequential weights. The exact
+    // callback copies size bytes to dst. The padded callback may place those bytes
+    // at data_offset inside a larger destination allocation, which lets aligned
+    // direct I/O read into pinned host memory without an intermediate host copy.
     typedef bool (*ggml_backend_sched_weight_read_callback)(
             void * user_data, const void * logical_src, void * dst, size_t size);
+    typedef bool (*ggml_backend_sched_weight_read_padded_callback)(
+            void * user_data, const void * logical_src, void * dst, size_t capacity,
+            size_t size, size_t * data_offset);
     GGML_API void                 ggml_backend_sched_set_weight_read_callback(
             ggml_backend_sched_t sched, ggml_backend_sched_weight_read_callback callback, void * user_data);
+    GGML_API void                 ggml_backend_sched_set_weight_read_padded_callback(
+            ggml_backend_sched_t sched, ggml_backend_sched_weight_read_padded_callback callback, void * user_data);
 
     // Limit total weight bytes per accelerator scheduler split when force_weight_offload is active.
     // When non-zero, splits are broken when accumulated weight inputs exceed this limit.

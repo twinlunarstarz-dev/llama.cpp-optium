@@ -532,9 +532,12 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
             ggml_backend_t backend_fused = ggml_backend_sched_get_tensor_backend(sched.get(), node.tensor);
             ggml_backend_dev_t device_fused = backend_fused ? ggml_backend_get_device(backend_fused) : nullptr;
 
-            // TODO: make this descriptor-specific; model.dev_layer() preserves the current behavior,
-            // but is still wrong for cases like --no-kv-offload.
-            ggml_backend_dev_t device_layer = model.dev_layer(node.il);
+            // Sequential weights are storage-backed, while fused attention/state
+            // kernels execute with the runtime layer/KV placement. Use that placement
+            // for capability probing so sequential mode does not disable CUDA fusion
+            // merely because persistent weights live on CPU.
+            ggml_backend_dev_t device_layer = model.is_sequential() ?
+                model.dev_kv_layer(node.il) : model.dev_layer(node.il);
 
             if (device_fused != device_layer) {
                 LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but %s "
@@ -674,8 +677,24 @@ void llama_context::sched_reserve() {
     if (model.is_sequential()) {
         ggml_backend_sched_set_force_weight_offload(sched.get(), true);
         ggml_backend_sched_set_async_weight_prefetch(sched.get(), true);
+        ggml_backend_sched_set_persistent_weight_residency(sched.get(), true);
+        if (model.is_sequential_direct_io()) {
+            ggml_backend_sched_set_weight_read_callback(sched.get(),
+                [](void * user_data, const void * logical_src, void * dst, size_t size) {
+                    return static_cast<const llama_model *>(user_data)->read_sequential_weight(logical_src, dst, size);
+                }, const_cast<llama_model *>(&model));
+            ggml_backend_sched_set_weight_read_padded_callback(sched.get(),
+                [](void * user_data, const void * logical_src, void * dst, size_t capacity, size_t size, size_t * data_offset) {
+                    return static_cast<const llama_model *>(user_data)->read_sequential_weight_padded(
+                        logical_src, dst, capacity, size, data_offset);
+                }, const_cast<llama_model *>(&model));
+        }
         if (sequential_weight_budget > 0) {
-            ggml_backend_sched_set_max_weight_bytes_per_split(sched.get(), sequential_weight_budget);
+            for (ggml_backend_t backend : backend_ptrs) {
+                if (ggml_backend_dev_type(ggml_backend_get_device(backend)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    ggml_backend_sched_set_max_weight_bytes_per_split(sched.get(), backend, sequential_weight_budget);
+                }
+            }
         }
     }
 
@@ -716,8 +735,24 @@ void llama_context::sched_reserve() {
                 if (model.is_sequential()) {
                     ggml_backend_sched_set_force_weight_offload(sched.get(), true);
                     ggml_backend_sched_set_async_weight_prefetch(sched.get(), true);
+                    ggml_backend_sched_set_persistent_weight_residency(sched.get(), true);
+                    if (model.is_sequential_direct_io()) {
+                        ggml_backend_sched_set_weight_read_callback(sched.get(),
+                            [](void * user_data, const void * logical_src, void * dst, size_t size) {
+                                return static_cast<const llama_model *>(user_data)->read_sequential_weight(logical_src, dst, size);
+                            }, const_cast<llama_model *>(&model));
+                        ggml_backend_sched_set_weight_read_padded_callback(sched.get(),
+                            [](void * user_data, const void * logical_src, void * dst, size_t capacity, size_t size, size_t * data_offset) {
+                                return static_cast<const llama_model *>(user_data)->read_sequential_weight_padded(
+                                    logical_src, dst, capacity, size, data_offset);
+                            }, const_cast<llama_model *>(&model));
+                    }
                     if (sequential_weight_budget > 0) {
-                        ggml_backend_sched_set_max_weight_bytes_per_split(sched.get(), sequential_weight_budget);
+                        for (ggml_backend_t backend : backend_ptrs) {
+                            if (ggml_backend_dev_type(ggml_backend_get_device(backend)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                                ggml_backend_sched_set_max_weight_bytes_per_split(sched.get(), backend, sequential_weight_budget);
+                            }
+                        }
                     }
                 }
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());

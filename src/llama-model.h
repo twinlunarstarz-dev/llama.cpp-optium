@@ -705,6 +705,7 @@ struct llama_model {
     void print_info() const;
 
     ggml_backend_dev_t dev_layer(int il) const;
+    ggml_backend_dev_t dev_kv_layer(int il) const;
     ggml_backend_dev_t dev_output() const;
 
     ggml_backend_buffer_type_t select_buft(int il) const;
@@ -714,6 +715,9 @@ struct llama_model {
     const struct ggml_tensor * get_tensor(const char * name) const;
 
     bool is_sequential() const;
+    bool is_sequential_direct_io() const;
+    bool read_sequential_weight(const void * logical_src, void * dst, size_t size) const;
+    bool read_sequential_weight_padded(const void * logical_src, void * dst, size_t capacity, size_t size, size_t * data_offset) const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;

@@ -311,12 +311,14 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
     return true;
 }
 
+static bool llama_model_arch_supports_sequential_load(const llm_arch arch);
+
 // Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback
 static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
     try {
         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
-            params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
+            params.check_tensors, params.no_alloc, false, params.kv_overrides, params.tensor_buft_overrides);
 
         ml.print_info();
         std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));
@@ -360,14 +362,11 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             if (llm_arch_is_hybrid(model->arch)) {
                 throw std::runtime_error("sequential MVP does not support hybrid models");
             }
-            if (fname.empty() || metadata != nullptr || file != nullptr || !ml.use_mmap) {
-                throw std::runtime_error("sequential MVP requires an mmap-backed path model source");
+            if (fname.empty() || metadata != nullptr || file != nullptr || (!ml.use_mmap && !ml.use_direct_io)) {
+                throw std::runtime_error("sequential loading requires an mmap or direct-I/O path model source");
             }
-            if (ml.use_direct_io) {
-                throw std::runtime_error("sequential MVP does not support direct I/O");
-            }
-            if (params.use_mlock) {
-                throw std::runtime_error("sequential MVP does not support mlock");
+            if (params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK) {
+                throw std::runtime_error("sequential loading does not support mlock");
             }
             if (params.no_alloc) {
                 throw std::runtime_error("sequential MVP does not support no-alloc model loading");
@@ -410,7 +409,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
     }
 }
 
-bool llama_model_arch_supports_sequential_load(const llm_arch arch) {
+static bool llama_model_arch_supports_sequential_load(const llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_LLAMA:
         case LLM_ARCH_QWEN2:
