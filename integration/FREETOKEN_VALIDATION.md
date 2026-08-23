@@ -14,10 +14,10 @@
 [  2%] Linking CXX static library libvendor-hash.a
 [  2%] Building CXX object ggml/src/CMakeFiles/ggml-base.dir/ggml.cpp.o
 [  2%] Building C object ggml/src/CMakeFiles/ggml-base.dir/ggml-alloc.c.o
-[  2%] Building CXX object ggml/src/CMakeFiles/ggml-base.dir/ggml-backend.cpp.o
-[  2%] Building CXX object ggml/src/CMakeFiles/ggml-base.dir/ggml-backend-meta.cpp.o
 [  2%] Built target vendor-hash
 [  2%] Building CXX object vendor/cpp-httplib/CMakeFiles/cpp-httplib.dir/httplib.cpp.o
+[  2%] Building CXX object ggml/src/CMakeFiles/ggml-base.dir/ggml-backend.cpp.o
+[  2%] Building CXX object ggml/src/CMakeFiles/ggml-base.dir/ggml-backend-meta.cpp.o
 [  3%] Building CXX object ggml/src/CMakeFiles/ggml-base.dir/ggml-opt.cpp.o
 [  3%] Building CXX object ggml/src/CMakeFiles/ggml-base.dir/ggml-threading.cpp.o
 [  3%] Building C object ggml/src/CMakeFiles/ggml-base.dir/ggml-quants.c.o
@@ -40,10 +40,10 @@
 [  4%] Linking CXX executable ../../bin/llama-qwen2vl-cli
 [  4%] Built target llama-qwen2vl-cli
 [  5%] Building C object ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/ggml-cpu.c.o
-[  5%] Building CXX object ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/ggml-cpu.cpp.o
-[  5%] Building CXX object ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/repack.cpp.o
 [  5%] Linking CXX static library libcpp-httplib.a
 [  5%] Built target cpp-httplib
+[  5%] Building CXX object ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/ggml-cpu.cpp.o
+[  5%] Building CXX object ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/repack.cpp.o
 [  5%] Building CXX object ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/hbm.cpp.o
 [  5%] Building C object ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/quants.c.o
 [  6%] Building CXX object ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/traits.cpp.o
@@ -269,63 +269,120 @@
 [ 47%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/dotsocr.cpp.o
 [ 47%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/exaone4_5.cpp.o
 [ 47%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/gemma4a.cpp.o
+[ 47%] Building CXX object common/CMakeFiles/llama-common.dir/common.cpp.o
 [ 47%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/gemma4v.cpp.o
 [ 48%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/gemma4ua.cpp.o
 [ 48%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/gemma4uv.cpp.o
-[ 48%] Building CXX object common/CMakeFiles/llama-common.dir/common.cpp.o
 [ 48%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/glm4v.cpp.o
 [ 48%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/granite-speech.cpp.o
 [ 48%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/granite4-vision.cpp.o
 [ 48%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/hunyuanvl.cpp.o
-[ 49%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/internvl.cpp.o
-[ 49%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/kimivl.cpp.o
-[ 49%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/kimik25.cpp.o
-[ 50%] Building CXX object common/CMakeFiles/llama-common.dir/console.cpp.o
-[ 50%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/nemotron-v2-vl.cpp.o
+[ 49%] Building CXX object common/CMakeFiles/llama-common.dir/console.cpp.o
+[ 50%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/internvl.cpp.o
 [ 50%] Building CXX object common/CMakeFiles/llama-common.dir/debug.cpp.o
+[ 50%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/kimivl.cpp.o
+[ 50%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/kimik25.cpp.o
+[ 50%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/nemotron-v2-vl.cpp.o
 [ 50%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/muse-glimmer.cpp.o
 [ 51%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/llama4.cpp.o
+[ 51%] Building CXX object common/CMakeFiles/llama-common.dir/download.cpp.o
 [ 51%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/llava.cpp.o
 [ 51%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/minicpmv.cpp.o
-[ 51%] Building CXX object common/CMakeFiles/llama-common.dir/download.cpp.o
 [ 51%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/paddleocr.cpp.o
 [ 51%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/pixtral.cpp.o
 [ 52%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/qwen2vl.cpp.o
 [ 52%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/minimax-m3.cpp.o
 [ 52%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/qwen3vl.cpp.o
+[ 52%] Building CXX object common/CMakeFiles/llama-common.dir/fit.cpp.o
 [ 52%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/mimovl.cpp.o
 [ 52%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/qwen3a.cpp.o
 [ 53%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/mimo-audio.cpp.o
-[ 53%] Building CXX object common/CMakeFiles/llama-common.dir/fit.cpp.o
-/home/runner/work/llama.cpp-optium/llama.cpp-optium/common/fit.cpp: In function ‘std::vector<llama_device_memory_data> common_get_device_memory_data_impl(const char*, const llama_model_params*, const llama_context_params*, std::vector<ggml_backend_device*>&, uint32_t&, uint32_t&, uint32_t&, ggml_log_level)’:
-/home/runner/work/llama.cpp-optium/llama.cpp-optium/common/fit.cpp:57:18: error: ‘struct llama_model_params’ has no member named ‘use_mmap’
-   57 |     mparams_copy.use_mmap        = false;
-      |                  ^~~~~~~~
-/home/runner/work/llama.cpp-optium/llama.cpp-optium/common/fit.cpp:58:18: error: ‘struct llama_model_params’ has no member named ‘use_mlock’
-   58 |     mparams_copy.use_mlock       = false;
-      |                  ^~~~~~~~~
-/home/runner/work/llama.cpp-optium/llama.cpp-optium/common/fit.cpp:142:18: error: ‘const struct llama_model_params’ has no member named ‘load_mtp’; did you mean ‘load_mode’?
-  142 |     if (mparams->load_mtp) {
-      |                  ^~~~~~~~
-      |                  load_mode
-gmake[2]: *** [common/CMakeFiles/llama-common.dir/build.make:219: common/CMakeFiles/llama-common.dir/fit.cpp.o] Error 1
-gmake[1]: *** [CMakeFiles/Makefile2:2635: common/CMakeFiles/llama-common.dir/all] Error 2
-gmake[1]: *** Waiting for unfinished jobs....
+[ 53%] Building CXX object common/CMakeFiles/llama-common.dir/hf-cache.cpp.o
 [ 53%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/qwen3tts-spkenc.cpp.o
 [ 53%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/qwen3tts-gen.cpp.o
+[ 53%] Building CXX object common/CMakeFiles/llama-common.dir/imatrix-loader.cpp.o
 [ 53%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/pockettts-seanet.cpp.o
 [ 53%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/pockettts-spkenc.cpp.o
-[ 54%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/pockettts-gen.cpp.o
-[ 54%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/step3vl.cpp.o
-[ 54%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/siglip.cpp.o
-[ 54%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/whisper-enc.cpp.o
-[ 54%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/deepseekocr.cpp.o
-[ 55%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/deepseekocr2.cpp.o
-[ 55%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/mobilenetv5.cpp.o
-[ 55%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/youtuvl.cpp.o
-[ 55%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/yasa2.cpp.o
-[ 55%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/parakeet.cpp.o
-[ 56%] Linking CXX shared library ../../bin/libmtmd.so
-[ 56%] Built target mtmd
+[ 54%] Building CXX object common/CMakeFiles/llama-common.dir/json-schema-to-grammar.cpp.o
+[ 55%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/pockettts-gen.cpp.o
+[ 55%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/step3vl.cpp.o
+[ 55%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/siglip.cpp.o
+[ 55%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/whisper-enc.cpp.o
+[ 55%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/deepseekocr.cpp.o
+[ 56%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/deepseekocr2.cpp.o
+[ 56%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/mobilenetv5.cpp.o
+[ 56%] Building CXX object common/CMakeFiles/llama-common.dir/json.cpp.o
+[ 56%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/youtuvl.cpp.o
+[ 56%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/yasa2.cpp.o
+[ 56%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/parakeet.cpp.o
+[ 57%] Linking CXX shared library ../../bin/libmtmd.so
+[ 57%] Built target mtmd
+[ 57%] Building C object tests/CMakeFiles/test-c.dir/test-c.c.o
+[ 58%] Linking C executable ../bin/test-c
+[ 58%] Built target test-c
+[ 58%] Building CXX object examples/simple/CMakeFiles/llama-simple.dir/simple.cpp.o
+[ 58%] Linking CXX executable ../../bin/llama-simple
+[ 58%] Built target llama-simple
+[ 58%] Building CXX object examples/simple-chat/CMakeFiles/llama-simple-chat.dir/simple-chat.cpp.o
+[ 58%] Linking CXX executable ../../bin/llama-simple-chat
+[ 58%] Built target llama-simple-chat
+[ 58%] Building CXX object common/CMakeFiles/llama-common.dir/llguidance.cpp.o
+[ 58%] Building CXX object common/CMakeFiles/llama-common.dir/log.cpp.o
+[ 58%] Building CXX object common/CMakeFiles/llama-common.dir/ngram-cache.cpp.o
+[ 59%] Building CXX object common/CMakeFiles/llama-common.dir/ngram-map.cpp.o
+[ 59%] Building CXX object common/CMakeFiles/llama-common.dir/ngram-mod.cpp.o
+[ 59%] Building CXX object common/CMakeFiles/llama-common.dir/peg-parser.cpp.o
+[ 59%] Building CXX object common/CMakeFiles/llama-common.dir/preset.cpp.o
+[ 59%] Building CXX object common/CMakeFiles/llama-common.dir/reasoning-budget.cpp.o
+[ 60%] Building CXX object common/CMakeFiles/llama-common.dir/sampling.cpp.o
+[ 60%] Building CXX object common/CMakeFiles/llama-common.dir/speculative.cpp.o
+[ 60%] Building CXX object common/CMakeFiles/llama-common.dir/subproc.cpp.o
+[ 60%] Building CXX object common/CMakeFiles/llama-common.dir/trie.cpp.o
+[ 60%] Building CXX object common/CMakeFiles/llama-common.dir/unicode.cpp.o
+[ 61%] Building CXX object common/CMakeFiles/llama-common.dir/jinja/lexer.cpp.o
+[ 61%] Building CXX object common/CMakeFiles/llama-common.dir/jinja/parser.cpp.o
+[ 61%] Building CXX object common/CMakeFiles/llama-common.dir/jinja/runtime.cpp.o
+[ 61%] Building CXX object common/CMakeFiles/llama-common.dir/jinja/value.cpp.o
+[ 61%] Building CXX object common/CMakeFiles/llama-common.dir/jinja/string.cpp.o
+[ 62%] Building CXX object common/CMakeFiles/llama-common.dir/jinja/caps.cpp.o
+[ 62%] Linking CXX shared library ../bin/libllama-common.so
+[ 62%] Built target llama-common
+[ 62%] Building CXX object tests/CMakeFiles/test-tokenizer-0.dir/test-tokenizer-0.cpp.o
+[ 62%] Building CXX object tests/CMakeFiles/test-recurrent-state-rollback.dir/test-recurrent-state-rollback.cpp.o
+[ 62%] Linking CXX executable ../bin/test-tokenizer-0
+[ 62%] Built target test-tokenizer-0
+[ 62%] Building CXX object tests/CMakeFiles/test-unicode.dir/test-unicode.cpp.o
+[ 62%] Linking CXX executable ../bin/test-recurrent-state-rollback
+[ 63%] Linking CXX executable ../bin/test-unicode
+[ 63%] Built target test-recurrent-state-rollback
+[ 64%] Building CXX object tests/CMakeFiles/test-sampling.dir/test-sampling.cpp.o
+[ 64%] Built target test-unicode
+[ 64%] Building CXX object tests/CMakeFiles/test-reasoning-budget.dir/test-reasoning-budget.cpp.o
+[ 64%] Linking CXX executable ../bin/test-sampling
+[ 64%] Built target test-sampling
+[ 64%] Building CXX object tests/CMakeFiles/test-grammar-parser.dir/test-grammar-parser.cpp.o
+[ 65%] Linking CXX executable ../bin/test-reasoning-budget
+[ 65%] Built target test-reasoning-budget
+[ 65%] Building CXX object tests/CMakeFiles/test-grammar-integration.dir/test-grammar-integration.cpp.o
+[ 65%] Linking CXX executable ../bin/test-grammar-parser
+[ 65%] Built target test-grammar-parser
+[ 65%] Building CXX object tests/CMakeFiles/test-llama-grammar.dir/test-llama-grammar.cpp.o
+[ 66%] Linking CXX executable ../bin/test-grammar-integration
+[ 66%] Built target test-grammar-integration
+[ 66%] Building CXX object tests/CMakeFiles/test-batch-alloc.dir/test-batch-alloc.cpp.o
+[ 67%] Linking CXX executable ../bin/test-llama-grammar
+[ 67%] Built target test-llama-grammar
+[ 67%] Building CXX object tests/CMakeFiles/test-chat.dir/test-chat.cpp.o
+In file included from /home/runner/work/llama.cpp-optium/llama.cpp-optium/tests/../tools/server/server-chat.h:6,
+                 from /home/runner/work/llama.cpp-optium/llama.cpp-optium/tests/test-chat.cpp:10:
+/home/runner/work/llama.cpp-optium/llama.cpp-optium/tests/../tools/server/server-common.h:7:10: fatal error: mtmd.h: No such file or directory
+    7 | #include "mtmd.h"
+      |          ^~~~~~~~
+compilation terminated.
+gmake[2]: *** [tests/CMakeFiles/test-chat.dir/build.make:79: tests/CMakeFiles/test-chat.dir/test-chat.cpp.o] Error 1
+gmake[1]: *** [CMakeFiles/Makefile2:3005: tests/CMakeFiles/test-chat.dir/all] Error 2
+gmake[1]: *** Waiting for unfinished jobs....
+[ 67%] Linking CXX executable ../bin/test-batch-alloc
+[ 67%] Built target test-batch-alloc
 gmake: *** [Makefile:146: all] Error 2
 ```
