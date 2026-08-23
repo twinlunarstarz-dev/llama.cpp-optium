@@ -23,30 +23,14 @@ jobs:
           fetch-depth: 0
           ref: opt/sequential-freetoken-stack-2026-08-22
 
-      - name: Apply final integration
+      - name: Verify clean integration head
         shell: bash
         run: |
           set -euo pipefail
-          git config user.name "llama.cpp-optium integration"
-          git config user.email "actions@users.noreply.github.com"
-          if [ -f integration/apply_pending.py ]; then
-            python3 -m py_compile integration/apply_pending.py
-            python3 integration/apply_pending.py
-          fi
-          if [ -f integration/apply_final.py ]; then
-            python3 -m py_compile integration/apply_final.py
-            python3 integration/apply_final.py
-          fi
-          if [ -f integration/fix_final_tests.py ]; then
-            python3 -m py_compile integration/fix_final_tests.py
-            python3 integration/fix_final_tests.py
-          fi
           git diff --check
-          if ! git diff --quiet; then
-            git add -A
-            git commit -m 'test: align sequential validation with current APIs'
-            git push origin HEAD:opt/sequential-freetoken-stack-2026-08-22
-          fi
+          test ! -e integration/apply_pending.py
+          test ! -e integration/apply_final.py
+          test ! -e integration/fix_final_tests.py
 
       - name: CPU configure
         shell: bash
@@ -56,7 +40,7 @@ jobs:
             -DGGML_CUDA=OFF \
             -DLLAMA_CURL=OFF \
             -DLLAMA_BUILD_TESTS=ON \
-            -DLLAMA_BUILD_SERVER=OFF
+            -DLLAMA_BUILD_SERVER=ON
 
       - name: CPU build
         shell: bash
@@ -99,4 +83,4 @@ jobs:
 
       - name: CUDA compile
         shell: bash
-        run: cmake --build build-cuda -j2 --target llama-cli
+        run: cmake --build build-cuda -j2 --target llama
