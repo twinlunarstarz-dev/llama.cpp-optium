@@ -595,6 +595,10 @@ static bool ggml_gallocr_is_allocated(ggml_gallocr_t galloc, struct ggml_tensor 
         || ggml_gallocr_is_own(galloc, t); // tensor will be allocated by galloc
 }
 
+static bool ggml_gallocr_is_no_alloc(const struct ggml_tensor * tensor) {
+    return tensor->flags & GGML_TENSOR_FLAG_NO_ALLOC;
+}
+
 // free the extra space at the end if the new tensor is smaller
 static void ggml_gallocr_free_extra_space(ggml_gallocr_t galloc, struct ggml_tensor * node, struct ggml_tensor * parent) {
     struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
@@ -621,6 +625,12 @@ static void ggml_gallocr_free_extra_space(ggml_gallocr_t galloc, struct ggml_ten
 
 static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor * node, int buffer_id) {
     GGML_ASSERT(buffer_id >= 0);
+
+    // Sequential/transient tensors are attached to bounded external storage immediately
+    // before execution and must not reserve space from the graph allocator.
+    if (ggml_gallocr_is_no_alloc(node)) {
+        return;
+    }
     struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
 
     if (!ggml_gallocr_is_allocated(galloc, node) && !ggml_impl_is_view(node)) {
