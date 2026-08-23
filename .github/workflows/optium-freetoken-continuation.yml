@@ -1,0 +1,69 @@
+name: Optium FreeToken sequential continuation
+
+on:
+  pull_request:
+    branches: [master]
+    paths:
+      - .github/OPTIUM_FREETOKEN_CONTINUATION
+
+permissions:
+  contents: write
+
+concurrency:
+  group: optium-freetoken-continuation
+  cancel-in-progress: true
+
+jobs:
+  continue:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: opt/sequential-freetoken-stack-2026-08-22
+      - name: Apply pending integration
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "llama.cpp-optium integration"
+          git config user.email "actions@users.noreply.github.com"
+          python3 -m py_compile integration/apply_pending.py
+          python3 integration/apply_pending.py
+          git diff --check
+          if ! git diff --quiet; then
+            git add -A
+            git commit -m 'sequential: apply FreeToken integration phase'
+            git push origin HEAD:opt/sequential-freetoken-stack-2026-08-22
+          fi
+      - name: CPU build and focused tests
+        shell: bash
+        run: |
+          set +e
+          rm -rf build
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=OFF -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_SERVER=OFF >/tmp/configure.log 2>&1
+          c=$?; echo $c >/tmp/configure.rc
+          if [ $c -eq 0 ]; then cmake --build build -j2 >/tmp/build.log 2>&1; b=$?; else : >/tmp/build.log; b=99; fi
+          echo $b >/tmp/build.rc
+          if [ $b -eq 0 ]; then ctest --test-dir build --output-on-failure -R 'test-(arg-parser|llama-archs|sequential)' >/tmp/test.log 2>&1; t=$?; else : >/tmp/test.log; t=99; fi
+          echo $t >/tmp/test.rc
+          exit 0
+      - name: Publish validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo '# FreeToken sequential continuation validation'
+            echo
+            echo "- configure rc: $(cat /tmp/configure.rc)"
+            echo "- build rc: $(cat /tmp/build.rc)"
+            echo "- focused tests rc: $(cat /tmp/test.rc)"
+            if [ "$(cat /tmp/configure.rc)" != 0 ]; then echo; echo '## Configure'; echo '```text'; tail -n 500 /tmp/configure.log; echo '```'; fi
+            if [ "$(cat /tmp/build.rc)" != 0 ]; then echo; echo '## Build'; echo '```text'; tail -n 900 /tmp/build.log; echo '```'; fi
+            if [ "$(cat /tmp/test.rc)" != 0 ] && [ "$(cat /tmp/test.rc)" != 99 ]; then echo; echo '## Tests'; echo '```text'; tail -n 900 /tmp/test.log; echo '```'; fi
+          } > integration/FREETOKEN_VALIDATION.md
+          git add integration/FREETOKEN_VALIDATION.md
+          if ! git diff --cached --quiet; then
+            git commit -m 'test: record FreeToken sequential continuation validation'
+            git push origin HEAD:opt/sequential-freetoken-stack-2026-08-22
+          fi
