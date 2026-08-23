@@ -679,12 +679,12 @@ void llama_context::sched_reserve() {
             ggml_backend_sched_set_weight_read_callback(sched.get(),
                 [](void * user_data, const void * logical_src, void * dst, size_t size) {
                     return static_cast<const llama_model *>(user_data)->read_sequential_weight(logical_src, dst, size);
-                }, (void *) &model);
+                }, const_cast<llama_model *>(&model));
             ggml_backend_sched_set_weight_read_padded_callback(sched.get(),
                 [](void * user_data, const void * logical_src, void * dst, size_t capacity, size_t size, size_t * data_offset) {
                     return static_cast<const llama_model *>(user_data)->read_sequential_weight_padded(
                         logical_src, dst, capacity, size, data_offset);
-                }, (void *) &model);
+                }, const_cast<llama_model *>(&model));
         }
         if (sequential_weight_budget > 0) {
             for (ggml_backend_t backend : backend_ptrs) {
@@ -737,12 +737,12 @@ void llama_context::sched_reserve() {
                         ggml_backend_sched_set_weight_read_callback(sched.get(),
                             [](void * user_data, const void * logical_src, void * dst, size_t size) {
                                 return static_cast<const llama_model *>(user_data)->read_sequential_weight(logical_src, dst, size);
-                            }, (void *) &model);
+                            }, const_cast<llama_model *>(&model));
                         ggml_backend_sched_set_weight_read_padded_callback(sched.get(),
                             [](void * user_data, const void * logical_src, void * dst, size_t capacity, size_t size, size_t * data_offset) {
                                 return static_cast<const llama_model *>(user_data)->read_sequential_weight_padded(
                                     logical_src, dst, capacity, size, data_offset);
-                            }, (void *) &model);
+                            }, const_cast<llama_model *>(&model));
                     }
                     if (sequential_weight_budget > 0) {
                         for (ggml_backend_t backend : backend_ptrs) {

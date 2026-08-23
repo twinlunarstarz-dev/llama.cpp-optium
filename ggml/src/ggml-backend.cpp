@@ -1242,7 +1242,7 @@ static bool ggml_backend_sched_storage_task_exists(
 
 static int ggml_backend_sched_storage_prefetch_consume(
         ggml_backend_sched_t sched, int backend_id, const uint8_t * logical_src, size_t size,
-        const uint8_t ** data) {
+        uint8_t ** data) {
     for (int slot = 0; slot < GGML_BACKEND_SCHED_STAGING_SLOTS; ++slot) {
         auto & task = sched->storage_prefetch[backend_id][slot];
         if (!task.active || task.logical_src != logical_src || task.size != size) {
@@ -1260,7 +1260,7 @@ static int ggml_backend_sched_storage_prefetch_consume(
             task.success = false;
             return -1;
         }
-        *data = (const uint8_t *) ggml_backend_buffer_get_base(staging.buffers[slot]) + task.data_offset;
+        *data = (uint8_t *) ggml_backend_buffer_get_base(staging.buffers[slot]) + task.data_offset;
         task.active = false;
         task.success = false;
         return slot;
@@ -1270,7 +1270,7 @@ static int ggml_backend_sched_storage_prefetch_consume(
 
 static bool ggml_backend_sched_read_storage_into_slot(
         ggml_backend_sched_t sched, int backend_id, int slot,
-        const uint8_t * logical_src, size_t size, const uint8_t ** data) {
+        const uint8_t * logical_src, size_t size, uint8_t ** data) {
     auto & staging = sched->staging[backend_id];
     void * base = ggml_backend_buffer_get_base(staging.buffers[slot]);
     size_t data_offset = 0;
@@ -1285,7 +1285,7 @@ static bool ggml_backend_sched_read_storage_into_slot(
     if (!ok || data_offset > staging.capacities[slot] || size > staging.capacities[slot] - data_offset) {
         return false;
     }
-    *data = (const uint8_t *) base + data_offset;
+    *data = (uint8_t *) base + data_offset;
     return true;
 }
 
@@ -1310,7 +1310,7 @@ static void ggml_backend_sched_weight_upload_chunked(
         const size_t chunk_size = instrument || storage_read ? GGML_BACKEND_SCHED_WEIGHT_UPLOAD_CHUNK_SIZE :
             (size > GGML_BACKEND_SCHED_WEIGHT_UPLOAD_CHUNK_THRESHOLD ? GGML_BACKEND_SCHED_WEIGHT_UPLOAD_CHUNK_SIZE : size);
         const size_t chunk = std::min(chunk_size, size - copied);
-        const uint8_t * staged_data = NULL;
+        uint8_t * staged_data = NULL;
         int slot = storage_read ? ggml_backend_sched_storage_prefetch_consume(
             sched, backend_id, src_bytes + copied, chunk, &staged_data) : -1;
         if (slot < 0 && (instrument || storage_read)) {
@@ -1324,8 +1324,8 @@ static void ggml_backend_sched_weight_upload_chunked(
                         GGML_ASSERT(false && "storage-backed weight callback rejected its logical source");
                     }
                 } else {
-                    staged_data = (const uint8_t *) ggml_backend_buffer_get_base(staging.buffers[slot]);
-                    memcpy((void *) staged_data, src_bytes + copied, chunk);
+                    staged_data = (uint8_t *) ggml_backend_buffer_get_base(staging.buffers[slot]);
+                    memcpy(staged_data, src_bytes + copied, chunk);
                 }
             }
         }
@@ -1453,41 +1453,35 @@ static void ggml_backend_sched_drain_residents(ggml_backend_sched_t sched) {
 }
 
 static bool ggml_backend_sched_make_resident_space(
-        ggml_backend_sched_t sched, int backend_id, size_t request, bool expert_tier) {
+        ggml_backend_sched_t sched, int backend_id, size_t request) {
     const size_t window = sched->weight_window_limit[backend_id];
-    // Keep dense/recurrent weights and compact expert slabs in independent tiers. A
-    // scan-resistant dense tier is deliberately not evicted by a one-use cyclic
-    // stream: once admitted, its stable subset produces hits on every later token.
-    // Expert slabs retain LFU/LRU replacement because their active set is dynamic.
-    const bool partitioned = window >= (size_t) 1024 * 1024 * 1024;
-    // Reserve half of the window for the currently executing split. DeepSeek V4
-    // has individual sequential allocations above 2 GiB on a roughly 4 GiB
-    // CUDA0 window, so filling most of the window with cache makes forward
-    // progress impossible even though cache admission itself succeeded.
-    const size_t tier_limit = !partitioned ? window :
-        (expert_tier ? window / 10 : (window * 4) / 10);
+    if (!sched->weight_window_configured[backend_id] || !sched->weight_window_memory_valid[backend_id] ||
+            request == 0 || request > window) {
+        return false;
+    }
     while (true) {
-        size_t tier_owned = 0;
-        for (const auto & entry : *sched->residents) {
-            const auto & resident = entry.second;
-            if (resident.backend_id == backend_id && resident.expert_tier == expert_tier) {
-                tier_owned += resident.allocation_size;
-            }
+        bool unknown = false;
+        bool live_rejected = false;
+        if (ggml_backend_sched_weight_window_admit(
+                sched, backend_id, request, &unknown, &live_rejected)) {
+            return true;
         }
-        if (request <= tier_limit && tier_owned <= tier_limit - request) {
-            bool unknown = false;
-            bool live_rejected = false;
-            return ggml_backend_sched_weight_window_admit(sched, backend_id, request, &unknown, &live_rejected);
-        }
-        if (partitioned && !expert_tier) {
+        if (unknown) {
             return false;
         }
+
+        // Dense weights and expert slabs share one global budget. Frequency first
+        // makes repeated dense weights scan-resistant, while completed-use breaks
+        // ties in LRU order for the changing MoE active set. Executing entries are
+        // part of the current working set and are never eviction candidates.
         auto victim = sched->residents->end();
         for (auto it = sched->residents->begin(); it != sched->residents->end(); ++it) {
-            if (it->second.backend_id == backend_id && it->second.expert_tier == expert_tier && !it->second.executing &&
-                    (victim == sched->residents->end() || it->second.frequency < victim->second.frequency ||
-                     (it->second.frequency == victim->second.frequency &&
-                      it->second.completed_use < victim->second.completed_use))) {
+            if (it->second.backend_id != backend_id || it->second.executing) {
+                continue;
+            }
+            if (victim == sched->residents->end() || it->second.frequency < victim->second.frequency ||
+                    (it->second.frequency == victim->second.frequency &&
+                     it->second.completed_use < victim->second.completed_use)) {
                 victim = it;
             }
         }
@@ -2340,6 +2334,62 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         }
     }
 
+    if (sched->force_weight_offload) {
+        const int cpu_backend_id = sched->n_backends - 1;
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            struct ggml_tensor * node = graph->nodes[i];
+            if (node->op != GGML_OP_MUL_MAT_ID || node->src[0] == NULL || node->src[2] == NULL) {
+                continue;
+            }
+            int * node_backend_id = &tensor_backend_id(node);
+            if (*node_backend_id < 0 || *node_backend_id == cpu_backend_id) {
+                continue;
+            }
+            const ggml_tensor * weights = node->src[0];
+            const ggml_tensor * ids = node->src[2];
+            if (weights->buffer == NULL || !ggml_backend_buffer_is_host(weights->buffer) ||
+                    weights->ne[2] <= 1 || weights->nb[2] == 0 || ids->ne[0] <= 0 || ids->ne[1] <= 0) {
+                continue;
+            }
+            const uint64_t n_ids = (uint64_t) ids->ne[0] > UINT64_MAX / (uint64_t) ids->ne[1] ?
+                UINT64_MAX : (uint64_t) ids->ne[0] * (uint64_t) ids->ne[1];
+            const uint64_t n_active = std::min<uint64_t>((uint64_t) weights->ne[2], n_ids);
+            const uint64_t estimate = n_active > UINT64_MAX / weights->nb[2] ?
+                UINT64_MAX : n_active * weights->nb[2];
+            auto backend_limit = [&](int backend_id) -> size_t {
+                return sched->weight_window_configured[backend_id] ?
+                    sched->weight_window_limit[backend_id] : sched->max_weight_bytes_per_split[backend_id];
+            };
+            const size_t selected_limit = backend_limit(*node_backend_id);
+            if (selected_limit == 0 || estimate <= selected_limit) {
+                continue;
+            }
+
+            int overflow_backend = -1;
+            for (int candidate = 0; candidate < cpu_backend_id; ++candidate) {
+                if (candidate == *node_backend_id || !ggml_backend_supports_op(sched->backends[candidate], node)) {
+                    continue;
+                }
+                const size_t limit = backend_limit(candidate);
+                if (limit > 0 && estimate <= limit) {
+                    overflow_backend = candidate;
+                    break;
+                }
+            }
+            if (overflow_backend < 0 && ggml_backend_supports_op(sched->backends[cpu_backend_id], node)) {
+                overflow_backend = cpu_backend_id;
+            }
+            if (overflow_backend >= 0) {
+                GGML_LOG_DEBUG("sequential MoE overflow: %s estimated active weights=%" PRIu64
+                    " bytes exceed backend %s limit=%zu; routing to %s\n",
+                    node->name, estimate, ggml_backend_name(sched->backends[*node_backend_id]), selected_limit,
+                    ggml_backend_name(sched->backends[overflow_backend]));
+                *node_backend_id = overflow_backend;
+                SET_CAUSE(node, "3.moe-overflow");
+            }
+        }
+    }
+
     // pass 4: assign backends to remaining src from dst and view_src
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
@@ -3079,7 +3129,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             bool unknown_memory = false;
             bool live_guard_rejected = false;
             const bool resident_admitted = cache_eligible && alloc_size > 0 &&
-                ggml_backend_sched_make_resident_space(sched, split_backend_id, alloc_size, expert_tier);
+                ggml_backend_sched_make_resident_space(sched, split_backend_id, alloc_size);
             const bool window_rejected = alloc_size > 0 && !resident_admitted &&
                 !ggml_backend_sched_weight_window_admit(sched, split_backend_id, alloc_size, &unknown_memory, &live_guard_rejected);
             if (alloc_size == 0 || limit_rejected || window_rejected) {
@@ -3278,19 +3328,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         const auto & compact_experts = *split->compact_experts[input_id];
                         const auto & compact_slots = *split->compact_slots[input_id];
                         const auto & compact_misses = *split->compact_misses[input_id];
-                        for (size_t compact_id = 0; compact_id < compact_experts.size(); ++compact_id) {
+                        for (size_t compact_id = 0; compact_id < compact_experts.size();) {
                             if (!compact_misses[compact_id]) {
+                                ++compact_id;
                                 continue;
+                            }
+                            size_t last = compact_id;
+                            while (last + 1 < compact_experts.size() && compact_misses[last + 1] &&
+                                    compact_experts[last + 1] == compact_experts[last] + 1 &&
+                                    compact_slots[last + 1] == compact_slots[last] + 1) {
+                                ++last;
                             }
                             const size_t src_offset = (size_t) compact_experts[compact_id] * expert_size;
                             const size_t dst_offset = (size_t) compact_slots[compact_id] * expert_size;
-                            // Every compact slot contains a complete expert, so there is no unused
-                            // inter-slot padding to initialize. Extending this copy according to the
-                            // destination slot can read past a final source expert and overwrite the
-                            // following resident slot when source and destination orders differ.
+                            const size_t copy_size = (last - compact_id + 1) * expert_size;
                             ggml_backend_sched_weight_upload_chunked(sched, split_backend, split_backend_id,
                                 input_cpy, (const uint8_t *) input->data + src_offset, dst_offset,
-                                expert_size, split->input_transient[input_id]);
+                                copy_size, split->input_transient[input_id]);
+                            compact_id = last + 1;
                         }
                         const size_t full_alloc = ggml_backend_buft_get_alloc_size(sched->bufts[split_backend_id], input);
                         ggml_backend_sched_counter_add(sched, &metrics.compact_physical_bytes, split->transient_sizes[input_id]);

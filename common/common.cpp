@@ -1445,7 +1445,21 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         cparams.n_samplers = pimpl->samplers_seq_config.size();
     }
 
-    llama_context * lctx = llama_init_from_model(model, cparams);
+    llama_context * lctx = nullptr;
+    while (true) {
+        lctx = llama_init_from_model(model, cparams);
+        if (lctx != nullptr || !params.sequential_load || cparams.n_ubatch <= 32) {
+            break;
+        }
+        const uint32_t next_ubatch = std::max<uint32_t>(32, cparams.n_ubatch / 2);
+        if (next_ubatch >= cparams.n_ubatch) {
+            break;
+        }
+        COM_WRN("sequential context allocation failed with ubatch=%u; retrying with ubatch=%u\n",
+            cparams.n_ubatch, next_ubatch);
+        cparams.n_ubatch = next_ubatch;
+        params.n_ubatch = (int32_t) next_ubatch;
+    }
     if (lctx == NULL) {
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
         return;
