@@ -408,6 +408,72 @@ size_t llama_file::size() const { return pimpl->size; }
 size_t llama_file::read_alignment() const { return pimpl->read_alignment(); }
 bool llama_file::has_direct_io() const { return pimpl->has_direct_io(); }
 
+
+void llama_file::read_at(void * ptr, size_t len, size_t offset) const {
+#ifdef __linux__
+    if (pimpl->fd != -1) {
+        const size_t alignment = pimpl->alignment;
+        if (len == 0) return;
+        if (offset > pimpl->size) throw std::runtime_error("direct pread offset exceeds file size");
+        const size_t aligned_offset = offset & ~(alignment - 1);
+        const size_t prefix = offset - aligned_offset;
+        const size_t aligned_size = (prefix + len + alignment - 1) & ~(alignment - 1);
+        void * raw = nullptr;
+        const int rc = posix_memalign(&raw, alignment, aligned_size);
+        if (rc != 0) throw std::runtime_error(format("posix_memalign failed with error %d", rc));
+        std::unique_ptr<void, decltype(&free)> buffer(raw, free);
+        size_t done = 0;
+        while (done < aligned_size) {
+            const ssize_t n = pread(pimpl->fd, static_cast<uint8_t *>(raw) + done,
+                                    aligned_size - done, aligned_offset + done);
+            if (n < 0 && errno == EINTR) continue;
+            if (n < 0) throw std::runtime_error(format("direct pread error: %s", strerror(errno)));
+            if (n == 0) { memset(static_cast<uint8_t *>(raw) + done, 0, aligned_size - done); break; }
+            done += static_cast<size_t>(n);
+        }
+        memcpy(ptr, static_cast<uint8_t *>(raw) + prefix, len);
+        return;
+    }
+#endif
+    const size_t saved = tell();
+    seek(offset, SEEK_SET);
+    const_cast<llama_file *>(this)->read_raw(ptr, len);
+    seek(saved, SEEK_SET);
+}
+
+bool llama_file::read_at_padded(void * base, size_t capacity, size_t len, size_t offset, size_t * data_offset) const {
+    if (data_offset == nullptr || base == nullptr || capacity < len) return false;
+#ifdef __linux__
+    if (pimpl->fd != -1) {
+        const size_t alignment = pimpl->alignment;
+        if (len == 0) { *data_offset = 0; return true; }
+        if (offset > pimpl->size) throw std::runtime_error("direct pread offset exceeds file size");
+        const size_t aligned_offset = offset & ~(alignment - 1);
+        const size_t prefix = offset - aligned_offset;
+        const size_t aligned_size = (prefix + len + alignment - 1) & ~(alignment - 1);
+        const uintptr_t begin = reinterpret_cast<uintptr_t>(base);
+        const uintptr_t aligned_ptr = (begin + alignment - 1) & ~(uintptr_t) (alignment - 1);
+        const size_t leading = aligned_ptr - begin;
+        if (leading <= capacity && aligned_size <= capacity - leading) {
+            size_t done = 0;
+            while (done < aligned_size) {
+                const ssize_t n = pread(pimpl->fd, reinterpret_cast<uint8_t *>(aligned_ptr) + done,
+                                        aligned_size - done, aligned_offset + done);
+                if (n < 0 && errno == EINTR) continue;
+                if (n < 0) throw std::runtime_error(format("direct pread error: %s", strerror(errno)));
+                if (n == 0) { memset(reinterpret_cast<uint8_t *>(aligned_ptr) + done, 0, aligned_size - done); break; }
+                done += static_cast<size_t>(n);
+            }
+            *data_offset = leading + prefix;
+            return true;
+        }
+    }
+#endif
+    read_at(base, len, offset);
+    *data_offset = 0;
+    return true;
+}
+
 int llama_file::file_id() const {
 #ifdef _WIN32
     return _fileno(pimpl->fp);

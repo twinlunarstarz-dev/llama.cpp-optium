@@ -1591,6 +1591,10 @@ bool llama_model_loader::load_all_data(
             const auto & file = files.at(weight->idx);
 
             if (ggml_backend_buffer_is_host(cur->buffer)) {
+                if (sequential_load && use_direct_io && cur->data != nullptr) {
+                    size_done += n_size;
+                    continue;
+                }
                 file->seek(weight->offs, SEEK_SET);
                 file->read_raw(cur->data, n_size);
                 if (check_tensors) {

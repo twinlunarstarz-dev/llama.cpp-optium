@@ -31,7 +31,9 @@
 #include <cstring>
 #include <cmath>
 #include <functional>
+#include <list>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <regex>
 #include <sstream>
@@ -1070,6 +1072,37 @@ struct llama_model::impl {
     // sequential load: keep weights CPU mmap-backed and let the scheduler stream
     // eligible weight ops to the device through normal split input copies.
     bool sequential_load = false;
+
+    struct direct_io_region {
+        uintptr_t logical_begin;
+        size_t size;
+        size_t file_offset;
+        llama_file * file;
+    };
+    struct direct_io_cache_key {
+        uintptr_t logical_begin;
+        size_t size;
+        bool operator==(const direct_io_cache_key & other) const {
+            return logical_begin == other.logical_begin && size == other.size;
+        }
+    };
+    struct direct_io_cache_key_hash {
+        size_t operator()(const direct_io_cache_key & key) const {
+            size_t h = std::hash<uintptr_t>{}(key.logical_begin);
+            return h ^ (std::hash<size_t>{}(key.size) + 0x9e3779b9 + (h << 6) + (h >> 2));
+        }
+    };
+    struct direct_io_cache_entry {
+        std::shared_ptr<std::vector<uint8_t>> data;
+        std::list<direct_io_cache_key>::iterator lru;
+    };
+    std::vector<direct_io_region> direct_io_regions;
+    std::vector<std::unique_ptr<llama_file>> direct_io_files;
+    mutable std::mutex direct_io_cache_mutex;
+    mutable std::unordered_map<direct_io_cache_key, direct_io_cache_entry, direct_io_cache_key_hash> direct_io_cache;
+    mutable std::list<direct_io_cache_key> direct_io_cache_lru;
+    mutable size_t direct_io_cache_bytes = 0;
+    size_t direct_io_cache_limit = (size_t) 4 * 1024 * 1024 * 1024;
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -1300,12 +1333,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         pimpl->sequential_load = true;
 
         // force mmap for disk streaming (no direct_io, no mlock)
-        if (!ml.use_mmap) {
-            LLAMA_LOG_WARN("%s: sequential load requires mmap, forcing use_mmap = true\n", __func__);
+        if (!ml.use_mmap && !ml.use_direct_io) {
+            LLAMA_LOG_WARN("%s: sequential load requires mmap or direct I/O; forcing mmap\n", __func__);
+            ml.use_mmap = true;
         }
-        ml.use_mmap    = true;
-        ml.use_direct_io = false;
-        params.use_mlock = false;
 
         // estimate how many layers can be resident at once, for diagnostics only.
         // The scheduler copies only the weights needed by each offloaded split.
@@ -1687,19 +1718,28 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 buf_map.emplace(idx, buf);
             }
         } else if (ml.sequential_load && ggml_backend_buft_is_host(buft)) {
-            // sequential mode: CPU tensors point directly to mmap (no RAM copy)
-            // tensors retain their GGUF file offsets as data pointers
             GGML_ASSERT(!ml.no_alloc);
-            ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
+            ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // logical-source buffer
             for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
                 t->buffer = buf;
                 const auto * weight = ml.get_weight(ggml_get_name(t));
-                if (weight && weight->idx < ml.mappings.size()) {
+                if (weight == nullptr) {
+                    throw std::runtime_error(format("sequential tensor '%s' has no GGUF source", t->name));
+                }
+                if (ml.use_direct_io) {
+                    const uintptr_t logical = (((uintptr_t) weight->idx + 1) << 48) | weight->offs;
+                    t->data = reinterpret_cast<void *>(logical);
+                    pimpl->direct_io_regions.push_back({logical, ggml_nbytes(t), weight->offs, ml.files.at(weight->idx).get()});
+                } else {
+                    if (weight->idx >= ml.mappings.size() || ml.mappings.at(weight->idx) == nullptr) {
+                        throw std::runtime_error(format("sequential tensor '%s' has no stable mapped GGUF source", t->name));
+                    }
                     const auto & mapping = ml.mappings.at(weight->idx);
-                    t->data = (uint8_t *)mapping->addr() + weight->offs;
+                    t->data = (uint8_t *) mapping->addr() + weight->offs;
                 }
             }
-            LLAMA_LOG_INFO("%s: sequential load: CPU tensors mapped directly to mmap (no RAM allocation)\n", __func__);
+            LLAMA_LOG_INFO("%s: sequential load: CPU tensors use %s sources (no model-sized RAM allocation)\n",
+                __func__, ml.use_direct_io ? "direct-I/O" : "mmap");
             bufs.emplace_back(buf);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 buf_map.emplace(idx, buf);
@@ -1789,6 +1829,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
     }
+    if (pimpl->sequential_load && ml.use_direct_io) {
+        for (auto & file : ml.files) {
+            pimpl->direct_io_files.emplace_back(std::move(file));
+        }
+    }
 
     return true;
 }
@@ -1843,6 +1888,69 @@ llama_split_mode llama_model::split_mode() const {
 
 bool llama_model::is_sequential() const {
     return pimpl->sequential_load;
+}
+
+
+bool llama_model::read_sequential_weight(const void * logical_src, void * dst, size_t size) const {
+    size_t data_offset = 0;
+    return read_sequential_weight_padded(logical_src, dst, size, size, &data_offset) && data_offset == 0;
+}
+
+bool llama_model::read_sequential_weight_padded(
+        const void * logical_src, void * dst, size_t capacity, size_t size, size_t * data_offset) const {
+    if (dst == nullptr || data_offset == nullptr || capacity < size) return false;
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(logical_src);
+    const impl::direct_io_cache_key key{begin, size};
+    std::shared_ptr<std::vector<uint8_t>> cached;
+    {
+        std::lock_guard<std::mutex> lock(pimpl->direct_io_cache_mutex);
+        auto hit = pimpl->direct_io_cache.find(key);
+        if (hit != pimpl->direct_io_cache.end()) {
+            cached = hit->second.data;
+            pimpl->direct_io_cache_lru.splice(pimpl->direct_io_cache_lru.begin(),
+                pimpl->direct_io_cache_lru, hit->second.lru);
+        }
+    }
+    if (cached) {
+        memcpy(dst, cached->data(), size);
+        *data_offset = 0;
+        return true;
+    }
+    for (const auto & region : pimpl->direct_io_regions) {
+        if (begin >= region.logical_begin && begin - region.logical_begin <= region.size &&
+                size <= region.size - (begin - region.logical_begin)) {
+            const size_t file_offset = region.file_offset + (begin - region.logical_begin);
+            if (!region.file->read_at_padded(dst, capacity, size, file_offset, data_offset)) return false;
+            const char * env = getenv("LLAMA_SEQUENTIAL_HOST_CACHE_MB");
+            size_t limit = pimpl->direct_io_cache_limit;
+            if (env != nullptr && env[0] != '\0') {
+                char * end = nullptr;
+                const unsigned long long mb = strtoull(env, &end, 10);
+                if (end != env) limit = mb > SIZE_MAX / (1024ull * 1024ull) ? SIZE_MAX : (size_t) mb * 1024ull * 1024ull;
+            }
+            if (limit > 0 && size <= limit) {
+                auto data = std::make_shared<std::vector<uint8_t>>(size);
+                memcpy(data->data(), static_cast<uint8_t *>(dst) + *data_offset, size);
+                std::lock_guard<std::mutex> lock(pimpl->direct_io_cache_mutex);
+                auto existing = pimpl->direct_io_cache.find(key);
+                if (existing == pimpl->direct_io_cache.end()) {
+                    while (!pimpl->direct_io_cache_lru.empty() && pimpl->direct_io_cache_bytes > limit - size) {
+                        const auto victim_key = pimpl->direct_io_cache_lru.back();
+                        auto victim = pimpl->direct_io_cache.find(victim_key);
+                        GGML_ASSERT(victim != pimpl->direct_io_cache.end());
+                        pimpl->direct_io_cache_bytes -= victim->second.data->size();
+                        pimpl->direct_io_cache.erase(victim);
+                        pimpl->direct_io_cache_lru.pop_back();
+                    }
+                    pimpl->direct_io_cache_lru.push_front(key);
+                    pimpl->direct_io_cache.emplace(key, impl::direct_io_cache_entry{data, pimpl->direct_io_cache_lru.begin()});
+                    pimpl->direct_io_cache_bytes += size;
+                }
+            }
+            return true;
+        }
+    }
+    return false;
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {
