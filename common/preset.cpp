@@ -46,10 +46,8 @@ std::vector<std::string> common_preset::to_args(const std::string & bin_path) co
             continue; // skip preset-only options (they are not CLI args)
         }
 
-        // Sequential loading keeps its shorter spelling canonical; the longer
-        // form is input compatibility only.
-        const bool sequential = opt.env && strcmp(opt.env, "LLAMA_ARG_SEQUENTIAL") == 0;
-        args.push_back(sequential ? "--sequential" : opt.args.back());
+        // use the last arg as the main arg (i.e. --long-form)
+        args.push_back(opt.args.back());
 
         // handle value(s)
         if (opt.value_hint == nullptr && opt.value_hint_2 == nullptr) {
@@ -57,7 +55,7 @@ std::vector<std::string> common_preset::to_args(const std::string & bin_path) co
             if (common_arg_utils::is_falsey(value)) {
                 // use negative arg if available
                 if (!opt.args_neg.empty()) {
-                    args.back() = sequential ? "--no-sequential" : opt.args_neg.back();
+                    args.back() = opt.args_neg.back();
                 } else {
                     // otherwise, skip the flag
                     // TODO: maybe throw an error instead?
@@ -87,8 +85,7 @@ std::string common_preset::to_ini() const {
     for (const auto & [opt, value] : options) {
         auto espaced_value = value;
         string_replace_all(espaced_value, "\n", "\\\n");
-        const bool sequential = opt.env && strcmp(opt.env, "LLAMA_ARG_SEQUENTIAL") == 0;
-        ss << (sequential ? "sequential-load" : rm_leading_dashes(opt.args.back())) << " = ";
+        ss << rm_leading_dashes(opt.args.back()) << " = ";
         ss << espaced_value << "\n";
     }
     ss << "\n";
@@ -317,24 +314,26 @@ common_presets common_preset_context::load_from_ini(const std::string & path, co
                     key.c_str()
                 ));
             }
-            // Preserve only the exact legacy spelling for sequential loading.
-            // Unknown underscore-separated keys must remain errors.
-            const std::string canonical_key = key == "sequential_load" ? "sequential-load" : key;
-            auto it = key_to_opt.find(canonical_key);
-            if (it != key_to_opt.end()) {
-                const auto & opt = it->second;
+            if (key_to_opt.find(key) != key_to_opt.end()) {
+                const auto & opt = key_to_opt.at(key);
                 if (is_bool_arg(opt)) {
                     preset.options[opt] = parse_bool_arg(opt, key, value);
                 } else {
                     preset.options[opt] = value;
                 }
                 LOG_DBG("accepted option: %s = %s\n", key.c_str(), preset.options[opt].c_str());
+            } else if (ignore_unknown_keys) {
+                LOG_WRN("ignoring option '%s' from %s: not supported by this program\n", key.c_str(), path.c_str());
             } else {
                 throw std::runtime_error(string_format(
                     "option '%s' not recognized in preset '%s'",
                     key.c_str(), preset.name.c_str()
                 ));
             }
+        }
+
+        if (preset.name == COMMON_PRESET_DEFAULT_NAME && preset.options.empty()) {
+            continue;
         }
 
         if (preset.name == "*") {
@@ -366,7 +365,24 @@ struct local_model {
     std::string name;
     std::string path;
     std::string path_mmproj;
+    std::string path_draft;
 };
+
+// TODO @ngxson: handle "eagle3-" when it's supported by common_speculative_types_from_gguf()
+static const char * draft_prefixes[] = { "mtp-", "dspark-", "dflash-" };
+
+static bool is_mmproj_file(const std::string & fname) {
+    return fname.find("mmproj") != std::string::npos;
+}
+
+static bool is_draft_file(const std::string & fname) {
+    for (const auto & prefix : draft_prefixes) {
+        if (fname.rfind(prefix, 0) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
 
 common_presets common_preset_context::load_from_models_dir(const std::string & models_dir) const {
     if (!std::filesystem::exists(models_dir) || !std::filesystem::is_directory(models_dir)) {
@@ -379,10 +395,15 @@ common_presets common_preset_context::load_from_models_dir(const std::string & m
         common_file_info model_file;
         common_file_info first_shard_file;
         common_file_info mmproj_file;
+        common_file_info draft_file;
         for (const auto & file : files) {
             if (string_ends_with(file.name, ".gguf")) {
-                if (file.name.find("mmproj") != std::string::npos) {
+                if (is_mmproj_file(file.name)) {
                     mmproj_file = file;
+                } else if (is_draft_file(file.name)) {
+                    if (draft_file.path.empty()) {
+                        draft_file = file; // first sidecar found wins
+                    }
                 } else if (file.name.find("-00001-of-") != std::string::npos) {
                     first_shard_file = file;
                 } else {
@@ -394,7 +415,8 @@ common_presets common_preset_context::load_from_models_dir(const std::string & m
         local_model model{
             /* name        */ name,
             /* path        */ first_shard_file.path.empty() ? model_file.path : first_shard_file.path,
-            /* path_mmproj */ mmproj_file.path // can be empty
+            /* path_mmproj */ mmproj_file.path, // can be empty
+            /* path_draft  */ draft_file.path   // can be empty
         };
         if (!model.path.empty()) {
             models.push_back(model);
@@ -406,13 +428,17 @@ common_presets common_preset_context::load_from_models_dir(const std::string & m
         if (file.is_dir) {
             scan_subdir(file.path, file.name);
         } else if (string_ends_with(file.name, ".gguf")) {
+            if (is_mmproj_file(file.name) || is_draft_file(file.name)) {
+                continue; // companion file, cannot be loaded as a model on its own
+            }
             // single file model
             std::string name = file.name;
             string_replace_all(name, ".gguf", "");
             local_model model{
                 /* name        */ name,
                 /* path        */ file.path,
-                /* path_mmproj */ ""
+                /* path_mmproj */ "",
+                /* path_draft  */ ""
             };
             models.push_back(model);
         }
@@ -426,6 +452,9 @@ common_presets common_preset_context::load_from_models_dir(const std::string & m
         preset.set_option(*this, "LLAMA_ARG_MODEL", model.path);
         if (!model.path_mmproj.empty()) {
             preset.set_option(*this, "LLAMA_ARG_MMPROJ", model.path_mmproj);
+        }
+        if (!model.path_draft.empty()) {
+            preset.set_option(*this, "LLAMA_ARG_SPEC_DRAFT_MODEL", model.path_draft);
         }
         out[preset.name] = preset;
     }

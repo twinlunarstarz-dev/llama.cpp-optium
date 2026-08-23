@@ -15,8 +15,7 @@ def stop_server_after_each_test():
         server.stop()
 
 
-@pytest.fixture(scope="module", autouse=True)
-def do_something():
+@pytest.fixture(scope="session", autouse=True)
+def load_server_presets():
     # this will be run once per test session, before any tests
-    if os.environ.get("LLAMA_SERVER_TEST_SKIP_MODEL_PRELOAD") != "1":
-        ServerPreset.load_all()
+    ServerPreset.load_all()

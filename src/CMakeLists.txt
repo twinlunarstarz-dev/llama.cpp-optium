@@ -25,6 +25,8 @@ add_library(llama
             llama-kv-cache.cpp
             llama-kv-cache-iswa.cpp
             llama-kv-cache-dsa.cpp
+            llama-kv-cache-dsa-iswa.cpp
+            llama-kv-cache-msa.cpp
             llama-kv-cache-dsv4.cpp
             llama-memory.cpp
             llama-memory-hybrid.cpp
@@ -35,10 +37,6 @@ add_library(llama
             llama-model-saver.cpp
             llama-model.cpp
             llama-quant.cpp
-            llama-train-quant.cpp
-            llama-train-identity.cpp
-            llama-train-state.cpp
-            llama-train-checkpoint.cpp
             llama-sampler.cpp
             llama-vocab.cpp
             unicode-data.cpp
@@ -48,9 +46,14 @@ add_library(llama
             )
 
 set_target_properties(llama PROPERTIES
-    VERSION ${LLAMA_INSTALL_VERSION}
-    SOVERSION 0
+    VERSION ${LLAMA_VERSION_BASE}
+    SOVERSION ${LLAMA_VERSION_MAJOR}
     MACHO_CURRENT_VERSION 0 # keep macOS linker from seeing oversized version number
+)
+
+target_compile_definitions(llama PRIVATE
+    LLAMA_VERSION="${LLAMA_VERSION}"
+    LLAMA_COMMIT="${LLAMA_BUILD_COMMIT}"
 )
 
 target_include_directories(llama PRIVATE .)
@@ -58,14 +61,6 @@ target_include_directories(llama PUBLIC ../include)
 target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
-
-# P2: Link OpenSSL for SHA-256 hashing in llama-train-identity.cpp
-if (LLAMA_OPENSSL)
-    find_package(OpenSSL QUIET)
-    if (OPENSSL_FOUND)
-        target_link_libraries(llama PRIVATE OpenSSL::Crypto)
-    endif()
-endif()
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
