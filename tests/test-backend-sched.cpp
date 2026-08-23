@@ -418,6 +418,7 @@ static void test_transient_success_and_failures() {
 
 static void test_weight_upload_fast_path() {
     constexpr size_t CHUNK = 64u * 1024u * 1024u;
+    constexpr size_t ADAPTIVE_CHUNK = 32u * 1024u * 1024u;
     test_env env(2);
     ggml_tensor * weight = env.weight_1d(CHUNK / sizeof(float) + 1);
     env.allocate_weights();
@@ -431,16 +432,17 @@ static void test_weight_upload_fast_path() {
     ggml_backend_sched_t sched = make_sched(env);
     GGML_ASSERT(ggml_backend_sched_alloc_graph(sched, graph));
     GGML_ASSERT(ggml_backend_sched_graph_compute_async(sched, graph) == GGML_STATUS_SUCCESS);
-    GGML_ASSERT(env.mock.ctx.transfer_sizes.size() == 2);
-    GGML_ASSERT(env.mock.ctx.transfer_sizes[0] == CHUNK);
-    GGML_ASSERT(env.mock.ctx.transfer_sizes[1] == sizeof(float));
+    GGML_ASSERT(env.mock.ctx.transfer_sizes.size() == 3);
+    GGML_ASSERT(env.mock.ctx.transfer_sizes[0] == ADAPTIVE_CHUNK);
+    GGML_ASSERT(env.mock.ctx.transfer_sizes[1] == ADAPTIVE_CHUNK);
+    GGML_ASSERT(env.mock.ctx.transfer_sizes[2] == sizeof(float));
 
     const auto metrics = get_metrics(sched);
     const auto & row = metrics.backends[0];
-    GGML_ASSERT(row.upload_count == 1 && row.upload_chunk_count == 2);
+    GGML_ASSERT(row.upload_count == 1 && row.upload_chunk_count == 3);
     GGML_ASSERT(row.uploaded_logical_bytes == CHUNK + sizeof(float));
-    GGML_ASSERT(row.max_upload_chunk_bytes == CHUNK);
-    GGML_ASSERT(row.staged_upload_chunk_count == 2 && row.staged_upload_bytes == CHUNK + sizeof(float));
+    GGML_ASSERT(row.max_upload_chunk_bytes == ADAPTIVE_CHUNK);
+    GGML_ASSERT(row.staged_upload_chunk_count == 3 && row.staged_upload_bytes == CHUNK + sizeof(float));
     GGML_ASSERT(row.staging_buffer_bytes == CHUNK + sizeof(float));
 
     ggml_backend_sched_free(sched);

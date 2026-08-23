@@ -1698,17 +1698,47 @@ bool llama_model_loader::load_all_data(
     if (size_done >= size_data) {
         // unmap offloaded tensors and metadata
         if (use_mmap) {
+            bool (*reg_fn)(void *, size_t) = nullptr;
+            void (*unreg_fn)(void *) = nullptr;
+            const char * register_host_env = getenv("GGML_CUDA_REGISTER_HOST");
+            const bool register_host = !sequential_load && register_host_env != nullptr && atoi(register_host_env) != 0;
+
+            if (register_host) {
+                // Resolve the generic host-registration hook from the first backend
+                // that exposes it. CUDA's implementation uses cudaHostRegister.
+                for (size_t i = 0; i < ggml_backend_dev_count() && reg_fn == nullptr; ++i) {
+                    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_dev_get(i));
+                    reg_fn = (bool (*)(void *, size_t)) ggml_backend_reg_get_proc_address(
+                        reg, "ggml_backend_register_host_buffer");
+                    unreg_fn = (void (*)(void *)) ggml_backend_reg_get_proc_address(
+                        reg, "ggml_backend_unregister_host_buffer");
+                    if (reg_fn == nullptr || unreg_fn == nullptr) {
+                        reg_fn = nullptr;
+                        unreg_fn = nullptr;
+                    }
+                }
+            }
+
             for (uint32_t idx = 0; idx < mappings.size(); idx++) {
                 const auto & mmap_used = mmaps_used.at(idx);
                 auto & mapping = mappings.at(idx);
                 if (sequential_load) {
                     // sequential mode: keep tensor data mapped for on-demand disk paging;
-                    // only unmap the metadata header (before first tensor)
+                    // only unmap the metadata header (before first tensor). Never pin
+                    // this full span: sequential mode must work when the model exceeds RAM.
                     mapping->unmap_fragment(0, mmap_used.first);
                 } else {
                     mapping->unmap_fragment(0, mmap_used.first);
                     if (mmap_used.second != 0) {
                         mapping->unmap_fragment(mmap_used.second, mapping->size());
+                    }
+                    if (mmap_used.second > mmap_used.first && reg_fn != nullptr && unreg_fn != nullptr) {
+                        const size_t n_registered = mapping->register_host(
+                            mmap_used.first, mmap_used.second, reg_fn, unreg_fn);
+                        if (n_registered > 0) {
+                            LLAMA_LOG_INFO("%s: registered %.2f MiB of mmap-backed CPU weights for direct H2D DMA\n",
+                                __func__, n_registered / 1024.0 / 1024.0);
+                        }
                     }
                 }
             }
