@@ -22,48 +22,77 @@ jobs:
         with:
           fetch-depth: 0
           ref: opt/sequential-freetoken-stack-2026-08-22
-      - name: Apply pending integration
+
+      - name: Apply final integration
         shell: bash
         run: |
           set -euo pipefail
           git config user.name "llama.cpp-optium integration"
           git config user.email "actions@users.noreply.github.com"
-          python3 -m py_compile integration/apply_pending.py
-          python3 integration/apply_pending.py
+          if [ -f integration/apply_pending.py ]; then
+            python3 -m py_compile integration/apply_pending.py
+            python3 integration/apply_pending.py
+          fi
+          if [ -f integration/apply_final.py ]; then
+            python3 -m py_compile integration/apply_final.py
+            python3 integration/apply_final.py
+          fi
           git diff --check
           if ! git diff --quiet; then
             git add -A
-            git commit -m 'sequential: apply FreeToken integration phase'
+            git commit -m 'sequential: complete CUDA streaming integration'
             git push origin HEAD:opt/sequential-freetoken-stack-2026-08-22
           fi
-      - name: CPU build and focused tests
+
+      - name: CPU configure
         shell: bash
         run: |
-          set +e
-          rm -rf build
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=OFF -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_SERVER=OFF >/tmp/configure.log 2>&1
-          c=$?; echo $c >/tmp/configure.rc
-          if [ $c -eq 0 ]; then cmake --build build -j2 >/tmp/build.log 2>&1; b=$?; else : >/tmp/build.log; b=99; fi
-          echo $b >/tmp/build.rc
-          if [ $b -eq 0 ]; then ctest --test-dir build --output-on-failure -R 'test-(arg-parser|llama-archs|sequential)' >/tmp/test.log 2>&1; t=$?; else : >/tmp/test.log; t=99; fi
-          echo $t >/tmp/test.rc
-          exit 0
-      - name: Publish validation
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_CUDA=OFF \
+            -DLLAMA_CURL=OFF \
+            -DLLAMA_BUILD_TESTS=ON \
+            -DLLAMA_BUILD_SERVER=OFF
+
+      - name: CPU build
+        shell: bash
+        run: cmake --build build -j2
+
+      - name: Focused tests
+        shell: bash
+        run: ctest --test-dir build --output-on-failure -R 'test-(arg-parser|llama-archs|sequential)'
+
+  cuda-compile:
+    needs: continue
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    container:
+      image: nvidia/cuda:12.8.1-devel-ubuntu24.04
+    steps:
+      - name: Install build tools
         shell: bash
         run: |
-          set -euo pipefail
-          {
-            echo '# FreeToken sequential continuation validation'
-            echo
-            echo "- configure rc: $(cat /tmp/configure.rc)"
-            echo "- build rc: $(cat /tmp/build.rc)"
-            echo "- focused tests rc: $(cat /tmp/test.rc)"
-            if [ "$(cat /tmp/configure.rc)" != 0 ]; then echo; echo '## Configure'; echo '```text'; tail -n 500 /tmp/configure.log; echo '```'; fi
-            if [ "$(cat /tmp/build.rc)" != 0 ]; then echo; echo '## Build'; echo '```text'; tail -n 900 /tmp/build.log; echo '```'; fi
-            if [ "$(cat /tmp/test.rc)" != 0 ] && [ "$(cat /tmp/test.rc)" != 99 ]; then echo; echo '## Tests'; echo '```text'; tail -n 900 /tmp/test.log; echo '```'; fi
-          } > integration/FREETOKEN_VALIDATION.md
-          git add integration/FREETOKEN_VALIDATION.md
-          if ! git diff --cached --quiet; then
-            git commit -m 'test: record FreeToken sequential continuation validation'
-            git push origin HEAD:opt/sequential-freetoken-stack-2026-08-22
-          fi
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git ca-certificates cmake ninja-build build-essential
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: opt/sequential-freetoken-stack-2026-08-22
+
+      - name: CUDA configure
+        shell: bash
+        run: |
+          cmake -S . -B build-cuda -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_CUDA=ON \
+            -DCMAKE_CUDA_ARCHITECTURES='75;86;89' \
+            -DGGML_CUDA_FA_ALL_QUANTS=ON \
+            -DLLAMA_CURL=OFF \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_SERVER=OFF
+
+      - name: CUDA compile
+        shell: bash
+        run: cmake --build build-cuda -j2 --target llama-cli
