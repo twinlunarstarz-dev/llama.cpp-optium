@@ -344,7 +344,6 @@ struct common_params_speculative_draft {
     common_cpu_params cpuparams_batch;
 
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
-    std::string device_raw;                  // deferred raw --device value for server router dispatch
 
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
 };
@@ -463,6 +462,7 @@ struct common_params {
 
     // offload params
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
+    std::string device_raw;                  // deferred raw --device value for server router dispatch
 
     int32_t n_gpu_layers       = -1;    // number of layers to store in VRAM, -1 is auto, <= -2 is all
     int32_t main_gpu           = 0;     // the GPU that is used for scratch and small tensors
