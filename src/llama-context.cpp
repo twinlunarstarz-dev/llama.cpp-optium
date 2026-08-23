@@ -532,9 +532,12 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
             ggml_backend_t backend_fused = ggml_backend_sched_get_tensor_backend(sched.get(), node.tensor);
             ggml_backend_dev_t device_fused = backend_fused ? ggml_backend_get_device(backend_fused) : nullptr;
 
-            // TODO: make this descriptor-specific; model.dev_layer() preserves the current behavior,
-            // but is still wrong for cases like --no-kv-offload.
-            ggml_backend_dev_t device_layer = model.dev_layer(node.il);
+            // Sequential weights are storage-backed, while fused attention/state
+            // kernels execute with the runtime layer/KV placement. Use that placement
+            // for capability probing so sequential mode does not disable CUDA fusion
+            // merely because persistent weights live on CPU.
+            ggml_backend_dev_t device_layer = model.is_sequential() ?
+                model.dev_kv_layer(node.il) : model.dev_layer(node.il);
 
             if (device_fused != device_layer) {
                 LLAMA_LOG_WARN("%s: layer %d is assigned to device %s but %s "

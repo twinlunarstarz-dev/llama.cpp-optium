@@ -1068,6 +1068,7 @@ struct llama_model::impl {
     layer_dev dev_input = {};
     layer_dev dev_output = {};
     std::vector<layer_dev> dev_layer;
+    std::vector<layer_dev> dev_kv_layer;
 
     bool has_tensor_overrides;
 
@@ -1444,10 +1445,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
     const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
-    auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
+    auto get_layer_buft_list = [&](int il, bool sequential_weight) -> llama_model::impl::layer_dev {
         const bool is_swa = il < n_layer_all && hparams.is_swa(il);
-        // sequential load: ALL layers start on CPU (mmap-direct), GPU window managed at runtime
-        if (pimpl->sequential_load) {
+        // Sequential weights remain CPU/storage-backed, but KV placement uses the
+        // ordinary layer/tensor-split mapping so --kv-offload remains effective.
+        if (pimpl->sequential_load && sequential_weight) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s (sequential, is_swa = %d)\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
             return {cpu_dev, &pimpl->cpu_buft_list};
         }
@@ -1465,14 +1467,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // there is very little benefit to offloading the input layer, so always keep it on the CPU
     pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
 
-    // assign the repeating layers to the devices according to the splits
+    // Assign persistent weights and KV independently. In ordinary loading the
+    // two maps are identical; sequential loading keeps only weights host-backed.
     pimpl->dev_layer.resize(n_layer_all);
+    pimpl->dev_kv_layer.resize(n_layer_all);
     for (int il = 0; il < n_layer_all; ++il) {
-        pimpl->dev_layer[il] = get_layer_buft_list(il);
+        pimpl->dev_layer[il] = get_layer_buft_list(il, true);
+        pimpl->dev_kv_layer[il] = pimpl->sequential_load ?
+            get_layer_buft_list(il, false) : pimpl->dev_layer[il];
     }
 
     // assign the output layer
-    pimpl->dev_output = get_layer_buft_list(n_layer_all);
+    pimpl->dev_output = get_layer_buft_list(n_layer_all, true);
 
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
 
@@ -2202,6 +2208,10 @@ void llama_model::print_info() const {
 
 ggml_backend_dev_t llama_model::dev_layer(int il) const {
     return pimpl->dev_layer.at(il).dev;
+}
+
+ggml_backend_dev_t llama_model::dev_kv_layer(int il) const {
+    return pimpl->dev_kv_layer.at(il).dev;
 }
 
 ggml_backend_dev_t llama_model::dev_output() const {
