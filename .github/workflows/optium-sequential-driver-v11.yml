@@ -40,7 +40,7 @@ jobs:
             mkdir -p /tmp/report
             {
               echo '# Sequential port failure'; echo
-              echo "- driver: v11"
+              echo "- driver: v11-fixed"
               echo "- step: $STEP"
               echo "- exit code: $rc"
               [ -z "$DETAIL" ] || echo "- detail: $DETAIL"
@@ -55,9 +55,9 @@ jobs:
             mkdir -p integration
             cp /tmp/report/REPORT.md integration/REPORT.md
             git add integration/REPORT.md
-            git commit -m 'integration: report sequential port failure v11'
+            git commit -m 'integration: report sequential port failure v11-fixed'
             git push --force origin HEAD:"$BRANCH"
-            exit 0
+            exit 1
           }
           trap fail_report ERR
 
@@ -77,7 +77,8 @@ jobs:
           rc=$?
           set -e
           if [ $rc -ne 0 ]; then
-            if git ls-files -u -- tests/test-backend-sched.cpp | grep -q .; then
+            test_unmerged="$(git ls-files -u -- tests/test-backend-sched.cpp)"
+            if [ -n "$test_unmerged" ]; then
               DETAIL='keeping current-upstream deletion of tests/test-backend-sched.cpp'
               git rm -f -- tests/test-backend-sched.cpp
             fi
@@ -132,7 +133,7 @@ jobs:
           set -euo pipefail
           {
             echo '# Sequential port validation'; echo
-            echo '- driver: v11'
+            echo '- driver: v11-fixed'
             echo "- configure rc: $(cat /tmp/configure.rc)"
             echo "- build rc: $(cat /tmp/build.rc)"
             echo "- focused tests rc: $(cat /tmp/test.rc)"
