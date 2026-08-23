@@ -40,7 +40,7 @@ jobs:
             mkdir -p /tmp/report
             {
               echo '# Sequential port failure'; echo
-              echo "- driver: v11-fixed"
+              echo "- driver: v11-final"
               echo "- step: $STEP"
               echo "- exit code: $rc"
               [ -z "$DETAIL" ] || echo "- detail: $DETAIL"
@@ -55,7 +55,7 @@ jobs:
             mkdir -p integration
             cp /tmp/report/REPORT.md integration/REPORT.md
             git add integration/REPORT.md
-            git commit -m 'integration: report sequential port failure v11-fixed'
+            git commit -m 'integration: report sequential port failure v11-final'
             git push --force origin HEAD:"$BRANCH"
             exit 1
           }
@@ -72,10 +72,15 @@ jobs:
           git cherry-pick -X theirs 4012e11809111501ef9b735d8c461335f0e6b3c4
 
           STEP='multi-GPU sequential loading'
+          # This cherry-pick is expected to return nonzero solely because current upstream
+          # deleted tests/test-backend-sched.cpp. Disable ERR handling around that expected
+          # return so we can resolve the modify/delete conflict deliberately.
+          trap - ERR
           set +e
           git cherry-pick -X theirs 1dabfb09614957038300beb5ab9622df82a7a2b7
           rc=$?
           set -e
+          trap fail_report ERR
           if [ $rc -ne 0 ]; then
             test_unmerged="$(git ls-files -u -- tests/test-backend-sched.cpp)"
             if [ -n "$test_unmerged" ]; then
@@ -133,7 +138,7 @@ jobs:
           set -euo pipefail
           {
             echo '# Sequential port validation'; echo
-            echo '- driver: v11-fixed'
+            echo '- driver: v11-final'
             echo "- configure rc: $(cat /tmp/configure.rc)"
             echo "- build rc: $(cat /tmp/build.rc)"
             echo "- focused tests rc: $(cat /tmp/test.rc)"
