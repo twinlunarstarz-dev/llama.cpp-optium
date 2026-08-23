@@ -6,7 +6,7 @@ on:
       - .ci-fable-moe-trigger
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   validate:
@@ -31,13 +31,57 @@ jobs:
             -DLLAMA_BUILD_TESTS=ON
       - name: Build core and architecture fixture
         run: cmake --build build-fable-cpu -j2 --target llama test-llama-archs
-      - name: Collect patched sources
+      - name: Materialize validated commit object without moving a ref
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          mkdir -p /tmp/fable-patched/ggml/src /tmp/fable-patched/src
-          cp ggml/src/ggml-backend.cpp /tmp/fable-patched/ggml/src/
-          cp src/llama-mmap.cpp src/llama-mmap.h src/llama-model-loader.cpp /tmp/fable-patched/src/
-          git diff -- ggml/src/ggml-backend.cpp src/llama-mmap.cpp src/llama-mmap.h src/llama-model-loader.cpp > /tmp/fable-patched/fable-moe.patch
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, subprocess, urllib.request
+
+          repo = os.environ['GITHUB_REPOSITORY']
+          token = os.environ['GH_TOKEN']
+          parent = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          base_tree = subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip()
+          paths = [
+              'ggml/src/ggml-backend.cpp',
+              'src/llama-mmap.cpp',
+              'src/llama-mmap.h',
+              'src/llama-model-loader.cpp',
+          ]
+          tree = [
+              {'path': p, 'mode': '100644', 'type': 'blob', 'content': open(p, encoding='utf-8').read()}
+              for p in paths
+          ]
+          tree += [
+              {'path': 'integration/apply_fable_moe.py', 'mode': '100644', 'type': 'blob', 'sha': None},
+              {'path': '.github/workflows/fable-moe-validate.yml', 'mode': '100644', 'type': 'blob', 'sha': None},
+          ]
+
+          def api(method, path, body=None):
+              data = None if body is None else json.dumps(body).encode()
+              req = urllib.request.Request(
+                  f'https://api.github.com/repos/{repo}/{path}', data=data, method=method,
+                  headers={
+                      'Authorization': f'Bearer {token}',
+                      'Accept': 'application/vnd.github+json',
+                      'X-GitHub-Api-Version': '2022-11-28',
+                      'Content-Type': 'application/json',
+                  })
+              with urllib.request.urlopen(req) as resp:
+                  return json.load(resp)
+
+          new_tree = api('POST', 'git/trees', {'base_tree': base_tree, 'tree': tree})['sha']
+          commit = api('POST', 'git/commits', {
+              'message': 'moe: port Fable mmap pinning and prefill overlap',
+              'tree': new_tree,
+              'parents': [parent],
+          })['sha']
+          print(f'FABLE_VALIDATED_COMMIT={commit}')
+          with open('/tmp/fable-validated-commit.txt', 'w') as f:
+              f.write(commit + '\n')
+          PY
       - uses: actions/upload-artifact@v4
         with:
-          name: fable-moe-patched-sources
-          path: /tmp/fable-patched
+          name: fable-validated-commit
+          path: /tmp/fable-validated-commit.txt
