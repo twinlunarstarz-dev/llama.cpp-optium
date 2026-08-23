@@ -675,7 +675,11 @@ void llama_context::sched_reserve() {
         ggml_backend_sched_set_force_weight_offload(sched.get(), true);
         ggml_backend_sched_set_async_weight_prefetch(sched.get(), true);
         if (sequential_weight_budget > 0) {
-            ggml_backend_sched_set_max_weight_bytes_per_split(sched.get(), sequential_weight_budget);
+            for (ggml_backend_t backend : backend_ptrs) {
+                if (ggml_backend_dev_type(ggml_backend_get_device(backend)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    ggml_backend_sched_set_max_weight_bytes_per_split(sched.get(), backend, sequential_weight_budget);
+                }
+            }
         }
     }
 
@@ -717,7 +721,11 @@ void llama_context::sched_reserve() {
                     ggml_backend_sched_set_force_weight_offload(sched.get(), true);
                     ggml_backend_sched_set_async_weight_prefetch(sched.get(), true);
                     if (sequential_weight_budget > 0) {
-                        ggml_backend_sched_set_max_weight_bytes_per_split(sched.get(), sequential_weight_budget);
+                        for (ggml_backend_t backend : backend_ptrs) {
+                            if (ggml_backend_dev_type(ggml_backend_get_device(backend)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                                ggml_backend_sched_set_max_weight_bytes_per_split(sched.get(), backend, sequential_weight_budget);
+                            }
+                        }
                     }
                 }
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
