@@ -1043,6 +1043,8 @@ struct llama_model::impl {
 
     std::string desc_str;
 
+    std::vector<float> tensor_split_owned;
+
     llama_ftype ftype = LLAMA_FTYPE_ALL_F32;
 
     // model memory mapped files
