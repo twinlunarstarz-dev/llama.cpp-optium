@@ -1,0 +1,77 @@
+name: Optium sequential scheduler repair v12
+
+on:
+  pull_request:
+    branches: [master]
+    paths:
+      - .github/OPTIUM_SEQUENTIAL_REPAIR_V12
+
+permissions:
+  contents: write
+
+concurrency:
+  group: optium-sequential-port-integration
+  cancel-in-progress: true
+
+jobs:
+  repair:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: opt/cuda-sequential-integration-2026-08-22
+
+      - name: Restore coherent fork scheduler unit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "llama.cpp-optium integration"
+          git config user.email "actions@users.noreply.github.com"
+          git fetch origin master
+          git checkout origin/master -- \
+            ggml/include/ggml-backend.h \
+            ggml/src/ggml-backend-impl.h \
+            ggml/src/ggml-backend.cpp
+          git add ggml/include/ggml-backend.h ggml/src/ggml-backend-impl.h ggml/src/ggml-backend.cpp
+          git commit -m 'sequential: restore coherent fork scheduler on current-upstream integration'
+          git push origin HEAD:opt/cuda-sequential-integration-2026-08-22
+
+      - name: CPU validation
+        shell: bash
+        run: |
+          set +e
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=OFF -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=ON >/tmp/configure.log 2>&1
+          c=$?; echo $c >/tmp/configure.rc
+          if [ $c -eq 0 ]; then cmake --build build -j2 >/tmp/build.log 2>&1; b=$?; else : >/tmp/build.log; b=99; fi
+          echo $b >/tmp/build.rc
+          if [ $b -eq 0 ]; then ctest --test-dir build --output-on-failure -R 'test-(arg-parser|llama-archs|sequential)' >/tmp/test.log 2>&1; t=$?; else : >/tmp/test.log; t=99; fi
+          echo $t >/tmp/test.rc
+          exit 0
+
+      - name: Publish validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo '# Sequential scheduler repair validation'; echo
+            echo '- driver: v12'
+            echo '- scheduler source: current fork master'
+            echo '- CUDA source: current upstream integration'
+            echo "- configure rc: $(cat /tmp/configure.rc)"
+            echo "- build rc: $(cat /tmp/build.rc)"
+            echo "- focused tests rc: $(cat /tmp/test.rc)"
+            if [ "$(cat /tmp/configure.rc)" != 0 ]; then
+              echo; echo '## Configure'; echo '```text'; tail -n 300 /tmp/configure.log; echo '```'
+            elif [ "$(cat /tmp/build.rc)" != 0 ]; then
+              echo; echo '## Build'; echo '```text'; tail -n 700 /tmp/build.log; echo '```'
+            elif [ "$(cat /tmp/test.rc)" != 0 ]; then
+              echo; echo '## Tests'; echo '```text'; tail -n 700 /tmp/test.log; echo '```'
+            else
+              echo; echo 'CPU configure/build and focused tests passed.'
+            fi
+          } > integration/VALIDATION.md
+          git add integration/VALIDATION.md
+          git commit -m 'test: record scheduler repair validation'
+          git push origin HEAD:opt/cuda-sequential-integration-2026-08-22
