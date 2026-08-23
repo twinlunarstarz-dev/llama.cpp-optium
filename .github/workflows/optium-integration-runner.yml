@@ -1,16 +1,16 @@
 name: Optium integration runner
 
 on:
-  issues:
-    types: [opened]
+  pull_request:
+    types: [opened, reopened, synchronize]
 
 permissions:
   contents: write
-  issues: write
+  pull-requests: write
 
 jobs:
   integrate:
-    if: github.event.issue.title == '[internal] run optium upstream integration'
+    if: github.event.pull_request.title == '[internal] run optium upstream integration'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -49,7 +49,7 @@ jobs:
         if: steps.port.outputs.apply_ok != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          ISSUE: ${{ github.event.issue.number }}
+          PR: ${{ github.event.pull_request.number }}
         run: |
           {
             echo 'Semantic three-way port found conflicts; no integration branch changes were pushed.'
@@ -59,7 +59,7 @@ jobs:
             echo 'Conflicting files:'
             sed 's/^/- `/' /tmp/conflicts.txt | sed 's/$/`/'
           } > /tmp/comment.md
-          gh issue comment "$ISSUE" --repo "$GITHUB_REPOSITORY" --body-file /tmp/comment.md
+          gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body-file /tmp/comment.md
 
       - name: Stop on patch conflicts
         if: steps.port.outputs.apply_ok != 'true'
@@ -67,8 +67,7 @@ jobs:
 
       - name: Commit semantic fork port
         if: steps.port.outputs.apply_ok == 'true'
-        run: |
-          git commit -m "sync: port fork functionality onto current upstream"
+        run: git commit -m "sync: port fork functionality onto current upstream"
 
       - name: Configure validation build
         if: steps.port.outputs.apply_ok == 'true'
@@ -90,7 +89,7 @@ jobs:
         if: steps.port.outputs.apply_ok == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          ISSUE: ${{ github.event.issue.number }}
+          PR: ${{ github.event.pull_request.number }}
         run: |
           sha=$(git rev-parse HEAD)
-          gh issue comment "$ISSUE" --repo "$GITHUB_REPOSITORY" --body "Semantic fork port applied, CPU validation build/tests passed, and integration branch was pushed at \`$sha\`."
+          gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body "Semantic fork port applied, CPU validation build/tests passed, and integration branch was pushed at \`$sha\`."
