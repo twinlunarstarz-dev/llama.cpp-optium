@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <filesystem>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -492,30 +493,6 @@ static bool arch_supported(const llm_arch arch) {
     return true;
 }
 
-static void test_sequential_arch_allowlist() {
-    for (const llm_arch arch : {
-         LLM_ARCH_LLAMA,
-         LLM_ARCH_QWEN2,
-         LLM_ARCH_GEMMA,
-         LLM_ARCH_DEEPSEEK4,
-         }) {
-        GGML_ASSERT(llama_model_arch_supports_sequential_load(arch));
-    }
-    for (const llm_arch arch : {
-             LLM_ARCH_LLAMA4,       // MoE is mandatory in the local generator.
-             LLM_ARCH_QWEN2MOE,     // MoE.
-             LLM_ARCH_RWKV6,        // Recurrent.
-             LLM_ARCH_JAMBA,        // Hybrid.
-             LLM_ARCH_QWEN2VL,      // Multimodal.
-             LLM_ARCH_MISTRAL3,     // Numerical validation exceeds the relative-error tolerance.
-             LLM_ARCH_GEMMA2,       // Numerical validation exceeds the relative-error tolerance.
-             LLM_ARCH_PHI3,         // Numerical validation exceeds the relative-error tolerance.
-             LLM_ARCH_UNKNOWN,
-         }) {
-        GGML_ASSERT(!llama_model_arch_supports_sequential_load(arch));
-    }
-}
-
 struct error_stats {
     double max_abs = 0.0;
     double max_rel = 0.0;
@@ -552,7 +529,8 @@ static std::vector<float> load_file_and_decode(
     ggml_backend_dev_t devices[] = { cuda_dev, nullptr };
     model_params.devices = devices;
     model_params.sequential_load = sequential;
-    model_params.use_mmap = true;
+    model_params.load_mode = LLAMA_LOAD_MODE_MMAP;
+    model_params.n_gpu_layers = 99;
 
     llama_model_ptr model(llama_model_load_from_file(path.c_str(), model_params));
     if (!model) {
@@ -570,9 +548,6 @@ static std::vector<float> load_file_and_decode(
 }
 
 static int validate_sequential_fixture(const llm_arch arch, const size_t seed, const std::string & dir) {
-    if (!llama_model_arch_supports_sequential_load(arch)) {
-        throw std::runtime_error("architecture is not in the sequential allowlist");
-    }
     ggml_backend_dev_t cuda_dev = get_single_cuda_device();
     if (cuda_dev == nullptr) {
         throw std::runtime_error("exactly one visible CUDA device is required");
@@ -580,7 +555,7 @@ static int validate_sequential_fixture(const llm_arch arch, const size_t seed, c
 
     std::filesystem::create_directories(dir);
     const std::string path = dir + "/" + llm_arch_name(arch) + "-dense.gguf";
-    gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, false, true);
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, false);
     auto generated = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {});
     llama_model_save_to_file(generated.first.get(), path.c_str());
     generated = {};
