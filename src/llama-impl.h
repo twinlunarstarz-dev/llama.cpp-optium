@@ -104,10 +104,3 @@ std::string llama_format_tensor_shape(const std::vector<int64_t> & ne);
 std::string llama_format_tensor_shape(const struct ggml_tensor * t);
 
 std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i);
-
-// Internal capability contract for the sequential model loader.
-bool llama_model_arch_supports_sequential_load(llm_arch arch);
-
-#define LLAMA_TENSOR_NAME_FATTN   "__fattn__"
-#define LLAMA_TENSOR_NAME_FGDN_AR "__fgdn_ar__"
-#define LLAMA_TENSOR_NAME_FGDN_CH "__fgdn_ch__"

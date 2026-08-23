@@ -1286,6 +1286,47 @@ struct common_init_result::impl {
     std::vector<llama_sampler_seq_config> samplers_seq_config;
 };
 
+static void common_validate_sequential_params(const common_params & params) {
+    if (!params.sequential_load) {
+        return;
+    }
+
+    std::vector<ggml_backend_dev_t> devices;
+    for (ggml_backend_dev_t dev : params.devices) {
+        if (dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            devices.push_back(dev);
+        }
+    }
+    if (devices.empty()) {
+        throw std::runtime_error("sequential loading requires at least one selected non-CPU device");
+    }
+
+    for (ggml_backend_dev_t device : devices) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
+        if (reg == nullptr || strcmp(ggml_backend_reg_name(reg), "CUDA") != 0) {
+            throw std::runtime_error("sequential loading currently requires native CUDA devices");
+        }
+    }
+    if (!params.use_mmap) {
+        throw std::runtime_error("sequential MVP requires mmap");
+    }
+    if (params.use_direct_io) {
+        throw std::runtime_error("sequential MVP does not support direct I/O");
+    }
+    if (params.use_mlock) {
+        throw std::runtime_error("sequential MVP does not support mlock");
+    }
+    if (params.no_alloc) {
+        throw std::runtime_error("sequential MVP does not support no-alloc model loading");
+    }
+    if (!params.lora_adapters.empty()) {
+        throw std::runtime_error("sequential MVP does not support LoRA adapters");
+    }
+    if (!params.control_vectors.empty()) {
+        throw std::runtime_error("sequential MVP does not support control vectors");
+    }
+}
+
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
     auto mparams = common_model_params_to_llama(params);
@@ -1323,6 +1364,13 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.fit_params_min_ctx,
             has_draft || spec_mtp ? &extra : nullptr,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+
+        // sequential mode requires mmap and non-no_alloc - restore after fit probing
+        if (params.sequential_load) {
+            mparams.use_mmap  = true;
+            mparams.no_alloc  = false;
+            mparams.use_mlock = false;
+        }
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
@@ -1688,9 +1736,14 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.split_mode      = params.split_mode;
     mparams.load_mode       = params.load_mode;
     mparams.tensor_split    = params.tensor_split;
+    mparams.use_mmap        = params.use_mmap || params.sequential_load; // force mmap for streaming
+    mparams.use_direct_io   = params.sequential_load ? false : params.use_direct_io;
+    mparams.use_mlock       = params.sequential_load ? false : params.use_mlock; // no mlock for streaming
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
+    mparams.no_alloc        = params.sequential_load ? false : params.no_alloc; // sequential needs alloc for mmap pointer assignment
+    mparams.sequential_load = params.sequential_load;
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
@@ -1708,8 +1761,6 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
 
     mparams.progress_callback           = params.load_progress_callback;
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
-    mparams.no_alloc                    = params.no_alloc;
-    mparams.load_mtp                    = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
 
     return mparams;
 }
@@ -1743,7 +1794,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.cb_eval_user_data = params.cb_eval_user_data;
     cparams.offload_kqv       = !params.no_kv_offload;
     cparams.no_perf           = params.no_perf;
-    cparams.op_offload        = !params.no_op_offload;
+    cparams.op_offload        = params.sequential_load ? true : !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
 

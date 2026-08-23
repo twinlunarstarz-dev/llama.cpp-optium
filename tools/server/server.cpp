@@ -133,8 +133,16 @@ int llama_server(common_params & params, int argc, char ** argv) {
 
     // router server never loads a model and must not touch the GPU
     const bool is_router_server = params.model.path.empty()
-                               && params.model.hf_repo.empty()
-                               && params.model.docker_repo.empty();
+                               && params.model.hf_repo.empty();
+
+    if (!is_router_server) {
+        try {
+            common_params_resolve_devices(params);
+        } catch (const std::exception & e) {
+            SRV_ERR("failed to resolve server devices: %s\n", e.what());
+            return 1;
+        }
+    }
 
     // skip device enumeration so the CUDA primary context stays uncreated
     common_params_print_info(params, !is_router_server);
@@ -469,6 +477,10 @@ int llama_server(common_params & params, int argc, char ** argv) {
             }
             SRV_ERR("%s", "exiting due to model loading error\n");
             return 1;
+        }
+
+        if (params.sequential_load) {
+            SRV_INF("%s", "sequential loading enabled with ordinary server feature composition\n");
         }
 
         routes.update_meta(ctx_server);
