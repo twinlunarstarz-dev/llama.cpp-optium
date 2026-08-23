@@ -1,0 +1,44 @@
+name: validate fable moe port
+
+on:
+  push:
+    branches:
+      - opt/fable-moe-prefill-2026-08-23
+    paths:
+      - .github/workflows/fable-moe-validate.yml
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: opt/fable-moe-prefill-2026-08-23
+      - name: Apply semantic port
+        run: |
+          set -euo pipefail
+          python3 integration/apply_fable_moe.py
+          git diff --check
+      - name: Configure CPU validation
+        run: |
+          cmake -S . -B build-fable-cpu \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_CUDA=OFF \
+            -DLLAMA_CURL=OFF \
+            -DLLAMA_BUILD_SERVER=OFF \
+            -DLLAMA_BUILD_TESTS=ON
+      - name: Build core and architecture fixture
+        run: cmake --build build-fable-cpu -j2 --target llama test-llama-archs
+      - name: Collect patched sources
+        run: |
+          mkdir -p /tmp/fable-patched/ggml/src /tmp/fable-patched/src
+          cp ggml/src/ggml-backend.cpp /tmp/fable-patched/ggml/src/
+          cp src/llama-mmap.cpp src/llama-mmap.h src/llama-model-loader.cpp /tmp/fable-patched/src/
+          git diff -- ggml/src/ggml-backend.cpp src/llama-mmap.cpp src/llama-mmap.h src/llama-model-loader.cpp > /tmp/fable-patched/fable-moe.patch
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fable-moe-patched-sources
+          path: /tmp/fable-patched
