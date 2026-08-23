@@ -54,8 +54,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
 
     llama_model_params mparams_copy = *mparams;
     mparams_copy.no_alloc        = true;
-    mparams_copy.use_mmap        = false;
-    mparams_copy.use_mlock       = false;
+    mparams_copy.load_mode       = LLAMA_LOAD_MODE_NONE;
     mparams_copy.sequential_load = false;
 
     llama_model * model = llama_model_load_from_file(path_model, mparams_copy);
@@ -139,7 +138,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     }
 
     hp_ngl         = llama_model_n_layer(model);
-    if (mparams->load_mtp) {
+    if (cparams->ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
         hp_ngl    += llama_model_n_layer_nextn(model);
     }
     hp_n_ctx_train = llama_model_n_ctx_train(model);
