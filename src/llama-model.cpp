@@ -1892,6 +1892,9 @@ bool llama_model::is_sequential() const {
     return pimpl->sequential_load;
 }
 
+bool llama_model::is_sequential_direct_io() const {
+    return pimpl->sequential_load && !pimpl->direct_io_regions.empty();
+}
 
 bool llama_model::read_sequential_weight(const void * logical_src, void * dst, size_t size) const {
     size_t data_offset = 0;

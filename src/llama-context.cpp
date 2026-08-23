@@ -674,6 +674,18 @@ void llama_context::sched_reserve() {
     if (model.is_sequential()) {
         ggml_backend_sched_set_force_weight_offload(sched.get(), true);
         ggml_backend_sched_set_async_weight_prefetch(sched.get(), true);
+        ggml_backend_sched_set_persistent_weight_residency(sched.get(), true);
+        if (model.is_sequential_direct_io()) {
+            ggml_backend_sched_set_weight_read_callback(sched.get(),
+                [](void * user_data, const void * logical_src, void * dst, size_t size) {
+                    return static_cast<const llama_model *>(user_data)->read_sequential_weight(logical_src, dst, size);
+                }, (void *) &model);
+            ggml_backend_sched_set_weight_read_padded_callback(sched.get(),
+                [](void * user_data, const void * logical_src, void * dst, size_t capacity, size_t size, size_t * data_offset) {
+                    return static_cast<const llama_model *>(user_data)->read_sequential_weight_padded(
+                        logical_src, dst, capacity, size, data_offset);
+                }, (void *) &model);
+        }
         if (sequential_weight_budget > 0) {
             for (ggml_backend_t backend : backend_ptrs) {
                 if (ggml_backend_dev_type(ggml_backend_get_device(backend)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
@@ -720,6 +732,18 @@ void llama_context::sched_reserve() {
                 if (model.is_sequential()) {
                     ggml_backend_sched_set_force_weight_offload(sched.get(), true);
                     ggml_backend_sched_set_async_weight_prefetch(sched.get(), true);
+                    ggml_backend_sched_set_persistent_weight_residency(sched.get(), true);
+                    if (model.is_sequential_direct_io()) {
+                        ggml_backend_sched_set_weight_read_callback(sched.get(),
+                            [](void * user_data, const void * logical_src, void * dst, size_t size) {
+                                return static_cast<const llama_model *>(user_data)->read_sequential_weight(logical_src, dst, size);
+                            }, (void *) &model);
+                        ggml_backend_sched_set_weight_read_padded_callback(sched.get(),
+                            [](void * user_data, const void * logical_src, void * dst, size_t capacity, size_t size, size_t * data_offset) {
+                                return static_cast<const llama_model *>(user_data)->read_sequential_weight_padded(
+                                    logical_src, dst, capacity, size, data_offset);
+                            }, (void *) &model);
+                    }
                     if (sequential_weight_budget > 0) {
                         for (ggml_backend_t backend : backend_ptrs) {
                             if (ggml_backend_dev_type(ggml_backend_get_device(backend)) != GGML_BACKEND_DEVICE_TYPE_CPU) {

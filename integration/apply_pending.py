@@ -442,7 +442,13 @@ s = p.read_text()
 needle = '''        ggml_backend_sched_set_force_weight_offload(sched.get(), true);\n        ggml_backend_sched_set_async_weight_prefetch(sched.get(), true);\n'''
 insert = '''        ggml_backend_sched_set_force_weight_offload(sched.get(), true);\n        ggml_backend_sched_set_async_weight_prefetch(sched.get(), true);\n        ggml_backend_sched_set_persistent_weight_residency(sched.get(), true);\n        if (model.is_sequential_direct_io()) {\n            ggml_backend_sched_set_weight_read_callback(sched.get(),\n                [](void * user_data, const void * logical_src, void * dst, size_t size) {\n                    return static_cast<const llama_model *>(user_data)->read_sequential_weight(logical_src, dst, size);\n                }, (void *) &model);\n            ggml_backend_sched_set_weight_read_padded_callback(sched.get(),\n                [](void * user_data, const void * logical_src, void * dst, size_t capacity, size_t size, size_t * data_offset) {\n                    return static_cast<const llama_model *>(user_data)->read_sequential_weight_padded(\n                        logical_src, dst, capacity, size, data_offset);\n                }, (void *) &model);\n        }\n'''
 count = s.count(needle)
-if count != 2:
-    raise SystemExit(f'expected two sequential scheduler setup blocks, found {count}')
-s = s.replace(needle, insert)
+if count != 1:
+    raise SystemExit(f'expected one top-level sequential scheduler setup block, found {count}')
+s = s.replace(needle, insert, 1)
+nested_needle = ''.join(('            ' + line) if line.strip() else line for line in needle.splitlines(True))
+nested_insert = ''.join(('            ' + line) if line.strip() else line for line in insert.splitlines(True))
+count_nested = s.count(nested_needle)
+if count_nested != 1:
+    raise SystemExit(f'expected one nested sequential scheduler setup block, found {count_nested}')
+s = s.replace(nested_needle, nested_insert, 1)
 p.write_text(s)

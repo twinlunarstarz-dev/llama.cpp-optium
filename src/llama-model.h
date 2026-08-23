@@ -714,6 +714,7 @@ struct llama_model {
     const struct ggml_tensor * get_tensor(const char * name) const;
 
     bool is_sequential() const;
+    bool is_sequential_direct_io() const;
     bool read_sequential_weight(const void * logical_src, void * dst, size_t size) const;
     bool read_sequential_weight_padded(const void * logical_src, void * dst, size_t capacity, size_t size, size_t * data_offset) const;
 
