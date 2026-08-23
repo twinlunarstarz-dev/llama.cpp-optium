@@ -1,11 +1,12 @@
-# FreeToken sequential v1 validation
+# FreeToken sequential v1 fixed validation
 
 - configure rc: 0
 - build rc: 2
+- focused tests rc: 99
 
 ```text
-[  1%] Building C object ggml/src/CMakeFiles/ggml-base.dir/ggml.c.o
 [  1%] Building CXX object vendor/hash/CMakeFiles/vendor-hash.dir/hash.cpp.o
+[  1%] Building C object ggml/src/CMakeFiles/ggml-base.dir/ggml.c.o
 [  1%] Building C object vendor/hash/CMakeFiles/vendor-hash.dir/xxhash/xxhash.c.o
 [  1%] Building CXX object vendor/hash/CMakeFiles/vendor-hash.dir/sha1/sha1.c.o
 [  1%] Building C object vendor/hash/CMakeFiles/vendor-hash.dir/sha256/sha256.c.o
@@ -13,12 +14,12 @@
 [  2%] Building CXX object ggml/src/CMakeFiles/ggml-base.dir/ggml.cpp.o
 [  2%] Building C object ggml/src/CMakeFiles/ggml-base.dir/ggml-alloc.c.o
 [  2%] Building CXX object ggml/src/CMakeFiles/ggml-base.dir/ggml-backend.cpp.o
+[  2%] Built target vendor-hash
+[  2%] Building CXX object vendor/cpp-httplib/CMakeFiles/cpp-httplib.dir/httplib.cpp.o
 [  2%] Building CXX object ggml/src/CMakeFiles/ggml-base.dir/ggml-backend-meta.cpp.o
 [  3%] Building CXX object ggml/src/CMakeFiles/ggml-base.dir/ggml-opt.cpp.o
 [  3%] Building CXX object ggml/src/CMakeFiles/ggml-base.dir/ggml-threading.cpp.o
 [  3%] Building C object ggml/src/CMakeFiles/ggml-base.dir/ggml-quants.c.o
-[  3%] Built target vendor-hash
-[  3%] Building CXX object vendor/cpp-httplib/CMakeFiles/cpp-httplib.dir/httplib.cpp.o
 [  3%] Building CXX object ggml/src/CMakeFiles/ggml-base.dir/gguf.cpp.o
 [  3%] Linking CXX shared library ../../bin/libggml-base.so
 [  3%] Built target ggml-base
@@ -39,12 +40,12 @@
 [  4%] Built target llama-qwen2vl-cli
 [  5%] Building C object ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/ggml-cpu.c.o
 [  5%] Building CXX object ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/ggml-cpu.cpp.o
+[  5%] Linking CXX static library libcpp-httplib.a
+[  5%] Built target cpp-httplib
 [  5%] Building CXX object ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/repack.cpp.o
 [  5%] Building CXX object ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/hbm.cpp.o
 [  5%] Building C object ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/quants.c.o
-[  5%] Linking CXX static library libcpp-httplib.a
 [  6%] Building CXX object ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/traits.cpp.o
-[  6%] Built target cpp-httplib
 [  6%] Building CXX object ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/amx/amx.cpp.o
 [  6%] Building CXX object ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/amx/mmq.cpp.o
 [  6%] Building CXX object ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/binary-ops.cpp.o
@@ -74,35 +75,38 @@
 [ 10%] Building CXX object src/CMakeFiles/llama.dir/llama-context.cpp.o
 [ 10%] Building CXX object src/CMakeFiles/llama.dir/llama-cparams.cpp.o
 [ 10%] Building CXX object src/CMakeFiles/llama.dir/llama-grammar.cpp.o
-/home/runner/work/llama.cpp-optium/llama.cpp-optium/src/llama-context.cpp: In member function ‘void llama_context::sched_reserve()’:
-/home/runner/work/llama.cpp-optium/llama.cpp-optium/src/llama-context.cpp:678:76: error: invalid conversion from ‘size_t’ {aka ‘long unsigned int’} to ‘ggml_backend_t’ {aka ‘ggml_backend*’} [-fpermissive]
-  678 |             ggml_backend_sched_set_max_weight_bytes_per_split(sched.get(), sequential_weight_budget);
-      |                                                                            ^~~~~~~~~~~~~~~~~~~~~~~~
-      |                                                                            |
-      |                                                                            size_t {aka long unsigned int}
-/home/runner/work/llama.cpp-optium/llama.cpp-optium/src/llama-context.cpp:678:62: error: too few arguments to function ‘void ggml_backend_sched_set_max_weight_bytes_per_split(ggml_backend_sched_t, ggml_backend_t, size_t)’
-  678 |             ggml_backend_sched_set_max_weight_bytes_per_split(sched.get(), sequential_weight_budget);
-      |             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-In file included from /home/runner/work/llama.cpp-optium/llama.cpp-optium/ggml/src/../include/ggml-cpu.h:4,
-                 from /home/runner/work/llama.cpp-optium/llama.cpp-optium/src/../include/llama.h:5,
-                 from /home/runner/work/llama.cpp-optium/llama.cpp-optium/src/llama-context.h:3,
-                 from /home/runner/work/llama.cpp-optium/llama.cpp-optium/src/llama-context.cpp:1:
-/home/runner/work/llama.cpp-optium/llama.cpp-optium/ggml/src/../include/ggml-backend.h:384:35: note: declared here
-  384 |     GGML_API void                 ggml_backend_sched_set_max_weight_bytes_per_split(
-      |                                   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-/home/runner/work/llama.cpp-optium/llama.cpp-optium/src/llama-context.cpp:720:88: error: invalid conversion from ‘size_t’ {aka ‘long unsigned int’} to ‘ggml_backend_t’ {aka ‘ggml_backend*’} [-fpermissive]
-  720 |                         ggml_backend_sched_set_max_weight_bytes_per_split(sched.get(), sequential_weight_budget);
-      |                                                                                        ^~~~~~~~~~~~~~~~~~~~~~~~
-      |                                                                                        |
-      |                                                                                        size_t {aka long unsigned int}
-/home/runner/work/llama.cpp-optium/llama.cpp-optium/src/llama-context.cpp:720:74: error: too few arguments to function ‘void ggml_backend_sched_set_max_weight_bytes_per_split(ggml_backend_sched_t, ggml_backend_t, size_t)’
-  720 |                         ggml_backend_sched_set_max_weight_bytes_per_split(sched.get(), sequential_weight_budget);
-      |                         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-/home/runner/work/llama.cpp-optium/llama.cpp-optium/ggml/src/../include/ggml-backend.h:384:35: note: declared here
-  384 |     GGML_API void                 ggml_backend_sched_set_max_weight_bytes_per_split(
-      |                                   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-gmake[2]: *** [src/CMakeFiles/llama.dir/build.make:149: src/CMakeFiles/llama.dir/llama-context.cpp.o] Error 1
+[ 11%] Building CXX object src/CMakeFiles/llama.dir/llama-graph.cpp.o
+[ 11%] Building CXX object src/CMakeFiles/llama.dir/llama-hparams.cpp.o
+[ 11%] Building CXX object src/CMakeFiles/llama.dir/llama-impl.cpp.o
+[ 11%] Building CXX object src/CMakeFiles/llama.dir/llama-io.cpp.o
+[ 11%] Building CXX object src/CMakeFiles/llama.dir/llama-kv-cache.cpp.o
+[ 12%] Building CXX object src/CMakeFiles/llama.dir/llama-kv-cache-iswa.cpp.o
+[ 12%] Building CXX object src/CMakeFiles/llama.dir/llama-kv-cache-dsa.cpp.o
+[ 12%] Building CXX object src/CMakeFiles/llama.dir/llama-kv-cache-dsa-iswa.cpp.o
+[ 12%] Building CXX object src/CMakeFiles/llama.dir/llama-kv-cache-msa.cpp.o
+[ 12%] Building CXX object src/CMakeFiles/llama.dir/llama-kv-cache-dsv4.cpp.o
+[ 13%] Building CXX object src/CMakeFiles/llama.dir/llama-memory.cpp.o
+[ 13%] Building CXX object src/CMakeFiles/llama.dir/llama-memory-hybrid.cpp.o
+[ 13%] Building CXX object src/CMakeFiles/llama.dir/llama-memory-hybrid-iswa.cpp.o
+[ 13%] Building CXX object src/CMakeFiles/llama.dir/llama-memory-recurrent.cpp.o
+[ 13%] Building CXX object src/CMakeFiles/llama.dir/llama-mmap.cpp.o
+[ 14%] Building CXX object src/CMakeFiles/llama.dir/llama-model-loader.cpp.o
+[ 14%] Building CXX object src/CMakeFiles/llama.dir/llama-model-saver.cpp.o
+/home/runner/work/llama.cpp-optium/llama.cpp-optium/src/llama-model-loader.cpp: In constructor ‘llama_model_loader::llama_model_loader(gguf_context*, llama_model_set_tensor_data_t, void*, const std::string&, std::vector<std::__cxx11::basic_string<char> >&, FILE*, llama_load_mode, bool, bool, bool, const llama_model_kv_override*, const llama_model_tensor_buft_override*)’:
+/home/runner/work/llama.cpp-optium/llama.cpp-optium/src/llama-model-loader.cpp:824:11: error: ‘struct llama_model_loader’ has no member named ‘load_mtp’
+  824 |     this->load_mtp = load_mtp;
+      |           ^~~~~~~~
+[ 14%] Building CXX object src/CMakeFiles/llama.dir/llama-model.cpp.o
+gmake[2]: *** [src/CMakeFiles/llama.dir/build.make:401: src/CMakeFiles/llama.dir/llama-model-loader.cpp.o] Error 1
 gmake[2]: *** Waiting for unfinished jobs....
+/home/runner/work/llama.cpp-optium/llama.cpp-optium/src/llama-model.cpp: In constructor ‘llama_model::llama_model(const llama_model_params&)’:
+/home/runner/work/llama.cpp-optium/llama.cpp-optium/src/llama-model.cpp:1112:16: error: ‘struct llama_model::impl’ has no member named ‘tensor_split_owned’
+ 1112 |         pimpl->tensor_split_owned.assign(params.tensor_split, params.tensor_split + llama_max_devices());
+      |                ^~~~~~~~~~~~~~~~~~
+/home/runner/work/llama.cpp-optium/llama.cpp-optium/src/llama-model.cpp:1113:44: error: ‘struct llama_model::impl’ has no member named ‘tensor_split_owned’
+ 1113 |         this->params.tensor_split = pimpl->tensor_split_owned.data();
+      |                                            ^~~~~~~~~~~~~~~~~~
+gmake[2]: *** [src/CMakeFiles/llama.dir/build.make:429: src/CMakeFiles/llama.dir/llama-model.cpp.o] Error 1
 gmake[1]: *** [CMakeFiles/Makefile2:2502: src/CMakeFiles/llama.dir/all] Error 2
 gmake: *** [Makefile:146: all] Error 2
 ```
