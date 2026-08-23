@@ -821,7 +821,7 @@ llama_model_loader::llama_model_loader(
 
     this->check_tensors = check_tensors;
     this->no_alloc = no_alloc;
-    GGML_UNUSED(load_mtp);
+    this->load_mtp = load_mtp;
 }
 
 std::string llama_model_loader::get_arch_name() const {
