@@ -1328,66 +1328,6 @@ static std::string list_builtin_chat_templates() {
     return msg.str();
 }
 
-bool common_arg_utils::is_truthy(const std::string & value) {
-    return value == "on" || value == "enabled" || value == "true" || value == "1";
-}
-
-bool common_arg_utils::is_falsey(const std::string & value) {
-    return value == "off" || value == "disabled" || value == "false" || value == "0";
-}
-
-bool common_arg_utils::is_autoy(const std::string & value) {
-    return value == "auto" || value == "-1";
-}
-
-// Simple CSV parser that handles quoted fields and escaped quotes
-// example:
-//    input:  value1,"value, with, commas","value with ""escaped"" quotes",value4
-//    output: [value1] [value, with, commas] [value with "escaped" quotes] [value4]
-static std::vector<std::string> parse_csv_row(const std::string& input) {
-    std::vector<std::string> fields;
-    std::string field;
-    bool in_quotes = false;
-
-    for (size_t i = 0; i < input.length(); ++i) {
-        char ch = input[i];
-
-        if (ch == '"') {
-            if (!in_quotes) {
-                // start of quoted field (only valid if at beginning of field)
-                if (!field.empty()) {
-                    // quote appeared in middle of unquoted field, treat as literal
-                    field += '"';
-                } else {
-                    in_quotes = true; // start
-                }
-            } else {
-                if (i + 1 < input.length() && input[i + 1] == '"') {
-                    // escaped quote: ""
-                    field += '"';
-                    ++i; // skip the next quote
-                } else {
-                    in_quotes = false; // end
-                }
-            }
-        } else if (ch == ',') {
-            if (in_quotes) {
-                field += ',';
-            } else {
-                fields.push_back(std::move(field));
-                field.clear();
-            }
-        } else {
-            field += ch;
-        }
-    }
-
-    // Add the last field
-    fields.push_back(std::move(field));
-
-    return fields;
-}
-
 void common_params_resolve_devices(common_params & params) {
     if (!params.device_raw.empty()) {
         params.devices = parse_device_list(params.device_raw);
