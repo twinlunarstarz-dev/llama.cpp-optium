@@ -1,0 +1,112 @@
+name: Optium sequential port v5
+
+on:
+  push:
+    branches:
+      - opt/cuda-sequential-integration-2026-08-22
+    paths:
+      - .github/OPTIUM_SEQUENTIAL_PORT_V5
+
+permissions:
+  contents: write
+
+jobs:
+  port:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: opt/cuda-sequential-integration-2026-08-22
+
+      - name: Port and publish sequential source
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git config user.name "llama.cpp-optium integration"
+          git config user.email "actions@users.noreply.github.com"
+          git config core.autocrlf false
+          UPSTREAM=70adb1b4cea5ee39f867792c78dc59320921eda7
+          BRANCH=opt/cuda-sequential-integration-2026-08-22
+          MULTIGPU=1dabfb09614957038300beb5ab9622df82a7a2b7
+          STEP=initializing
+          fail_report() {
+            local rc=$?
+            trap - ERR
+            mkdir -p /tmp/report
+            { echo '# Sequential port failure'; echo; echo "- step: $STEP"; echo "- exit code: $rc"; echo; echo '```text'; git status --short || true; echo '```'; } >/tmp/report/REPORT.md
+            git cherry-pick --abort >/dev/null 2>&1 || true
+            git reset --hard "$UPSTREAM"
+            mkdir -p integration
+            cp /tmp/report/REPORT.md integration/REPORT.md
+            git add integration/REPORT.md
+            git commit -m 'integration: report sequential port failure'
+            git push --force origin HEAD:"$BRANCH"
+            exit 0
+          }
+          trap fail_report ERR
+
+          STEP='reset current upstream'
+          git reset --hard "$UPSTREAM"
+          git clean -fdx
+
+          STEP='storage-backed sequential loading'
+          git cherry-pick -X theirs 7d9d3b14225b6a3502a1b24e5aaf8de6bde7d4e9
+
+          STEP='DeepSeek sequential validation'
+          git cherry-pick -X theirs 4012e11809111501ef9b735d8c461335f0e6b3c4
+
+          STEP='multi-GPU sequential loading excluding obsolete deleted test'
+          parent=$(git rev-parse "$MULTIGPU^")
+          git diff --binary "$parent" "$MULTIGPU" -- . ':(exclude)tests/test-backend-sched.cpp' >/tmp/multigpu.patch
+          git apply --3way --index /tmp/multigpu.patch
+          git commit -m 'sequential: port multi-GPU loading to current upstream'
+
+          STEP='document source port'
+          mkdir -p integration
+          cat > integration/README.md <<'EOF'
+          # Current-upstream sequential integration
+
+          Base: upstream `70adb1b4cea5ee39f867792c78dc59320921eda7`.
+
+          Ported from llama.cpp-optium:
+          - storage-backed sequential loading
+          - DeepSeek sequential support/validation
+          - multi-GPU sequential routing and per-device weight windows
+
+          The complete model remains storage-backed and need not fit RAM or VRAM.
+          The obsolete upstream-deleted `tests/test-backend-sched.cpp` remains deleted and was intentionally excluded from the multi-GPU port.
+          EOF
+          rm -f integration/REPORT.md
+          git add -A
+          git commit -m 'docs: record current-upstream sequential port'
+
+          STEP='publish source'
+          trap - ERR
+          git push --force origin HEAD:"$BRANCH"
+
+      - name: CPU validation
+        shell: bash
+        run: |
+          set +e
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=OFF -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=ON >/tmp/configure.log 2>&1
+          c=$?; echo $c >/tmp/configure.rc
+          if [ $c -eq 0 ]; then cmake --build build -j2 >/tmp/build.log 2>&1; b=$?; else : >/tmp/build.log; b=99; fi
+          echo $b >/tmp/build.rc
+          if [ $b -eq 0 ]; then ctest --test-dir build --output-on-failure -R 'test-(arg-parser|llama-archs|sequential)' >/tmp/test.log 2>&1; t=$?; else : >/tmp/test.log; t=99; fi
+          echo $t >/tmp/test.rc
+          exit 0
+
+      - name: Publish validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          { echo '# Sequential port validation'; echo; echo "- configure rc: $(cat /tmp/configure.rc)"; echo "- build rc: $(cat /tmp/build.rc)"; echo "- focused tests rc: $(cat /tmp/test.rc)";
+            if [ "$(cat /tmp/configure.rc)" != 0 ]; then echo; echo '## Configure'; echo '```text'; tail -n 250 /tmp/configure.log; echo '```';
+            elif [ "$(cat /tmp/build.rc)" != 0 ]; then echo; echo '## Build'; echo '```text'; tail -n 450 /tmp/build.log; echo '```';
+            elif [ "$(cat /tmp/test.rc)" != 0 ]; then echo; echo '## Tests'; echo '```text'; tail -n 450 /tmp/test.log; echo '```';
+            else echo; echo 'CPU configure/build and focused tests passed.'; fi; } > integration/VALIDATION.md
+          git add integration/VALIDATION.md
+          git commit -m 'test: record sequential port validation'
+          git push origin HEAD:opt/cuda-sequential-integration-2026-08-22
