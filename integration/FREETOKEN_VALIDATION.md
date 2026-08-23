@@ -6,8 +6,8 @@
 
 ## Build
 ```text
-[  1%] Building CXX object vendor/hash/CMakeFiles/vendor-hash.dir/hash.cpp.o
 [  1%] Building C object ggml/src/CMakeFiles/ggml-base.dir/ggml.c.o
+[  1%] Building CXX object vendor/hash/CMakeFiles/vendor-hash.dir/hash.cpp.o
 [  1%] Building C object vendor/hash/CMakeFiles/vendor-hash.dir/xxhash/xxhash.c.o
 [  1%] Building CXX object vendor/hash/CMakeFiles/vendor-hash.dir/sha1/sha1.c.o
 [  1%] Building C object vendor/hash/CMakeFiles/vendor-hash.dir/sha256/sha256.c.o
@@ -108,12 +108,245 @@
 [ 16%] Building CXX object src/CMakeFiles/llama.dir/models/bailingmoe.cpp.o
 [ 16%] Building CXX object src/CMakeFiles/llama.dir/models/bailingmoe2.cpp.o
 [ 17%] Building CXX object src/CMakeFiles/llama.dir/models/bailingmoe3.cpp.o
-/home/runner/work/llama.cpp-optium/llama.cpp-optium/src/models/bailingmoe3.cpp: In member function ‘virtual void llama_model_bailingmoe3::load_arch_tensors(llama_model_loader&)’:
-/home/runner/work/llama.cpp-optium/llama.cpp-optium/src/models/bailingmoe3.cpp:73:13: error: ‘struct llama_model_loader’ has no member named ‘load_mtp’
-   73 |     if (!ml.load_mtp) {
+[ 17%] Building CXX object src/CMakeFiles/llama.dir/models/bert.cpp.o
+[ 17%] Building CXX object src/CMakeFiles/llama.dir/models/bitnet.cpp.o
+[ 17%] Building CXX object src/CMakeFiles/llama.dir/models/bloom.cpp.o
+[ 17%] Building CXX object src/CMakeFiles/llama.dir/models/chameleon.cpp.o
+[ 18%] Building CXX object src/CMakeFiles/llama.dir/models/chatglm.cpp.o
+[ 18%] Building CXX object src/CMakeFiles/llama.dir/models/clip.cpp.o
+[ 18%] Building CXX object src/CMakeFiles/llama.dir/models/codeshell.cpp.o
+[ 18%] Building CXX object src/CMakeFiles/llama.dir/models/cogvlm.cpp.o
+[ 18%] Building CXX object src/CMakeFiles/llama.dir/models/cohere2.cpp.o
+[ 19%] Building CXX object src/CMakeFiles/llama.dir/models/cohere2moe.cpp.o
+[ 19%] Building CXX object src/CMakeFiles/llama.dir/models/command-r.cpp.o
+[ 19%] Building CXX object src/CMakeFiles/llama.dir/models/dbrx.cpp.o
+[ 19%] Building CXX object src/CMakeFiles/llama.dir/models/deci.cpp.o
+[ 19%] Building CXX object src/CMakeFiles/llama.dir/models/deepseek.cpp.o
+[ 20%] Building CXX object src/CMakeFiles/llama.dir/models/deepseek2.cpp.o
+[ 20%] Building CXX object src/CMakeFiles/llama.dir/models/deepseek2ocr.cpp.o
+[ 20%] Building CXX object src/CMakeFiles/llama.dir/models/deepseek32.cpp.o
+[ 20%] Building CXX object src/CMakeFiles/llama.dir/models/deepseek4.cpp.o
+[ 20%] Building CXX object src/CMakeFiles/llama.dir/models/delta-net-base.cpp.o
+[ 21%] Building CXX object src/CMakeFiles/llama.dir/models/dflash.cpp.o
+[ 21%] Building CXX object src/CMakeFiles/llama.dir/models/dots1.cpp.o
+[ 21%] Building CXX object src/CMakeFiles/llama.dir/models/dots3note.cpp.o
+[ 21%] Building CXX object src/CMakeFiles/llama.dir/models/dream.cpp.o
+[ 21%] Building CXX object src/CMakeFiles/llama.dir/models/eagle3.cpp.o
+[ 22%] Building CXX object src/CMakeFiles/llama.dir/models/ernie4-5-moe.cpp.o
+[ 22%] Building CXX object src/CMakeFiles/llama.dir/models/ernie4-5.cpp.o
+[ 22%] Building CXX object src/CMakeFiles/llama.dir/models/eurobert.cpp.o
+[ 22%] Building CXX object src/CMakeFiles/llama.dir/models/exaone-moe.cpp.o
+[ 22%] Building CXX object src/CMakeFiles/llama.dir/models/exaone.cpp.o
+[ 23%] Building CXX object src/CMakeFiles/llama.dir/models/exaone4.cpp.o
+[ 23%] Building CXX object src/CMakeFiles/llama.dir/models/falcon-h1.cpp.o
+[ 23%] Building CXX object src/CMakeFiles/llama.dir/models/falcon.cpp.o
+[ 23%] Building CXX object src/CMakeFiles/llama.dir/models/gemma-embedding.cpp.o
+[ 23%] Building CXX object src/CMakeFiles/llama.dir/models/gemma.cpp.o
+[ 23%] Building CXX object src/CMakeFiles/llama.dir/models/gemma2.cpp.o
+[ 24%] Building CXX object src/CMakeFiles/llama.dir/models/gemma3.cpp.o
+[ 24%] Building CXX object src/CMakeFiles/llama.dir/models/gemma3n.cpp.o
+[ 24%] Building CXX object src/CMakeFiles/llama.dir/models/gemma4-assistant.cpp.o
+[ 24%] Building CXX object src/CMakeFiles/llama.dir/models/gemma4.cpp.o
+[ 24%] Building CXX object src/CMakeFiles/llama.dir/models/glm-dsa.cpp.o
+[ 25%] Building CXX object src/CMakeFiles/llama.dir/models/glm4-moe.cpp.o
+[ 25%] Building CXX object src/CMakeFiles/llama.dir/models/glm4.cpp.o
+[ 25%] Building CXX object src/CMakeFiles/llama.dir/models/gpt2.cpp.o
+[ 25%] Building CXX object src/CMakeFiles/llama.dir/models/gptneox.cpp.o
+[ 25%] Building CXX object src/CMakeFiles/llama.dir/models/granite-hybrid.cpp.o
+[ 26%] Building CXX object src/CMakeFiles/llama.dir/models/granite-moe.cpp.o
+[ 26%] Building CXX object src/CMakeFiles/llama.dir/models/granite-swa.cpp.o
+[ 26%] Building CXX object src/CMakeFiles/llama.dir/models/granite-switch.cpp.o
+[ 26%] Building CXX object src/CMakeFiles/llama.dir/models/granite.cpp.o
+[ 26%] Building CXX object src/CMakeFiles/llama.dir/models/grok.cpp.o
+[ 27%] Building CXX object src/CMakeFiles/llama.dir/models/grovemoe.cpp.o
+[ 27%] Building CXX object src/CMakeFiles/llama.dir/models/hunyuan-dense.cpp.o
+[ 27%] Building CXX object src/CMakeFiles/llama.dir/models/hunyuan-moe.cpp.o
+[ 27%] Building CXX object src/CMakeFiles/llama.dir/models/hunyuan-vl.cpp.o
+[ 27%] Building CXX object src/CMakeFiles/llama.dir/models/hy-v3.cpp.o
+[ 28%] Building CXX object src/CMakeFiles/llama.dir/models/internlm2.cpp.o
+[ 28%] Building CXX object src/CMakeFiles/llama.dir/models/jais.cpp.o
+[ 28%] Building CXX object src/CMakeFiles/llama.dir/models/jais2.cpp.o
+[ 28%] Building CXX object src/CMakeFiles/llama.dir/models/jamba.cpp.o
+[ 28%] Building CXX object src/CMakeFiles/llama.dir/models/jina-bert-v2.cpp.o
+[ 29%] Building CXX object src/CMakeFiles/llama.dir/models/jina-bert-v3.cpp.o
+[ 29%] Building CXX object src/CMakeFiles/llama.dir/models/kimi-k3.cpp.o
+[ 29%] Building CXX object src/CMakeFiles/llama.dir/models/kimi-linear.cpp.o
+[ 29%] Building CXX object src/CMakeFiles/llama.dir/models/laguna.cpp.o
+[ 29%] Building CXX object src/CMakeFiles/llama.dir/models/lfm2.cpp.o
+[ 29%] Building CXX object src/CMakeFiles/llama.dir/models/lfm2moe.cpp.o
+[ 30%] Building CXX object src/CMakeFiles/llama.dir/models/llada-moe.cpp.o
+[ 30%] Building CXX object src/CMakeFiles/llama.dir/models/llada.cpp.o
+[ 30%] Building CXX object src/CMakeFiles/llama.dir/models/llama-embed.cpp.o
+[ 30%] Building CXX object src/CMakeFiles/llama.dir/models/llama.cpp.o
+[ 30%] Building CXX object src/CMakeFiles/llama.dir/models/llama4.cpp.o
+[ 31%] Building CXX object src/CMakeFiles/llama.dir/models/maincoder.cpp.o
+[ 31%] Building CXX object src/CMakeFiles/llama.dir/models/mamba-base.cpp.o
+[ 31%] Building CXX object src/CMakeFiles/llama.dir/models/mamba.cpp.o
+[ 31%] Building CXX object src/CMakeFiles/llama.dir/models/mamba2.cpp.o
+[ 31%] Building CXX object src/CMakeFiles/llama.dir/models/mellum.cpp.o
+[ 32%] Building CXX object src/CMakeFiles/llama.dir/models/mimo2.cpp.o
+[ 32%] Building CXX object src/CMakeFiles/llama.dir/models/minicpm.cpp.o
+[ 32%] Building CXX object src/CMakeFiles/llama.dir/models/minicpm3.cpp.o
+[ 32%] Building CXX object src/CMakeFiles/llama.dir/models/minimax-01.cpp.o
+[ 32%] Building CXX object src/CMakeFiles/llama.dir/models/minimax-m2.cpp.o
+[ 33%] Building CXX object src/CMakeFiles/llama.dir/models/minimax-m3.cpp.o
+[ 33%] Building CXX object src/CMakeFiles/llama.dir/models/mistral3.cpp.o
+[ 33%] Building CXX object src/CMakeFiles/llama.dir/models/mistral4.cpp.o
+[ 33%] Building CXX object src/CMakeFiles/llama.dir/models/modern-bert.cpp.o
+[ 33%] Building CXX object src/CMakeFiles/llama.dir/models/mpt.cpp.o
+[ 34%] Building CXX object src/CMakeFiles/llama.dir/models/muse-glimmer.cpp.o
+[ 34%] Building CXX object src/CMakeFiles/llama.dir/models/nanbeige.cpp.o
+[ 34%] Building CXX object src/CMakeFiles/llama.dir/models/nemotron-h-moe.cpp.o
+[ 34%] Building CXX object src/CMakeFiles/llama.dir/models/nemotron-h.cpp.o
+[ 34%] Building CXX object src/CMakeFiles/llama.dir/models/nemotron.cpp.o
+[ 35%] Building CXX object src/CMakeFiles/llama.dir/models/neo-bert.cpp.o
+[ 35%] Building CXX object src/CMakeFiles/llama.dir/models/nomic-bert-moe.cpp.o
+[ 35%] Building CXX object src/CMakeFiles/llama.dir/models/nomic-bert.cpp.o
+[ 35%] Building CXX object src/CMakeFiles/llama.dir/models/olmo.cpp.o
+[ 35%] Building CXX object src/CMakeFiles/llama.dir/models/olmo2.cpp.o
+[ 36%] Building CXX object src/CMakeFiles/llama.dir/models/olmoe.cpp.o
+[ 36%] Building CXX object src/CMakeFiles/llama.dir/models/openai-moe.cpp.o
+[ 36%] Building CXX object src/CMakeFiles/llama.dir/models/openelm.cpp.o
+[ 36%] Building CXX object src/CMakeFiles/llama.dir/models/orion.cpp.o
+[ 36%] Building CXX object src/CMakeFiles/llama.dir/models/paddleocr.cpp.o
+[ 36%] Building CXX object src/CMakeFiles/llama.dir/models/pangu-embed.cpp.o
+[ 37%] Building CXX object src/CMakeFiles/llama.dir/models/phi2.cpp.o
+[ 37%] Building CXX object src/CMakeFiles/llama.dir/models/phi3.cpp.o
+[ 37%] Building CXX object src/CMakeFiles/llama.dir/models/phimoe.cpp.o
+[ 37%] Building CXX object src/CMakeFiles/llama.dir/models/plamo.cpp.o
+[ 37%] Building CXX object src/CMakeFiles/llama.dir/models/plamo2.cpp.o
+[ 38%] Building CXX object src/CMakeFiles/llama.dir/models/plamo3.cpp.o
+[ 38%] Building CXX object src/CMakeFiles/llama.dir/models/plm.cpp.o
+[ 38%] Building CXX object src/CMakeFiles/llama.dir/models/pockettts.cpp.o
+[ 38%] Building CXX object src/CMakeFiles/llama.dir/models/qwen.cpp.o
+[ 38%] Building CXX object src/CMakeFiles/llama.dir/models/qwen2.cpp.o
+[ 39%] Building CXX object src/CMakeFiles/llama.dir/models/qwen2moe.cpp.o
+[ 39%] Building CXX object src/CMakeFiles/llama.dir/models/qwen2vl.cpp.o
+[ 39%] Building CXX object src/CMakeFiles/llama.dir/models/qwen3.cpp.o
+[ 39%] Building CXX object src/CMakeFiles/llama.dir/models/qwen35.cpp.o
+[ 39%] Building CXX object src/CMakeFiles/llama.dir/models/qwen35moe.cpp.o
+[ 40%] Building CXX object src/CMakeFiles/llama.dir/models/qwen3moe.cpp.o
+[ 40%] Building CXX object src/CMakeFiles/llama.dir/models/qwen3next.cpp.o
+[ 40%] Building CXX object src/CMakeFiles/llama.dir/models/qwen3tts.cpp.o
+[ 40%] Building CXX object src/CMakeFiles/llama.dir/models/qwen3vl.cpp.o
+[ 40%] Building CXX object src/CMakeFiles/llama.dir/models/qwen3vlmoe.cpp.o
+[ 41%] Building CXX object src/CMakeFiles/llama.dir/models/refact.cpp.o
+[ 41%] Building CXX object src/CMakeFiles/llama.dir/models/rnd1.cpp.o
+[ 41%] Building CXX object src/CMakeFiles/llama.dir/models/rwkv6-base.cpp.o
+[ 41%] Building CXX object src/CMakeFiles/llama.dir/models/rwkv6.cpp.o
+[ 41%] Building CXX object src/CMakeFiles/llama.dir/models/rwkv6qwen2.cpp.o
+[ 42%] Building CXX object src/CMakeFiles/llama.dir/models/rwkv7-base.cpp.o
+[ 42%] Building CXX object src/CMakeFiles/llama.dir/models/rwkv7.cpp.o
+[ 42%] Building CXX object src/CMakeFiles/llama.dir/models/seed-oss.cpp.o
+[ 42%] Building CXX object src/CMakeFiles/llama.dir/models/smallthinker.cpp.o
+[ 42%] Building CXX object src/CMakeFiles/llama.dir/models/smollm3.cpp.o
+[ 43%] Building CXX object src/CMakeFiles/llama.dir/models/stablelm.cpp.o
+[ 43%] Building CXX object src/CMakeFiles/llama.dir/models/starcoder.cpp.o
+[ 43%] Building CXX object src/CMakeFiles/llama.dir/models/starcoder2.cpp.o
+[ 43%] Building CXX object src/CMakeFiles/llama.dir/models/step35.cpp.o
+[ 43%] Building CXX object src/CMakeFiles/llama.dir/models/t5.cpp.o
+[ 43%] Building CXX object src/CMakeFiles/llama.dir/models/t5encoder.cpp.o
+[ 44%] Building CXX object src/CMakeFiles/llama.dir/models/talkie.cpp.o
+[ 44%] Building CXX object src/CMakeFiles/llama.dir/models/wavtokenizer-dec.cpp.o
+[ 44%] Building CXX object src/CMakeFiles/llama.dir/models/xverse.cpp.o
+[ 44%] Linking CXX shared library ../bin/libllama.so
+[ 44%] Built target llama
+[ 44%] Building CXX object common/CMakeFiles/llama-common.dir/arg.cpp.o
+[ 44%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/mtmd.cpp.o
+[ 44%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/mtmd-audio.cpp.o
+[ 44%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/mtmd-image.cpp.o
+[ 45%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/mtmd-helper.cpp.o
+[ 45%] Building CXX object common/CMakeFiles/llama-common.dir/chat-auto-parser-generator.cpp.o
+[ 46%] Building CXX object common/CMakeFiles/llama-common.dir/chat-auto-parser-helpers.cpp.o
+[ 46%] Building CXX object common/CMakeFiles/llama-common.dir/chat-diff-analyzer.cpp.o
+[ 46%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/mtmd-helper-gen.cpp.o
+[ 46%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/clip.cpp.o
+[ 46%] Building CXX object common/CMakeFiles/llama-common.dir/chat-peg-parser.cpp.o
+[ 46%] Building CXX object common/CMakeFiles/llama-common.dir/chat.cpp.o
+[ 46%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/cogvlm.cpp.o
+[ 46%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/conformer.cpp.o
+[ 47%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/dots3note.cpp.o
+[ 47%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/dotsocr.cpp.o
+[ 47%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/exaone4_5.cpp.o
+[ 47%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/gemma4a.cpp.o
+[ 47%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/gemma4v.cpp.o
+[ 48%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/gemma4ua.cpp.o
+[ 48%] Building CXX object common/CMakeFiles/llama-common.dir/common.cpp.o
+[ 48%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/gemma4uv.cpp.o
+/home/runner/work/llama.cpp-optium/llama.cpp-optium/common/common.cpp: In function ‘void common_validate_sequential_params(const common_params&)’:
+/home/runner/work/llama.cpp-optium/llama.cpp-optium/common/common.cpp:1310:17: error: ‘const struct common_params’ has no member named ‘use_mmap’
+ 1310 |     if (!params.use_mmap) {
+      |                 ^~~~~~~~
+/home/runner/work/llama.cpp-optium/llama.cpp-optium/common/common.cpp:1313:16: error: ‘const struct common_params’ has no member named ‘use_direct_io’
+ 1313 |     if (params.use_direct_io) {
+      |                ^~~~~~~~~~~~~
+/home/runner/work/llama.cpp-optium/llama.cpp-optium/common/common.cpp:1316:16: error: ‘const struct common_params’ has no member named ‘use_mlock’
+ 1316 |     if (params.use_mlock) {
+      |                ^~~~~~~~~
+/home/runner/work/llama.cpp-optium/llama.cpp-optium/common/common.cpp: In constructor ‘common_init_result::common_init_result(common_params&, bool)’:
+/home/runner/work/llama.cpp-optium/llama.cpp-optium/common/common.cpp:1370:21: error: ‘struct llama_model_params’ has no member named ‘use_mmap’
+ 1370 |             mparams.use_mmap  = true;
+      |                     ^~~~~~~~
+/home/runner/work/llama.cpp-optium/llama.cpp-optium/common/common.cpp:1372:21: error: ‘struct llama_model_params’ has no member named ‘use_mlock’
+ 1372 |             mparams.use_mlock = false;
+      |                     ^~~~~~~~~
+/home/runner/work/llama.cpp-optium/llama.cpp-optium/common/common.cpp: In function ‘llama_model_params common_model_params_to_llama(common_params&)’:
+/home/runner/work/llama.cpp-optium/llama.cpp-optium/common/common.cpp:1739:13: error: ‘struct llama_model_params’ has no member named ‘use_mmap’
+ 1739 |     mparams.use_mmap        = params.use_mmap || params.sequential_load; // force mmap for streaming
       |             ^~~~~~~~
-gmake[2]: *** [src/CMakeFiles/llama.dir/build.make:625: src/CMakeFiles/llama.dir/models/bailingmoe3.cpp.o] Error 1
-gmake[2]: *** Waiting for unfinished jobs....
-gmake[1]: *** [CMakeFiles/Makefile2:2502: src/CMakeFiles/llama.dir/all] Error 2
+/home/runner/work/llama.cpp-optium/llama.cpp-optium/common/common.cpp:1739:38: error: ‘struct common_params’ has no member named ‘use_mmap’
+ 1739 |     mparams.use_mmap        = params.use_mmap || params.sequential_load; // force mmap for streaming
+      |                                      ^~~~~~~~
+/home/runner/work/llama.cpp-optium/llama.cpp-optium/common/common.cpp:1740:13: error: ‘struct llama_model_params’ has no member named ‘use_direct_io’
+ 1740 |     mparams.use_direct_io   = params.sequential_load ? false : params.use_direct_io;
+      |             ^~~~~~~~~~~~~
+/home/runner/work/llama.cpp-optium/llama.cpp-optium/common/common.cpp:1740:71: error: ‘struct common_params’ has no member named ‘use_direct_io’
+ 1740 |     mparams.use_direct_io   = params.sequential_load ? false : params.use_direct_io;
+      |                                                                       ^~~~~~~~~~~~~
+/home/runner/work/llama.cpp-optium/llama.cpp-optium/common/common.cpp:1741:13: error: ‘struct llama_model_params’ has no member named ‘use_mlock’
+ 1741 |     mparams.use_mlock       = params.sequential_load ? false : params.use_mlock; // no mlock for streaming
+      |             ^~~~~~~~~
+/home/runner/work/llama.cpp-optium/llama.cpp-optium/common/common.cpp:1741:71: error: ‘struct common_params’ has no member named ‘use_mlock’
+ 1741 |     mparams.use_mlock       = params.sequential_load ? false : params.use_mlock; // no mlock for streaming
+      |                                                                       ^~~~~~~~~
+[ 48%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/glm4v.cpp.o
+gmake[2]: *** [common/CMakeFiles/llama-common.dir/build.make:163: common/CMakeFiles/llama-common.dir/common.cpp.o] Error 1
+gmake[1]: *** [CMakeFiles/Makefile2:2635: common/CMakeFiles/llama-common.dir/all] Error 2
+gmake[1]: *** Waiting for unfinished jobs....
+[ 48%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/granite-speech.cpp.o
+[ 48%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/granite4-vision.cpp.o
+[ 48%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/hunyuanvl.cpp.o
+[ 49%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/internvl.cpp.o
+[ 49%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/kimivl.cpp.o
+[ 49%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/kimik25.cpp.o
+[ 49%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/nemotron-v2-vl.cpp.o
+[ 49%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/muse-glimmer.cpp.o
+[ 50%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/llama4.cpp.o
+[ 50%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/llava.cpp.o
+[ 50%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/minicpmv.cpp.o
+[ 50%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/paddleocr.cpp.o
+[ 50%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/pixtral.cpp.o
+[ 51%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/qwen2vl.cpp.o
+[ 51%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/minimax-m3.cpp.o
+[ 51%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/qwen3vl.cpp.o
+[ 51%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/mimovl.cpp.o
+[ 51%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/qwen3a.cpp.o
+[ 52%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/mimo-audio.cpp.o
+[ 52%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/qwen3tts-spkenc.cpp.o
+[ 52%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/qwen3tts-gen.cpp.o
+[ 52%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/pockettts-seanet.cpp.o
+[ 52%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/pockettts-spkenc.cpp.o
+[ 53%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/pockettts-gen.cpp.o
+[ 53%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/step3vl.cpp.o
+[ 53%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/siglip.cpp.o
+[ 53%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/whisper-enc.cpp.o
+[ 53%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/deepseekocr.cpp.o
+[ 54%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/deepseekocr2.cpp.o
+[ 54%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/mobilenetv5.cpp.o
+[ 54%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/youtuvl.cpp.o
+[ 54%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/yasa2.cpp.o
+[ 54%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/parakeet.cpp.o
+[ 55%] Linking CXX shared library ../../bin/libmtmd.so
+[ 55%] Built target mtmd
 gmake: *** [Makefile:146: all] Error 2
 ```
