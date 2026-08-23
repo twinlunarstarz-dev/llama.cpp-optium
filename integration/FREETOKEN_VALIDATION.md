@@ -6,8 +6,8 @@
 
 ## Build
 ```text
+[  0%] Building CXX object vendor/hash/CMakeFiles/vendor-hash.dir/hash.cpp.o
 [  1%] Building C object ggml/src/CMakeFiles/ggml-base.dir/ggml.c.o
-[  1%] Building CXX object vendor/hash/CMakeFiles/vendor-hash.dir/hash.cpp.o
 [  1%] Building C object vendor/hash/CMakeFiles/vendor-hash.dir/xxhash/xxhash.c.o
 [  1%] Building CXX object vendor/hash/CMakeFiles/vendor-hash.dir/sha1/sha1.c.o
 [  1%] Building C object vendor/hash/CMakeFiles/vendor-hash.dir/sha256/sha256.c.o
@@ -17,6 +17,10 @@
 [  2%] Built target vendor-hash
 [  2%] Building CXX object vendor/cpp-httplib/CMakeFiles/cpp-httplib.dir/httplib.cpp.o
 [  2%] Building CXX object ggml/src/CMakeFiles/ggml-base.dir/ggml-backend.cpp.o
+/home/runner/work/llama.cpp-optium/llama.cpp-optium/ggml/src/ggml-backend.cpp: In function ‘void ggml_backend_sched_weight_upload_chunked(ggml_backend_sched_t, ggml_backend_t, int, ggml_tensor*, const void*, size_t, size_t, bool)’:
+/home/runner/work/llama.cpp-optium/llama.cpp-optium/ggml/src/ggml-backend.cpp:1328:28: warning: cast from type ‘const uint8_t*’ {aka ‘const unsigned char*’} to type ‘void*’ casts away qualifiers [-Wcast-qual]
+ 1328 |                     memcpy((void *) staged_data, src_bytes + copied, chunk);
+      |                            ^~~~~~~~~~~~~~~~~~~~
 [  2%] Building CXX object ggml/src/CMakeFiles/ggml-base.dir/ggml-backend-meta.cpp.o
 [  3%] Building CXX object ggml/src/CMakeFiles/ggml-base.dir/ggml-opt.cpp.o
 [  3%] Building CXX object ggml/src/CMakeFiles/ggml-base.dir/ggml-threading.cpp.o
@@ -76,6 +80,19 @@
 [ 10%] Building CXX object src/CMakeFiles/llama.dir/llama-context.cpp.o
 [ 10%] Building CXX object src/CMakeFiles/llama.dir/llama-cparams.cpp.o
 [ 10%] Building CXX object src/CMakeFiles/llama.dir/llama-grammar.cpp.o
+/home/runner/work/llama.cpp-optium/llama.cpp-optium/src/llama-context.cpp: In member function ‘void llama_context::sched_reserve()’:
+/home/runner/work/llama.cpp-optium/llama.cpp-optium/src/llama-context.cpp:682:20: warning: cast from type ‘const llama_model*’ to type ‘void*’ casts away qualifiers [-Wcast-qual]
+  682 |                 }, (void *) &model);
+      |                    ^~~~~~~~~~~~~~~
+/home/runner/work/llama.cpp-optium/llama.cpp-optium/src/llama-context.cpp:687:20: warning: cast from type ‘const llama_model*’ to type ‘void*’ casts away qualifiers [-Wcast-qual]
+  687 |                 }, (void *) &model);
+      |                    ^~~~~~~~~~~~~~~
+/home/runner/work/llama.cpp-optium/llama.cpp-optium/src/llama-context.cpp:740:32: warning: cast from type ‘const llama_model*’ to type ‘void*’ casts away qualifiers [-Wcast-qual]
+  740 |                             }, (void *) &model);
+      |                                ^~~~~~~~~~~~~~~
+/home/runner/work/llama.cpp-optium/llama.cpp-optium/src/llama-context.cpp:745:32: warning: cast from type ‘const llama_model*’ to type ‘void*’ casts away qualifiers [-Wcast-qual]
+  745 |                             }, (void *) &model);
+      |                                ^~~~~~~~~~~~~~~
 [ 11%] Building CXX object src/CMakeFiles/llama.dir/llama-graph.cpp.o
 [ 11%] Building CXX object src/CMakeFiles/llama.dir/llama-hparams.cpp.o
 [ 11%] Building CXX object src/CMakeFiles/llama.dir/llama-impl.cpp.o
@@ -269,39 +286,39 @@
 [ 47%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/dotsocr.cpp.o
 [ 47%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/exaone4_5.cpp.o
 [ 47%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/gemma4a.cpp.o
-[ 47%] Building CXX object common/CMakeFiles/llama-common.dir/common.cpp.o
 [ 47%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/gemma4v.cpp.o
+[ 47%] Building CXX object common/CMakeFiles/llama-common.dir/common.cpp.o
 [ 48%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/gemma4ua.cpp.o
 [ 48%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/gemma4uv.cpp.o
 [ 48%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/glm4v.cpp.o
 [ 48%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/granite-speech.cpp.o
 [ 48%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/granite4-vision.cpp.o
 [ 48%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/hunyuanvl.cpp.o
-[ 49%] Building CXX object common/CMakeFiles/llama-common.dir/console.cpp.o
-[ 50%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/internvl.cpp.o
-[ 50%] Building CXX object common/CMakeFiles/llama-common.dir/debug.cpp.o
+[ 49%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/internvl.cpp.o
+[ 50%] Building CXX object common/CMakeFiles/llama-common.dir/console.cpp.o
 [ 50%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/kimivl.cpp.o
+[ 50%] Building CXX object common/CMakeFiles/llama-common.dir/debug.cpp.o
 [ 50%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/kimik25.cpp.o
 [ 50%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/nemotron-v2-vl.cpp.o
 [ 50%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/muse-glimmer.cpp.o
 [ 51%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/llama4.cpp.o
-[ 51%] Building CXX object common/CMakeFiles/llama-common.dir/download.cpp.o
 [ 51%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/llava.cpp.o
+[ 51%] Building CXX object common/CMakeFiles/llama-common.dir/download.cpp.o
 [ 51%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/minicpmv.cpp.o
 [ 51%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/paddleocr.cpp.o
 [ 51%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/pixtral.cpp.o
 [ 52%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/qwen2vl.cpp.o
 [ 52%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/minimax-m3.cpp.o
 [ 52%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/qwen3vl.cpp.o
-[ 52%] Building CXX object common/CMakeFiles/llama-common.dir/fit.cpp.o
 [ 52%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/mimovl.cpp.o
+[ 52%] Building CXX object common/CMakeFiles/llama-common.dir/fit.cpp.o
 [ 52%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/qwen3a.cpp.o
 [ 53%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/mimo-audio.cpp.o
-[ 53%] Building CXX object common/CMakeFiles/llama-common.dir/hf-cache.cpp.o
 [ 53%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/qwen3tts-spkenc.cpp.o
+[ 53%] Building CXX object common/CMakeFiles/llama-common.dir/hf-cache.cpp.o
 [ 53%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/qwen3tts-gen.cpp.o
-[ 53%] Building CXX object common/CMakeFiles/llama-common.dir/imatrix-loader.cpp.o
 [ 53%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/pockettts-seanet.cpp.o
+[ 53%] Building CXX object common/CMakeFiles/llama-common.dir/imatrix-loader.cpp.o
 [ 53%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/pockettts-spkenc.cpp.o
 [ 54%] Building CXX object common/CMakeFiles/llama-common.dir/json-schema-to-grammar.cpp.o
 [ 55%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/pockettts-gen.cpp.o
