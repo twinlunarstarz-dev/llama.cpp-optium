@@ -28,10 +28,6 @@ jobs:
           set -euo pipefail
           git config user.name "llama.cpp-optium integration"
           git config user.email "actions@users.noreply.github.com"
-          if [ -f integration/fix_phase2_patcher.py ]; then
-            python3 -m py_compile integration/fix_phase2_patcher.py
-            python3 integration/fix_phase2_patcher.py
-          fi
           python3 -m py_compile integration/apply_pending.py
           python3 integration/apply_pending.py
           git diff --check
