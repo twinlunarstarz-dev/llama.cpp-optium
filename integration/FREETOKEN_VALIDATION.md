@@ -1,9 +1,10 @@
-# FreeToken sequential v1 fixed validation
+# FreeToken sequential continuation validation
 
 - configure rc: 0
 - build rc: 2
 - focused tests rc: 99
 
+## Build
 ```text
 [  1%] Building CXX object vendor/hash/CMakeFiles/vendor-hash.dir/hash.cpp.o
 [  1%] Building C object ggml/src/CMakeFiles/ggml-base.dir/ggml.c.o
@@ -14,9 +15,9 @@
 [  2%] Building CXX object ggml/src/CMakeFiles/ggml-base.dir/ggml.cpp.o
 [  2%] Building C object ggml/src/CMakeFiles/ggml-base.dir/ggml-alloc.c.o
 [  2%] Building CXX object ggml/src/CMakeFiles/ggml-base.dir/ggml-backend.cpp.o
+[  2%] Building CXX object ggml/src/CMakeFiles/ggml-base.dir/ggml-backend-meta.cpp.o
 [  2%] Built target vendor-hash
 [  2%] Building CXX object vendor/cpp-httplib/CMakeFiles/cpp-httplib.dir/httplib.cpp.o
-[  2%] Building CXX object ggml/src/CMakeFiles/ggml-base.dir/ggml-backend-meta.cpp.o
 [  3%] Building CXX object ggml/src/CMakeFiles/ggml-base.dir/ggml-opt.cpp.o
 [  3%] Building CXX object ggml/src/CMakeFiles/ggml-base.dir/ggml-threading.cpp.o
 [  3%] Building C object ggml/src/CMakeFiles/ggml-base.dir/ggml-quants.c.o
@@ -40,9 +41,9 @@
 [  4%] Built target llama-qwen2vl-cli
 [  5%] Building C object ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/ggml-cpu.c.o
 [  5%] Building CXX object ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/ggml-cpu.cpp.o
+[  5%] Building CXX object ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/repack.cpp.o
 [  5%] Linking CXX static library libcpp-httplib.a
 [  5%] Built target cpp-httplib
-[  5%] Building CXX object ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/repack.cpp.o
 [  5%] Building CXX object ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/hbm.cpp.o
 [  5%] Building C object ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/quants.c.o
 [  6%] Building CXX object ggml/src/CMakeFiles/ggml-cpu.dir/ggml-cpu/traits.cpp.o
@@ -92,21 +93,27 @@
 [ 13%] Building CXX object src/CMakeFiles/llama.dir/llama-mmap.cpp.o
 [ 14%] Building CXX object src/CMakeFiles/llama.dir/llama-model-loader.cpp.o
 [ 14%] Building CXX object src/CMakeFiles/llama.dir/llama-model-saver.cpp.o
-/home/runner/work/llama.cpp-optium/llama.cpp-optium/src/llama-model-loader.cpp: In constructor ‘llama_model_loader::llama_model_loader(gguf_context*, llama_model_set_tensor_data_t, void*, const std::string&, std::vector<std::__cxx11::basic_string<char> >&, FILE*, llama_load_mode, bool, bool, bool, const llama_model_kv_override*, const llama_model_tensor_buft_override*)’:
-/home/runner/work/llama.cpp-optium/llama.cpp-optium/src/llama-model-loader.cpp:824:11: error: ‘struct llama_model_loader’ has no member named ‘load_mtp’
-  824 |     this->load_mtp = load_mtp;
-      |           ^~~~~~~~
 [ 14%] Building CXX object src/CMakeFiles/llama.dir/llama-model.cpp.o
-gmake[2]: *** [src/CMakeFiles/llama.dir/build.make:401: src/CMakeFiles/llama.dir/llama-model-loader.cpp.o] Error 1
+[ 14%] Building CXX object src/CMakeFiles/llama.dir/llama-quant.cpp.o
+[ 14%] Building CXX object src/CMakeFiles/llama.dir/llama-sampler.cpp.o
+[ 15%] Building CXX object src/CMakeFiles/llama.dir/llama-vocab.cpp.o
+[ 15%] Building CXX object src/CMakeFiles/llama.dir/unicode-data.cpp.o
+[ 15%] Building CXX object src/CMakeFiles/llama.dir/unicode.cpp.o
+[ 15%] Building CXX object src/CMakeFiles/llama.dir/models/afmoe.cpp.o
+[ 15%] Building CXX object src/CMakeFiles/llama.dir/models/apertus.cpp.o
+[ 16%] Building CXX object src/CMakeFiles/llama.dir/models/arcee.cpp.o
+[ 16%] Building CXX object src/CMakeFiles/llama.dir/models/arctic.cpp.o
+[ 16%] Building CXX object src/CMakeFiles/llama.dir/models/arwkv7.cpp.o
+[ 16%] Building CXX object src/CMakeFiles/llama.dir/models/baichuan.cpp.o
+[ 16%] Building CXX object src/CMakeFiles/llama.dir/models/bailingmoe.cpp.o
+[ 16%] Building CXX object src/CMakeFiles/llama.dir/models/bailingmoe2.cpp.o
+[ 17%] Building CXX object src/CMakeFiles/llama.dir/models/bailingmoe3.cpp.o
+/home/runner/work/llama.cpp-optium/llama.cpp-optium/src/models/bailingmoe3.cpp: In member function ‘virtual void llama_model_bailingmoe3::load_arch_tensors(llama_model_loader&)’:
+/home/runner/work/llama.cpp-optium/llama.cpp-optium/src/models/bailingmoe3.cpp:73:13: error: ‘struct llama_model_loader’ has no member named ‘load_mtp’
+   73 |     if (!ml.load_mtp) {
+      |             ^~~~~~~~
+gmake[2]: *** [src/CMakeFiles/llama.dir/build.make:625: src/CMakeFiles/llama.dir/models/bailingmoe3.cpp.o] Error 1
 gmake[2]: *** Waiting for unfinished jobs....
-/home/runner/work/llama.cpp-optium/llama.cpp-optium/src/llama-model.cpp: In constructor ‘llama_model::llama_model(const llama_model_params&)’:
-/home/runner/work/llama.cpp-optium/llama.cpp-optium/src/llama-model.cpp:1112:16: error: ‘struct llama_model::impl’ has no member named ‘tensor_split_owned’
- 1112 |         pimpl->tensor_split_owned.assign(params.tensor_split, params.tensor_split + llama_max_devices());
-      |                ^~~~~~~~~~~~~~~~~~
-/home/runner/work/llama.cpp-optium/llama.cpp-optium/src/llama-model.cpp:1113:44: error: ‘struct llama_model::impl’ has no member named ‘tensor_split_owned’
- 1113 |         this->params.tensor_split = pimpl->tensor_split_owned.data();
-      |                                            ^~~~~~~~~~~~~~~~~~
-gmake[2]: *** [src/CMakeFiles/llama.dir/build.make:429: src/CMakeFiles/llama.dir/llama-model.cpp.o] Error 1
 gmake[1]: *** [CMakeFiles/Makefile2:2502: src/CMakeFiles/llama.dir/all] Error 2
 gmake: *** [Makefile:146: all] Error 2
 ```
