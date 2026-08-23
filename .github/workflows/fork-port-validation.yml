@@ -1,0 +1,54 @@
+name: Fork port validation
+
+on:
+  push:
+    branches:
+      - opt/cuda-sequential-integration-2026-08-22
+    paths:
+      - .github/workflows/fork-port-validation.yml
+
+permissions:
+  contents: write
+
+jobs:
+  port-and-validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: opt/cuda-sequential-integration-2026-08-22
+
+      - name: Configure git
+        run: |
+          git config user.name "llama.cpp-optium CI"
+          git config user.email "actions@users.noreply.github.com"
+
+      - name: Port fork-specific commits onto current upstream
+        run: |
+          set -euxo pipefail
+          git fetch origin master
+          for commit in \
+            7d9d3b14225b6a3502a1b24e5aaf8de6bde7d4e9 \
+            4012e11809111501ef9b735d8c461335f0e6b3c4 \
+            1dabfb09614957038300beb5ab9622df82a7a2b7 \
+            6d5e04709b1583620f5f5cb205fe64da582dda18 \
+            bdc8156c3fc41e3eb5166274548b9cae6529314f \
+            d6294d870e56b2fb7e2fe26f156294c92948c401
+          do
+            git cherry-pick -Xpatience -Xtheirs "$commit"
+          done
+
+      - name: Configure CPU validation build
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=OFF -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build -j2
+
+      - name: Run focused regression tests
+        run: |
+          ctest --test-dir build --output-on-failure -R 'test-(backend-sched|arg-parser|llama-archs)'
+
+      - name: Push validated port
+        run: git push origin HEAD:opt/cuda-sequential-integration-2026-08-22
