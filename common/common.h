@@ -344,6 +344,7 @@ struct common_params_speculative_draft {
     common_cpu_params cpuparams_batch;
 
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
+    std::string device_raw;                  // deferred raw --device value for server router dispatch
 
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
 };

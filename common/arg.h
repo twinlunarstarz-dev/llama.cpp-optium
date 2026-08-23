@@ -126,8 +126,6 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
 
 // load all backends and print the list of available (non-CPU) devices to stdout
 void common_print_available_devices();
-
-// Resolve a deferred raw device list after server mode is known.
 void common_params_resolve_devices(common_params & params);
 
 // parse input arguments from CLI into a map
