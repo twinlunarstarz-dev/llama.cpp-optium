@@ -271,82 +271,61 @@
 [ 47%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/gemma4a.cpp.o
 [ 47%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/gemma4v.cpp.o
 [ 48%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/gemma4ua.cpp.o
-[ 48%] Building CXX object common/CMakeFiles/llama-common.dir/common.cpp.o
 [ 48%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/gemma4uv.cpp.o
-/home/runner/work/llama.cpp-optium/llama.cpp-optium/common/common.cpp: In function ‘void common_validate_sequential_params(const common_params&)’:
-/home/runner/work/llama.cpp-optium/llama.cpp-optium/common/common.cpp:1310:17: error: ‘const struct common_params’ has no member named ‘use_mmap’
- 1310 |     if (!params.use_mmap) {
-      |                 ^~~~~~~~
-/home/runner/work/llama.cpp-optium/llama.cpp-optium/common/common.cpp:1313:16: error: ‘const struct common_params’ has no member named ‘use_direct_io’
- 1313 |     if (params.use_direct_io) {
-      |                ^~~~~~~~~~~~~
-/home/runner/work/llama.cpp-optium/llama.cpp-optium/common/common.cpp:1316:16: error: ‘const struct common_params’ has no member named ‘use_mlock’
- 1316 |     if (params.use_mlock) {
-      |                ^~~~~~~~~
-/home/runner/work/llama.cpp-optium/llama.cpp-optium/common/common.cpp: In constructor ‘common_init_result::common_init_result(common_params&, bool)’:
-/home/runner/work/llama.cpp-optium/llama.cpp-optium/common/common.cpp:1370:21: error: ‘struct llama_model_params’ has no member named ‘use_mmap’
- 1370 |             mparams.use_mmap  = true;
-      |                     ^~~~~~~~
-/home/runner/work/llama.cpp-optium/llama.cpp-optium/common/common.cpp:1372:21: error: ‘struct llama_model_params’ has no member named ‘use_mlock’
- 1372 |             mparams.use_mlock = false;
-      |                     ^~~~~~~~~
-/home/runner/work/llama.cpp-optium/llama.cpp-optium/common/common.cpp: In function ‘llama_model_params common_model_params_to_llama(common_params&)’:
-/home/runner/work/llama.cpp-optium/llama.cpp-optium/common/common.cpp:1739:13: error: ‘struct llama_model_params’ has no member named ‘use_mmap’
- 1739 |     mparams.use_mmap        = params.use_mmap || params.sequential_load; // force mmap for streaming
-      |             ^~~~~~~~
-/home/runner/work/llama.cpp-optium/llama.cpp-optium/common/common.cpp:1739:38: error: ‘struct common_params’ has no member named ‘use_mmap’
- 1739 |     mparams.use_mmap        = params.use_mmap || params.sequential_load; // force mmap for streaming
-      |                                      ^~~~~~~~
-/home/runner/work/llama.cpp-optium/llama.cpp-optium/common/common.cpp:1740:13: error: ‘struct llama_model_params’ has no member named ‘use_direct_io’
- 1740 |     mparams.use_direct_io   = params.sequential_load ? false : params.use_direct_io;
-      |             ^~~~~~~~~~~~~
-/home/runner/work/llama.cpp-optium/llama.cpp-optium/common/common.cpp:1740:71: error: ‘struct common_params’ has no member named ‘use_direct_io’
- 1740 |     mparams.use_direct_io   = params.sequential_load ? false : params.use_direct_io;
-      |                                                                       ^~~~~~~~~~~~~
-/home/runner/work/llama.cpp-optium/llama.cpp-optium/common/common.cpp:1741:13: error: ‘struct llama_model_params’ has no member named ‘use_mlock’
- 1741 |     mparams.use_mlock       = params.sequential_load ? false : params.use_mlock; // no mlock for streaming
-      |             ^~~~~~~~~
-/home/runner/work/llama.cpp-optium/llama.cpp-optium/common/common.cpp:1741:71: error: ‘struct common_params’ has no member named ‘use_mlock’
- 1741 |     mparams.use_mlock       = params.sequential_load ? false : params.use_mlock; // no mlock for streaming
-      |                                                                       ^~~~~~~~~
+[ 48%] Building CXX object common/CMakeFiles/llama-common.dir/common.cpp.o
 [ 48%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/glm4v.cpp.o
-gmake[2]: *** [common/CMakeFiles/llama-common.dir/build.make:163: common/CMakeFiles/llama-common.dir/common.cpp.o] Error 1
-gmake[1]: *** [CMakeFiles/Makefile2:2635: common/CMakeFiles/llama-common.dir/all] Error 2
-gmake[1]: *** Waiting for unfinished jobs....
 [ 48%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/granite-speech.cpp.o
 [ 48%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/granite4-vision.cpp.o
 [ 48%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/hunyuanvl.cpp.o
 [ 49%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/internvl.cpp.o
 [ 49%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/kimivl.cpp.o
 [ 49%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/kimik25.cpp.o
-[ 49%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/nemotron-v2-vl.cpp.o
-[ 49%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/muse-glimmer.cpp.o
-[ 50%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/llama4.cpp.o
-[ 50%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/llava.cpp.o
-[ 50%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/minicpmv.cpp.o
-[ 50%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/paddleocr.cpp.o
-[ 50%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/pixtral.cpp.o
-[ 51%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/qwen2vl.cpp.o
-[ 51%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/minimax-m3.cpp.o
-[ 51%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/qwen3vl.cpp.o
-[ 51%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/mimovl.cpp.o
-[ 51%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/qwen3a.cpp.o
-[ 52%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/mimo-audio.cpp.o
-[ 52%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/qwen3tts-spkenc.cpp.o
-[ 52%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/qwen3tts-gen.cpp.o
-[ 52%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/pockettts-seanet.cpp.o
-[ 52%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/pockettts-spkenc.cpp.o
-[ 53%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/pockettts-gen.cpp.o
-[ 53%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/step3vl.cpp.o
-[ 53%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/siglip.cpp.o
-[ 53%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/whisper-enc.cpp.o
-[ 53%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/deepseekocr.cpp.o
-[ 54%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/deepseekocr2.cpp.o
-[ 54%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/mobilenetv5.cpp.o
-[ 54%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/youtuvl.cpp.o
-[ 54%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/yasa2.cpp.o
-[ 54%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/parakeet.cpp.o
-[ 55%] Linking CXX shared library ../../bin/libmtmd.so
-[ 55%] Built target mtmd
+[ 50%] Building CXX object common/CMakeFiles/llama-common.dir/console.cpp.o
+[ 50%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/nemotron-v2-vl.cpp.o
+[ 50%] Building CXX object common/CMakeFiles/llama-common.dir/debug.cpp.o
+[ 50%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/muse-glimmer.cpp.o
+[ 51%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/llama4.cpp.o
+[ 51%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/llava.cpp.o
+[ 51%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/minicpmv.cpp.o
+[ 51%] Building CXX object common/CMakeFiles/llama-common.dir/download.cpp.o
+[ 51%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/paddleocr.cpp.o
+[ 51%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/pixtral.cpp.o
+[ 52%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/qwen2vl.cpp.o
+[ 52%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/minimax-m3.cpp.o
+[ 52%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/qwen3vl.cpp.o
+[ 52%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/mimovl.cpp.o
+[ 52%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/qwen3a.cpp.o
+[ 53%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/mimo-audio.cpp.o
+[ 53%] Building CXX object common/CMakeFiles/llama-common.dir/fit.cpp.o
+/home/runner/work/llama.cpp-optium/llama.cpp-optium/common/fit.cpp: In function ‘std::vector<llama_device_memory_data> common_get_device_memory_data_impl(const char*, const llama_model_params*, const llama_context_params*, std::vector<ggml_backend_device*>&, uint32_t&, uint32_t&, uint32_t&, ggml_log_level)’:
+/home/runner/work/llama.cpp-optium/llama.cpp-optium/common/fit.cpp:57:18: error: ‘struct llama_model_params’ has no member named ‘use_mmap’
+   57 |     mparams_copy.use_mmap        = false;
+      |                  ^~~~~~~~
+/home/runner/work/llama.cpp-optium/llama.cpp-optium/common/fit.cpp:58:18: error: ‘struct llama_model_params’ has no member named ‘use_mlock’
+   58 |     mparams_copy.use_mlock       = false;
+      |                  ^~~~~~~~~
+/home/runner/work/llama.cpp-optium/llama.cpp-optium/common/fit.cpp:142:18: error: ‘const struct llama_model_params’ has no member named ‘load_mtp’; did you mean ‘load_mode’?
+  142 |     if (mparams->load_mtp) {
+      |                  ^~~~~~~~
+      |                  load_mode
+gmake[2]: *** [common/CMakeFiles/llama-common.dir/build.make:219: common/CMakeFiles/llama-common.dir/fit.cpp.o] Error 1
+gmake[1]: *** [CMakeFiles/Makefile2:2635: common/CMakeFiles/llama-common.dir/all] Error 2
+gmake[1]: *** Waiting for unfinished jobs....
+[ 53%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/qwen3tts-spkenc.cpp.o
+[ 53%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/qwen3tts-gen.cpp.o
+[ 53%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/pockettts-seanet.cpp.o
+[ 53%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/pockettts-spkenc.cpp.o
+[ 54%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/pockettts-gen.cpp.o
+[ 54%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/step3vl.cpp.o
+[ 54%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/siglip.cpp.o
+[ 54%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/whisper-enc.cpp.o
+[ 54%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/deepseekocr.cpp.o
+[ 55%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/deepseekocr2.cpp.o
+[ 55%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/mobilenetv5.cpp.o
+[ 55%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/youtuvl.cpp.o
+[ 55%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/yasa2.cpp.o
+[ 55%] Building CXX object tools/mtmd/CMakeFiles/mtmd.dir/models/parakeet.cpp.o
+[ 56%] Linking CXX shared library ../../bin/libmtmd.so
+[ 56%] Built target mtmd
 gmake: *** [Makefile:146: all] Error 2
 ```
