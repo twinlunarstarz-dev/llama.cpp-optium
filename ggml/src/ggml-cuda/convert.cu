@@ -439,6 +439,48 @@ static __global__ void convert_unary(
     }
 }
 
+template <typename dst_t>
+static __global__ void dequantize_block_iq4_nl_nc(
+        const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t ne00, const int64_t ne01,
+        const int64_t ne0203, const uint3 ne02,
+        const int64_t s01, const int64_t s02, const int64_t s03) {
+    const int64_t i00 = QK4_NL * blockIdx.x;
+    const int64_t iq  = threadIdx.x;
+
+    if (i00 + iq >= ne00) {
+        return;
+    }
+
+    for (int64_t i01 = blockIdx.y; i01 < ne01; i01 += gridDim.y) {
+        for (int64_t i0203 = blockIdx.z; i0203 < ne0203; i0203 += gridDim.z) {
+            const uint2 dm = fast_div_modulo((uint32_t) i0203, ne02);
+            const int64_t i02 = dm.y;
+            const int64_t i03 = dm.x;
+
+            const block_iq4_nl * x = (const block_iq4_nl *) vx + i03*s03 + i02*s02 + i01*s01 + blockIdx.x;
+            const float d = (float) x->d;
+            const uint8_t q = x->qs[iq];
+            dst_t * dst = y + (i0203*ne01 + i01)*ne00 + i00;
+
+            dst[iq] = ggml_cuda_cast<dst_t>(d * kvalues_iq4nl[q & 0x0f]);
+            if (i00 + iq + QK4_NL/2 < ne00) {
+                dst[iq + QK4_NL/2] = ggml_cuda_cast<dst_t>(d * kvalues_iq4nl[q >> 4]);
+            }
+        }
+    }
+}
+
+template <typename dst_t>
+static void dequantize_block_iq4_nl_nc_cuda(const void * vx, dst_t * y,
+        const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
+        const int64_t s01, const int64_t s02, const int64_t s03, cudaStream_t stream) {
+    const int64_t ne0203 = ne02*ne03;
+    const uint3 ne02_fdv = init_fastdiv_values(ne02);
+    const dim3 num_blocks((ne00 + QK4_NL - 1) / QK4_NL, (int) std::min(ne01, (int64_t) 65535), (int) std::min(ne0203, (int64_t) 65535));
+    dequantize_block_iq4_nl_nc<<<num_blocks, QK4_NL/2, 0, stream>>>
+        (vx, y, ne00, ne01, ne0203, ne02_fdv, s01, s02, s03);
+}
+
 template <typename src_t, typename dst_t>
 static void convert_unary_cuda(const void * vx, dst_t * y,
         const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
@@ -647,6 +689,8 @@ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK5_1, QR5_1, dequantize_q5_1>;
         case GGML_TYPE_Q8_0:
             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
+        case GGML_TYPE_IQ4_NL:
+            return dequantize_block_iq4_nl_nc_cuda;
         case GGML_TYPE_BF16:
             return convert_unary_cuda<nv_bfloat16>;
         default:

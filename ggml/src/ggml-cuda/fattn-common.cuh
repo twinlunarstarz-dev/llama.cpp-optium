@@ -1027,6 +1027,7 @@ void launch_fattn(
         half * K_f16 = (half *) f16_extra.K;
         if (ggml_is_contiguously_allocated(K)) {
             to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(K->type);
+            GGML_ASSERT(to_fp16 != nullptr);
             to_fp16(K_data, K_f16, ggml_nelements(K), main_stream);
 
             nb11 = nb11*bs*sizeof(half)/ts;
@@ -1035,6 +1036,7 @@ void launch_fattn(
         } else {
             GGML_ASSERT(K->nb[0] == ts);
             to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(K->type);
+            GGML_ASSERT(to_fp16 != nullptr);
             const int64_t s01 = nb11 / ts;
             const int64_t s02 = nb12 / ts;
             const int64_t s03 = nb13 / ts;
@@ -1061,6 +1063,7 @@ void launch_fattn(
             half * V_f16 = (half *) f16_extra.V;
             if (ggml_is_contiguously_allocated(V)) {
                 to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(V->type);
+                GGML_ASSERT(to_fp16 != nullptr);
                 to_fp16(V_data, V_f16, ggml_nelements(V), main_stream);
                 V_data = (char *) V_f16;
 
@@ -1070,6 +1073,7 @@ void launch_fattn(
             } else {
                 GGML_ASSERT(V->nb[0] == ts);
                 to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(V->type);
+                GGML_ASSERT(to_fp16 != nullptr);
                 const int64_t s01 = nb21 / ts;
                 const int64_t s02 = nb22 / ts;
                 const int64_t s03 = nb23 / ts;
@@ -1109,6 +1113,7 @@ void launch_fattn(
     }
 
     const dim3 block_dim(warp_size, nwarps, 1);
+    GGML_ASSERT(fattn_kernel != nullptr);
     int max_blocks_per_sm = 1; // Max. number of active blocks limited by occupancy.
     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, fattn_kernel, block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
     GGML_ASSERT(max_blocks_per_sm > 0);
