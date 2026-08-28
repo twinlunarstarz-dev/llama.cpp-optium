@@ -17,6 +17,37 @@
 
 </div>
 
+## llama.cpp-optium fork
+
+This repository tracks upstream [`ggml-org/llama.cpp`](https://github.com/ggml-org/llama.cpp) and adds experimental functionality for large-model inference on memory-constrained, heterogeneous systems. Upstream behavior remains the default unless a fork-specific option is enabled.
+
+### Additional functionality
+
+- **Sequential storage-backed loading** - `--sequential` / `--sequential-load` streams model weights through bounded host and per-device windows so a model does not need to fit in aggregate RAM and VRAM. The implementation supports mmap and direct-I/O source tiers, multi-GPU routing, automatic fitting, split-scoped allocation, and overlapped CUDA transfer/compute where supported. See [the architecture document](docs/architecture-sequential-loading-v2.md) and [integration notes](integration/README.md).
+- **Fable MoE prefill optimizations** - adds host-visible expert-ID compaction, expert-weight prefetch, and accelerator registration for mmap-backed spans to reduce MoE prefill transfer and residency overhead. Sequential/direct-I/O mode remains separate from whole-model pinning.
+- **Multi-pass generation** - `--passes N` generates hidden same-model candidates and selects a result with a same-model judge. `N=1` preserves normal generation.
+- **Extended speculative and MTP placement** - preserves local model-loader and router support for MTP draft loading, draft-device selection, separate draft KV types, and backend draft sampling across direct server and `models.ini` deployments.
+- **Optional LMCache daemon reuse** - `--lmcache HOST:PORT` or `lmcache = HOST:PORT` in a model preset stores versioned llama.cpp sequence-state objects in LMCache's bundled TCP daemon for cross-process prompt-prefix reuse. This is generic CPU-RAM object reuse, not LMCache's vLLM/SGLang connectors or tiered-storage engine. Failures fall back to the normal local prompt cache and prefill path. See [server options](tools/server/README.md#server-specific-params).
+- **Quantized training foundations** - includes quantized training primitives, stable tensor identity, and transactional checkpoint state used by the fork's ongoing full-parameter 4-bit GGUF training work. The higher-level training workflow is still under development.
+- **CUDA and scheduler tuning** - includes fork-specific wide-MoE scheduler growth, sequential external-allocation handling, Flash Attention quantized-view fixes, CUDA graph and prefetch integration, and configurable NCCL BF16 crossover behavior.
+
+### LMCache example
+
+Start an LMCache bundled daemon separately, then point `llama-server` at it:
+
+```sh
+llama-server -m model.gguf --lmcache 127.0.0.1:65432
+```
+
+For router deployments, the same option can be set per model or globally in `models.ini`:
+
+```ini
+[*]
+lmcache = 127.0.0.1:65432
+```
+
+Use `cache-ram = 0` with `lmcache` for remote-only prompt-state reuse, or retain a nonzero `cache-ram` value to use both the local and remote caches. Text prompts are supported; multimodal prompt states are intentionally not exported.
+
 ## Quick start
 
 A few options to get `llama.cpp` installed on your machine:

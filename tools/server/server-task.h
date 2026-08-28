@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.h"
+#include "lmcache-client.h"
 #include "llama.h"
 
 #include <string>
@@ -611,9 +612,14 @@ struct server_prompt_cache_state {
 };
 
 struct server_prompt_cache {
-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
+    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens, const std::string & lmcache_endpoint, const std::string & lmcache_namespace) {
+        this->local_enabled = limit_size_mib != 0;
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
+        if (!lmcache_endpoint.empty()) {
+            this->lmcache = std::make_unique<common_lmcache_client>(lmcache_endpoint);
+            this->lmcache_namespace = lmcache_namespace;
+        }
     }
 
     std::list<server_prompt_cache_state> states;
@@ -624,11 +630,18 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
+    bool local_enabled = true;
+
+    std::unique_ptr<common_lmcache_client> lmcache;
+    std::string lmcache_namespace;
+
     size_t size() const;
 
     size_t n_tokens() const;
 
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+
+    void store_remote(server_prompt_cache_state * state);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 

@@ -10,6 +10,8 @@
 #include "speculative.h"
 #include "server-common.h"
 
+#include <cstring>
+#include <limits>
 #include <sstream>
 
 //
@@ -1690,6 +1692,116 @@ json server_task_result_apply_lora::to_json() {
 //
 // server_prompt_cache
 //
+namespace {
+
+constexpr uint8_t LMCACHE_STATE_MAGIC[8] = { 'l', 'l', 'a', 'm', 'a', 'l', 'm', '1' };
+
+static uint64_t lmcache_hash(const void * data, size_t size, uint64_t hash = 1469598103934665603ull) {
+    const uint8_t * bytes = static_cast<const uint8_t *>(data);
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+static std::string lmcache_key(const std::string & cache_namespace, const llama_tokens & tokens) {
+    constexpr size_t prefix_tokens = 64;
+    const uint64_t namespace_hash = lmcache_hash(cache_namespace.data(), cache_namespace.size());
+    const size_t n_hash = std::min(tokens.size(), prefix_tokens);
+    uint64_t prompt_hash = lmcache_hash(tokens.data(), n_hash*sizeof(tokens[0]));
+    prompt_hash = lmcache_hash(&namespace_hash, sizeof(namespace_hash), prompt_hash);
+
+    std::ostringstream key;
+    key << "llamacpp-" << std::hex << namespace_hash << "@1@0@" << prompt_hash << "@uint8";
+    return key.str();
+}
+
+template<typename T>
+static void lmcache_write(std::vector<uint8_t> & data, T value) {
+    const size_t offset = data.size();
+    data.resize(offset + sizeof(value));
+    std::memcpy(data.data() + offset, &value, sizeof(value));
+}
+
+static void lmcache_write_bytes(std::vector<uint8_t> & data, const void * src, size_t size) {
+    const size_t offset = data.size();
+    data.resize(offset + size);
+    if (size > 0) {
+        std::memcpy(data.data() + offset, src, size);
+    }
+}
+
+template<typename T>
+static bool lmcache_read(const std::vector<uint8_t> & data, size_t & offset, T & value) {
+    if (offset > data.size() || data.size() - offset < sizeof(value)) {
+        return false;
+    }
+    std::memcpy(&value, data.data() + offset, sizeof(value));
+    offset += sizeof(value);
+    return true;
+}
+
+static bool lmcache_read_bytes(const std::vector<uint8_t> & data, size_t & offset, void * dst, size_t size) {
+    if (offset > data.size() || data.size() - offset < size) {
+        return false;
+    }
+    if (size > 0) {
+        std::memcpy(dst, data.data() + offset, size);
+    }
+    offset += size;
+    return true;
+}
+
+static std::vector<uint8_t> lmcache_serialize(const server_prompt_cache_state & state) {
+    const llama_tokens & tokens = state.prompt.tokens.get_tokens();
+    std::vector<uint8_t> data;
+    data.reserve(sizeof(LMCACHE_STATE_MAGIC) + 3*sizeof(uint64_t) + tokens.size()*sizeof(tokens[0]) + state.data.size());
+    lmcache_write_bytes(data, LMCACHE_STATE_MAGIC, sizeof(LMCACHE_STATE_MAGIC));
+    lmcache_write(data, (uint64_t) tokens.size());
+    lmcache_write(data, (uint64_t) state.data.main.size());
+    lmcache_write(data, (uint64_t) state.data.drft.size());
+    lmcache_write_bytes(data, tokens.data(), tokens.size()*sizeof(tokens[0]));
+    lmcache_write_bytes(data, state.data.main.data(), state.data.main.size());
+    lmcache_write_bytes(data, state.data.drft.data(), state.data.drft.size());
+    return data;
+}
+
+static bool lmcache_deserialize(const std::vector<uint8_t> & data, server_prompt_cache_state & state) {
+    if (data.size() < sizeof(LMCACHE_STATE_MAGIC) || std::memcmp(data.data(), LMCACHE_STATE_MAGIC, sizeof(LMCACHE_STATE_MAGIC)) != 0) {
+        return false;
+    }
+
+    size_t offset = sizeof(LMCACHE_STATE_MAGIC);
+    uint64_t n_tokens = 0;
+    uint64_t size_main = 0;
+    uint64_t size_drft = 0;
+    if (!lmcache_read(data, offset, n_tokens) || !lmcache_read(data, offset, size_main) || !lmcache_read(data, offset, size_drft)) {
+        return false;
+    }
+    if (n_tokens > std::numeric_limits<size_t>::max()/sizeof(llama_token) || size_main > std::numeric_limits<size_t>::max() || size_drft > std::numeric_limits<size_t>::max()) {
+        return false;
+    }
+
+    const size_t tokens_bytes = (size_t) n_tokens*sizeof(llama_token);
+    if (tokens_bytes > data.size() - offset || size_main > data.size() - offset - tokens_bytes || size_drft != data.size() - offset - tokens_bytes - size_main) {
+        return false;
+    }
+
+    llama_tokens tokens((size_t) n_tokens);
+    if (!lmcache_read_bytes(data, offset, tokens.data(), tokens_bytes)) {
+        return false;
+    }
+
+    state.prompt.tokens = server_tokens(tokens, false);
+    state.data.main.resize((size_t) size_main);
+    state.data.drft.resize((size_t) size_drft);
+    return lmcache_read_bytes(data, offset, state.data.main.data(), state.data.main.size()) &&
+           lmcache_read_bytes(data, offset, state.data.drft.data(), state.data.drft.size()) && offset == data.size();
+}
+
+}
+
 size_t server_prompt_cache::size() const {
     size_t res = 0;
 
@@ -1792,7 +1904,72 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     return &states.back();
 }
 
+void server_prompt_cache::store_remote(server_prompt_cache_state * state) {
+    if (lmcache && !state->prompt.tokens.has_mtmd) {
+        std::string error;
+        const llama_tokens & tokens = state->prompt.tokens.get_tokens();
+        if (!lmcache->put(lmcache_key(lmcache_namespace, tokens), lmcache_serialize(*state), error)) {
+            SRV_WRN("failed to store prompt state in LMCache: %s\n", error.c_str());
+        } else {
+            SRV_TRC(" - stored %zu-token prompt state in LMCache\n", tokens.size());
+        }
+    }
+
+    if (!local_enabled) {
+        for (auto it = states.begin(); it != states.end(); ++it) {
+            if (&*it == state) {
+                states.erase(it);
+                break;
+            }
+        }
+    }
+}
+
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+    if (lmcache && !tokens_new.has_mtmd) {
+        std::vector<uint8_t> data;
+        bool found = false;
+        std::string error;
+        const llama_tokens & tokens = tokens_new.get_tokens();
+        if (!lmcache->get(lmcache_key(lmcache_namespace, tokens), data, found, error)) {
+            SRV_WRN("failed to retrieve prompt state from LMCache: %s\n", error.c_str());
+        } else if (found) {
+            server_prompt_cache_state remote;
+            if (!lmcache_deserialize(data, remote)) {
+                SRV_WRN("%s", "ignored invalid LMCache prompt state\n");
+            } else if (!remote.data.drft.empty() && !ctx_dft) {
+                SRV_WRN("%s", "ignored LMCache prompt state that requires a draft context\n");
+            } else {
+                const int lcp_base = prompt.tokens.get_common_prefix(tokens_new);
+                const int lcp_remote = remote.prompt.tokens.get_common_prefix(tokens_new);
+                const float keep_base = prompt.tokens.size() > 0 ? float(lcp_base) / prompt.tokens.size() : -1.0f;
+                const float sim_base = tokens_new.size() > 0 ? float(lcp_base) / tokens_new.size() : 0.0f;
+                const float keep_remote = remote.prompt.tokens.size() > 0 ? float(lcp_remote) / remote.prompt.tokens.size() : 0.0f;
+                const float sim_remote = tokens_new.size() > 0 ? float(lcp_remote) / tokens_new.size() : 0.0f;
+                if (keep_remote >= 0.25f && keep_base < keep_remote && sim_base < sim_remote) {
+                    const size_t size_tgt = remote.data.main.size();
+                    const size_t n_tgt = llama_state_seq_set_data_ext(ctx_tgt, remote.data.main.data(), size_tgt, id_slot, 0);
+                    if (n_tgt != size_tgt) {
+                        SRV_ERR("failed to restore LMCache target state with size %zu\n", size_tgt);
+                        return false;
+                    }
+                    if (!remote.data.drft.empty()) {
+                        const size_t size_dft = remote.data.drft.size();
+                        const size_t n_dft = llama_state_seq_set_data_ext(ctx_dft, remote.data.drft.data(), size_dft, id_slot, 0);
+                        if (n_dft != size_dft) {
+                            SRV_ERR("failed to restore LMCache draft state with size %zu\n", size_dft);
+                            return false;
+                        }
+                    }
+                    prompt = std::move(remote.prompt);
+                    SRV_TRC(" - restored %zu-token prompt state from LMCache\n", tokens.size());
+                    return true;
+                }
+                SRV_TRC(" - LMCache prompt is not better, f_keep = %.3f, f_sim = %.3f\n", keep_remote, sim_remote);
+            }
+        }
+    }
+
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins

@@ -319,6 +319,8 @@ struct server_slot {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
 
+        prompt_cache.store_remote(cur);
+
         return true;
     }
 
@@ -1327,15 +1329,30 @@ private:
             batch.init(std::max(n_batch, params_base.n_parallel), n_embd);
         }
 
-        if (params_base.cache_ram_mib != 0) {
+        if (params_base.cache_ram_mib != 0 || !params_base.lmcache_endpoint.empty()) {
             if (params_base.cache_ram_mib < 0) {
                 SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
+            } else if (params_base.cache_ram_mib == 0) {
+                SRV_TRC("%s", "local prompt cache is disabled\n");
             } else {
                 SRV_TRC("prompt cache is enabled, size limit: %d MiB\n", params_base.cache_ram_mib);
             }
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
-            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            char model_desc[256] = {};
+            llama_model_desc(model_tgt, model_desc, sizeof(model_desc));
+
+            const std::string lmcache_namespace = string_format(
+                    "v1|commit=%s|model=%s|size=%" PRIu64 "|params=%" PRIu64 "|ctx=%d|k=%s|v=%s|draft_size=%" PRIu64 "|draft_params=%" PRIu64,
+                    llama_commit(), model_desc, llama_model_size(model_tgt), llama_model_n_params(model_tgt), n_ctx,
+                    ggml_type_name(params_base.cache_type_k), ggml_type_name(params_base.cache_type_v),
+                    model_dft ? llama_model_size(model_dft) : 0, model_dft ? llama_model_n_params(model_dft) : 0);
+
+            prompt_cache = std::make_unique<server_prompt_cache>(
+                    params_base.cache_ram_mib, n_ctx, params_base.lmcache_endpoint, lmcache_namespace);
+            if (!params_base.lmcache_endpoint.empty()) {
+                SRV_INF("LMCache prompt state reuse enabled at %s\n", params_base.lmcache_endpoint.c_str());
+            }
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
