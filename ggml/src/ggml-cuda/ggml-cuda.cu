@@ -4360,7 +4360,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     ggml_cuda_stream_context & stream_context = cuda_ctx->stream_context();
     stream_context.reset();
 
-    if (!use_cuda_graph) {
+    if (!use_cuda_graph || ggml_backend_cuda_get_device_count() != 1) {
         return;
     }
 
