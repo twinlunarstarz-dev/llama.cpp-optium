@@ -114,8 +114,10 @@ if (NOT GGML_LLAMAFILE_DEFAULT)
     set(GGML_LLAMAFILE_DEFAULT OFF)
 endif()
 
-if (NOT GGML_CUDA_GRAPHS_DEFAULT)
-    set(GGML_CUDA_GRAPHS_DEFAULT OFF)
+if (NOT DEFINED GGML_CUDA_GRAPHS_DEFAULT)
+    # CUDA graph replay preserves the same kernel sequence while reducing launch overhead.
+    # Explicit GGML_CUDA_GRAPHS / GGML_CUDA_GRAPHS_DEFAULT overrides remain authoritative.
+    set(GGML_CUDA_GRAPHS_DEFAULT ON)
 endif()
 
 # general
