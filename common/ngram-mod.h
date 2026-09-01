@@ -34,5 +34,11 @@ private:
 
     size_t used;
 
+    // The default ngram-mod table is a power of two. Cache this once so the hot
+    // add/get path can use a bit mask instead of an integer division, while
+    // retaining modulo for arbitrary table sizes.
+    size_t index_mask;
+    bool   index_is_pow2;
+
     std::vector<entry_t> entries;
 };
