@@ -1510,11 +1510,36 @@ ggml_tensor * llm_graph_context::build_cvec(
     return cvec->apply_to(ctx0, cur, il);
 }
 
+void llm_graph_input_forge_rot::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+    for (const auto & it : t) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(it.second->buffer));
+        llama_gen_hadamard(it.second);
+    }
+}
+
+// GGUF basename of a tensor name: "blk.7.ffn_down.weight" -> "ffn_down",
+// "output.weight" -> "output". Non-.weight names never match the table.
+static uint32_t llama_forge_rot_block_for(const llama_hparams & hp, const char * name) {
+    std::string base(name);
+    if (base.size() > 7 && base.compare(base.size() - 7, 7, ".weight") == 0) {
+        base.resize(base.size() - 7);
+    } else {
+        return 0;
+    }
+    const size_t dot = base.rfind('.');
+    if (dot != std::string::npos) {
+        base = base.substr(dot + 1);
+    }
+    return hp.forge_rot_block_for_base(base.c_str());
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
     ggml_tensor * cur_mm = cur;
+    bool cur_rotated = false;
     if (hadamard_rotations) {
         const auto it = hadamard_rotations->find(w);
         if (it != hadamard_rotations->end()) {
@@ -1535,6 +1560,30 @@ ggml_tensor * llm_graph_context::build_lora_mm(
                 cur_mm = llama_mul_mat_hadamard(ctx0, cur_mm, t.rot);
                 hadamard_memo[memo_key] = cur_mm;
             }
+            cur_rotated = true;
+        }
+    }
+    // Forge/TAARDIS: w is stored as (W @ H) in a block-diagonal Hadamard
+    // basis, so the matmul must see H x as its input. H is symmetric and
+    // orthonormal, and ggml_mul_mat(H, x)[i,j] = sum_k H[k,i] x[k,j] is
+    // exactly H^T x == H x. Rotate ONLY this matmul's input: LoRA adapters
+    // are trained in the unrotated basis and keep reading the raw `cur`.
+    if (!cur_rotated && w != nullptr && hparams.forge_rot_active()) {
+        // escape hatch for bisecting a bad rotation without a rebuild
+        static const bool forge_rot_disabled = getenv("LLAMA_FORGE_ROT_DISABLE") != nullptr;
+        const uint32_t b = forge_rot_disabled ? 0 : llama_forge_rot_block_for(hparams, w->name);
+        if (b > 1) {
+            GGML_ASSERT(cur->ne[0] % b == 0);
+            if (!inp_forge_rot) {
+                auto inp = std::make_unique<llm_graph_input_forge_rot>();
+                inp_forge_rot = static_cast<llm_graph_input_forge_rot *>(res->add_input(std::move(inp)));
+            }
+            ggml_tensor * & H = inp_forge_rot->t[b];
+            if (H == nullptr) {
+                H = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, b, b);
+                ggml_set_input(H);
+            }
+            cur_mm = llama_mul_mat_hadamard(ctx0, cur_mm, H);
         }
     }
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur_mm);
