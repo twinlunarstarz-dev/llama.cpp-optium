@@ -166,6 +166,11 @@ struct common_sampler {
     }
 
     mutable int64_t t_total_us = 0;
+
+    // common_sampler_sample_and_accept_n() verifies several already-computed rows.
+    // It synchronizes the context once for that whole verification batch and sets this
+    // flag so sampling each row does not redundantly synchronize the same context.
+    bool context_is_synchronized = false;
 };
 
 std::string common_params_sampling::print() const {
@@ -592,7 +597,9 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
 }
 
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
-    llama_synchronize(ctx);
+    if (!gsmpl->context_is_synchronized) {
+        llama_synchronize(ctx);
+    }
 
     // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
     const auto tm = gsmpl->tm();
@@ -677,6 +684,20 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+
+    // All verification logits belong to one already-submitted target decode. Synchronize
+    // once before consuming its rows; each common_sampler_sample() below then performs the
+    // exact same sampler/RNG work without repeatedly synchronizing an idle context.
+    const bool was_synchronized = gsmpl->context_is_synchronized;
+    if (!was_synchronized) {
+        llama_synchronize(ctx);
+    }
+    gsmpl->context_is_synchronized = true;
+    struct sync_restore {
+        common_sampler * smpl;
+        bool value;
+        ~sync_restore() { smpl->context_is_synchronized = value; }
+    } restore { gsmpl, was_synchronized };
 
     std::vector<llama_token> result;
     result.reserve(idxs.size());
