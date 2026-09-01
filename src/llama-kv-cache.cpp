@@ -6,6 +6,8 @@
 #include "llama-context.h"
 
 #include <algorithm>
+#include <array>
+#include <bitset>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -102,14 +104,14 @@ llama_kv_cache::llama_kv_cache(
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
-        bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
+        bool operator()(const ggml_backend_buft_t & lhs, const ggml_backend_buft_t & rhs) const {
             return strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
         }
     };
-    std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
+    std::map<ggml_backend_buft_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
 
     // create a context for each buffer type
-    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
+    auto ctx_for_buft = [&](ggml_backend_buft_t buft) -> ggml_context * {
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
@@ -210,7 +212,7 @@ llama_kv_cache::llama_kv_cache(
 
         const char * dev_name = "CPU";
 
-        ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+        ggml_backend_buft_t buft = ggml_backend_cpu_buffer_type();
 
         if (offload) {
             auto * dev = model.dev_kv_layer(il);
@@ -535,7 +537,7 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
     v_heads[s1] = v_heads[s0];
 
     //for (uint32_t s = 0; s < n_stream; ++s) {
-    //    LLAMA_LOG_WARN("%s: seq %d: min = %d, max = %d\n", __func__, s, v_cells[s].seq_pos_min(s), v_cells[s].seq_pos_max(s));
+    //    LLAMA_LOG_WARN("%s: seq %d: min = %d, max = %d\n", __func__, s, v_cells[s].seq_pos_min(s), s, v_cells[s].seq_pos_max(s));
     //}
 }
 
@@ -681,10 +683,10 @@ llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
     return cells.seq_pos_max(seq_id);
 }
 
-std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() const {
-    std::map<ggml_backend_buffer_type_t, size_t> ret;
+std::map<ggml_backend_buft_t, size_t> llama_kv_cache::memory_breakdown() const {
+    std::map<ggml_backend_buft_t, size_t> ret;
     for (const auto & [ctx, buf] : ctxs_bufs) {
-        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
+        ggml_backend_buft_t buft = ggml_backend_buffer_get_type(buf.get());
 
         if (hparams.no_alloc) {
             GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) == nullptr);
@@ -708,6 +710,7 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
         balloc.split_reset();
 
         std::vector<llama_ubatch> ubatches;
+        ubatches.reserve((balloc.get_n_tokens() + n_ubatch - 1) / n_ubatch);
         while (true) {
             auto ubatch = n_stream == 1 ? balloc.split_simple(n_ubatch) : balloc.split_equal(n_ubatch, true, 0);
 
@@ -760,6 +763,8 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
     // remember the old state of the cells so we can restore it in the end
     std::vector<state_t> states;
+    res.reserve(ubatches.size());
+    states.reserve(ubatches.size());
 
     bool success = true;
 
@@ -777,6 +782,7 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         // store the old state of the cells in the recovery stack
         {
             state_t state = { sinfo_new, v_heads, {} };
+            state.v_cells.reserve(sinfo_new.n_stream());
 
             for (uint32_t s = 0; s < sinfo_new.n_stream(); ++s) {
                 auto & cells = v_cells[sinfo_new.strm[s]];
@@ -1572,10 +1578,87 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
         seq_pos_min[seq_id] = std::min(seq_pos_min[seq_id], ubatch->pos[i]);
     }
 
+    // In the generation hot path each active request normally contributes exactly one token.
+    // There is then no second token from the same sequence that can reuse the map/vector cache
+    // below, so emit the exact same mask directly without constructing hash tables.
+    bool unique_single_seq = ubatch->n_tokens == ubatch->n_seqs_unq;
+    if (unique_single_seq) {
+        std::bitset<LLAMA_MAX_SEQ> seen;
+        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+            if (ubatch->n_seq_id[i] != 1) {
+                unique_single_seq = false;
+                break;
+            }
+            const llama_seq_id seq_id = ubatch->seq_id[i][0];
+            GGML_ASSERT(seq_id >= 0 && seq_id < LLAMA_MAX_SEQ);
+            if (seen.test(seq_id)) {
+                unique_single_seq = false;
+                break;
+            }
+            seen.set(seq_id);
+        }
+    }
+
+    if (unique_single_seq) {
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            for (uint32_t ii = 0; ii < n_tps; ++ii) {
+                const uint32_t i = s*n_tps + ii;
+                const llama_seq_id seq_id = ubatch->seq_id[i][0];
+                const auto & cells = v_cells.at(seq_to_stream[seq_id]);
+
+                      llama_pos p0 = -1;
+                const llama_pos p1 = ubatch->pos[i];
+                const llama_pos p1_x = is_2d ? ubatch->pos[i + ubatch->n_tokens*2] : 0;
+                const llama_pos p1_y = is_2d ? ubatch->pos[i + ubatch->n_tokens]   : 0;
+                const uint64_t idst = n_kv*i;
+
+                for (uint32_t j = 0; j < n_kv; ++j) {
+                    if (cells.is_empty(j)) {
+                        goto skip_unique;
+                    }
+                    if (!cells.seq_has(j, seq_id)) {
+                        goto skip_unique;
+                    }
+
+                    p0 = cells.pos_get(j);
+
+                    if (causal) {
+                        if (p0 > p1) {
+                            goto skip_unique;
+                        }
+                        if (is_2d && p0 == p1) {
+                            const auto & p0_ext = cells.ext_get(j);
+                            if (p0_ext.is_2d_gt(p1_x, p1_y)) {
+                                goto skip_unique;
+                            }
+                        }
+                    }
+
+                    if (swa && llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1)) {
+                        goto skip_unique;
+                    }
+
+                    if (alibi) {
+                        data[idst + j] = llama_cast<T>(static_cast<float>(-std::abs(p0 - p1)));
+                    } else {
+                        data[idst + j] = mask_keep;
+                    }
+                    continue;
+
+skip_unique:
+                    data[idst + j] = mask_drop;
+                }
+            }
+        }
+        return;
+    }
+
     for (uint32_t s = 0; s < n_stream; ++s) {
         // bookkeeping of the KQ mask cells that could change for other tokens of the same sequence
         std::unordered_map<llama_seq_id, uint32_t>              seq_srct;
         std::unordered_map<llama_seq_id, std::vector<uint32_t>> seq_idxs;
+        seq_srct.reserve(ubatch->n_seqs_unq);
+        seq_idxs.reserve(ubatch->n_seqs_unq);
 
         for (uint32_t ii = 0; ii < n_tps; ++ii) {
             const uint32_t i = s*n_tps + ii;
@@ -1843,7 +1926,54 @@ void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, st
         seqs.set(ubatch.seq_id_unq[s]);
     }
 
-    // (seq_id, pos) -> token, for every cell that could be a predecessor of a ubatch token
+    const llama_pos hist_p0 = std::max<llama_pos>(0, p_min - (llama_pos) n);
+    const uint64_t hist_span = (uint64_t) (p_max - hist_p0) + 1;
+    constexpr uint64_t DENSE_HIST_MAX_ENTRIES = 1u << 20;
+
+    // ngram-mod uses a narrow predecessor window in the generation hot path. Direct indexing
+    // avoids hash-node allocation while retaining the same last-write-wins (seq_id, pos) lookup.
+    if (ubatch.n_seqs_unq > 0 && hist_span <= DENSE_HIST_MAX_ENTRIES / ubatch.n_seqs_unq) {
+        std::array<int32_t, LLAMA_MAX_SEQ> seq_to_local;
+        seq_to_local.fill(-1);
+
+        for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+            const llama_seq_id seq_id = ubatch.seq_id_unq[s];
+            GGML_ASSERT(seq_id >= 0 && seq_id < LLAMA_MAX_SEQ);
+            seq_to_local[seq_id] = (int32_t) s;
+        }
+
+        std::vector<llama_token> hist((size_t) hist_span * ubatch.n_seqs_unq, LLAMA_TOKEN_NULL);
+
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            v_cells[s].for_each_token_in(seqs, hist_p0, p_max,
+                [&](llama_seq_id seq_id, llama_pos pos, llama_token tok) {
+                    const int32_t local = seq_to_local[seq_id];
+                    GGML_ASSERT(local >= 0);
+                    const uint64_t pos_off = (uint64_t) (pos - hist_p0);
+                    GGML_ASSERT(pos_off < hist_span);
+                    hist[(size_t) local * hist_span + pos_off] = tok;
+                });
+        }
+
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            // TODO: a token that belongs to more than one sequence has an ambiguous history.
+            //       the n-gram architectures have to reject such batches
+            const llama_seq_id seq_id = ubatch.seq_id[i][0];
+            const int32_t local = seq_to_local[seq_id];
+            GGML_ASSERT(local >= 0);
+
+            for (uint32_t j = 0; j < n; ++j) {
+                const llama_pos p = ubatch.pos[i] - (llama_pos) (n - j);
+                if (p < hist_p0 || p > p_max) {
+                    continue;
+                }
+                res[i*n + j] = hist[(size_t) local * hist_span + (uint64_t) (p - hist_p0)];
+            }
+        }
+        return;
+    }
+
+    // Keep the original sparse path as a bounded-memory fallback for unusually wide batches.
     std::unordered_map<uint64_t, llama_token> hist;
 
     const auto key = [](llama_seq_id seq_id, llama_pos pos) {
@@ -1858,8 +1988,6 @@ void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, st
     }
 
     for (uint32_t i = 0; i < n_tokens; ++i) {
-        // TODO: a token that belongs to more than one sequence has an ambiguous history.
-        //       the n-gram architectures have to reject such batches
         const llama_seq_id seq_id = ubatch.seq_id[i][0];
 
         for (uint32_t j = 0; j < n; ++j) {
