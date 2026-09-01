@@ -681,6 +681,8 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     std::vector<llama_token> result;
     result.reserve(idxs.size());
 
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+
     size_t i = 0;
     for (; i < draft.size(); i++) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
@@ -688,6 +690,13 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
         common_sampler_accept(gsmpl, id, true);
 
         result.push_back(id);
+
+        // EOG terminates the visible generation. Do not sample/accept any later speculative
+        // positions that can never be returned; keeping them would contaminate the reusable
+        // slot prefix on hybrid/recurrent models. The EOG itself remains the final target token.
+        if (llama_vocab_is_eog(vocab, id)) {
+            break;
+        }
 
         if (draft[i] != id) {
             break;
