@@ -312,6 +312,12 @@ struct server_slot {
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
+        // Level-1: retain KV in the unified device pool under a hidden
+        // sequence id.  This is metadata-only and avoids serializing the state.
+        if (prompt_cache.gpu_save(prompt, spec_state, id)) {
+            return true;
+        }
+
         auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
         if (cur == nullptr) {
             return false;
@@ -336,7 +342,12 @@ struct server_slot {
         std::vector<uint8_t> spec_probe;
         const bool spec_requires_state = spec && common_speculative_get_state(spec, id, spec_probe);
 
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
+        // Prefer the device-resident tier.  If no hidden sequence has a better
+        // exact prefix, fall back to the serialized RAM/LMCache state.
+        bool res = prompt_cache.gpu_load(prompt, tokens, id);
+        if (!res) {
+            res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
+        }
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
             return false;
@@ -1144,7 +1155,20 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
-        llama_init = common_init_from_params(params_base);
+        // Reserve additional sequence IDs for inactive agent contexts without
+        // creating additional active server slots.  With unified KV this does not
+        // divide n_ctx_seq: hidden sequences share the same physical KV pool.
+        int32_t gpu_agent_cache_seqs = 0;
+        if (!utility_model && params_base.kv_unified && params_base.lora_adapters.empty()) {
+            gpu_agent_cache_seqs = 8;
+            if (const char * env = getenv("LLAMA_SERVER_GPU_AGENT_CACHE_SEQS")) {
+                gpu_agent_cache_seqs = std::clamp<int32_t>(atoi(env), 0, 32);
+            }
+        }
+
+        common_params params_ctx = params_base;
+        params_ctx.n_parallel += gpu_agent_cache_seqs;
+        llama_init = common_init_from_params(params_ctx);
 
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
@@ -1172,6 +1196,10 @@ private:
 
             {
                 common_params params_dft = common_base_params_to_speculative(params_base);
+                // The draft/MTP context must understand the same hidden sequence
+                // IDs as the target context.  Keep output limits from params_base;
+                // only sequence-addressability is widened.
+                params_dft.n_parallel = llama_n_seq_max(ctx_tgt);
 
                 // progress callback
                 params_dft.load_progress_callback           = load_progress_callback;
@@ -1375,7 +1403,7 @@ private:
             batch.init(std::max(n_batch, params_base.n_parallel), n_embd);
         }
 
-        if (params_base.cache_ram_mib != 0 || !params_base.lmcache_endpoint.empty()) {
+        if (params_base.cache_ram_mib != 0 || !params_base.lmcache_endpoint.empty() || gpu_agent_cache_seqs > 0) {
             if (params_base.cache_ram_mib < 0) {
                 SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
             } else if (params_base.cache_ram_mib == 0) {
@@ -1396,6 +1424,12 @@ private:
 
             prompt_cache = std::make_unique<server_prompt_cache>(
                     params_base.cache_ram_mib, n_ctx, params_base.lmcache_endpoint, lmcache_namespace);
+            if (gpu_agent_cache_seqs > 0 && ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+                const int32_t seq_total = (int32_t) llama_n_seq_max(ctx_tgt);
+                const int32_t seq_first = params_base.n_parallel;
+                const int32_t seq_count = std::max<int32_t>(0, seq_total - seq_first);
+                prompt_cache->configure_gpu(ctx_tgt, ctx_dft, seq_first, seq_count);
+            }
             if (!params_base.lmcache_endpoint.empty()) {
                 SRV_INF("LMCache prompt state reuse enabled at %s\n", params_base.lmcache_endpoint.c_str());
             }
@@ -1717,6 +1751,12 @@ private:
                 // clear slots one by one
                 break;
             }
+        }
+
+        // If all active idle slots are already clear, reclaim the oldest hidden
+        // GPU agent.  It is first demoted to RAM/LMCache when configured.
+        if (!res && prompt_cache && prompt_cache->gpu_demote_lru()) {
+            res = true;
         }
 
         return res;

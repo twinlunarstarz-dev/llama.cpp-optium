@@ -616,6 +616,16 @@ struct server_prompt_cache_state {
     }
 };
 
+// Level-1 agent cache: KV remains in the unified device cache and is retained
+// under a hidden sequence id.  Only the small speculative-driver sidecar stays
+// in host memory.  This avoids D2H/H2D state serialization on normal A->B->A
+// agent switches.  Entries are demoted to server_prompt_cache_state on pressure.
+struct server_gpu_prompt_cache_state {
+    server_prompt prompt;
+    std::vector<uint8_t> spec;
+    llama_seq_id seq_id = -1;
+};
+
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens, const std::string & lmcache_endpoint, const std::string & lmcache_namespace) {
         this->local_enabled = limit_size_mib != 0;
@@ -628,6 +638,12 @@ struct server_prompt_cache {
     }
 
     std::list<server_prompt_cache_state> states;
+    std::list<server_gpu_prompt_cache_state> gpu_states;
+
+    llama_context * gpu_ctx_tgt = nullptr;
+    llama_context * gpu_ctx_dft = nullptr;
+    llama_seq_id gpu_seq_first = 0;
+    int32_t gpu_seq_count = 0;
 
     // in bytes, 0 = no limit
     size_t limit_size = 0;
@@ -656,6 +672,14 @@ struct server_prompt_cache {
     void store_remote(server_prompt_cache_state * state);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+
+    // Configure hidden sequence ids [seq_first, seq_first + seq_count) for a
+    // unified-KV, GPU-resident inactive-agent tier.
+    void configure_gpu(llama_context * ctx_tgt, llama_context * ctx_dft, llama_seq_id seq_first, int32_t seq_count);
+    bool gpu_enabled() const { return gpu_ctx_tgt != nullptr && gpu_seq_count > 0; }
+    bool gpu_save(const server_prompt & prompt, const std::vector<uint8_t> & spec, llama_seq_id active_seq);
+    bool gpu_load(server_prompt & prompt, const server_tokens & tokens_new, llama_seq_id active_seq);
+    bool gpu_demote_lru();
 
     void update();
 };
