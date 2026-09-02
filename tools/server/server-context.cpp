@@ -299,7 +299,7 @@ struct server_slot {
 
     server_prompt prompt;
 
-    bool prompt_save(server_prompt_cache & prompt_cache) const {
+    bool prompt_save(server_prompt_cache & prompt_cache, bool allow_gpu = true) const {
         if (prompt.tokens.size() == 0) {
             return false;
         }
@@ -317,7 +317,7 @@ struct server_slot {
 
         // Level-1: retain KV in the unified device pool under a hidden
         // sequence id.  This is metadata-only and avoids serializing the state.
-        if (prompt_cache.gpu_save(prompt, spec_state, id)) {
+        if (allow_gpu && prompt_cache.gpu_save(prompt, spec_state, id)) {
             return true;
         }
 
@@ -2612,6 +2612,19 @@ private:
         }
 
         if (n_resident == 0) {
+            for (auto & idle : slots) {
+                if (idle.is_processing() || idle.prompt.tokens.empty()) {
+                    continue;
+                }
+                if (idle.prompt_save(*prompt_cache, false)) {
+                    prompt_cache->update();
+                } else {
+                    SLT_WRN(idle, "%s", "failed to save idle KV state before suspended-state restore\n");
+                    return;
+                }
+                idle.prompt_clear();
+            }
+
             server_slot * oldest = nullptr;
             for (auto & slot : slots) {
                 if (!slot.is_suspended()) {
