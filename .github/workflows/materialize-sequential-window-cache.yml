@@ -1,0 +1,41 @@
+name: materialize-sequential-window-cache
+
+on:
+  push:
+    branches:
+      - perf/sequential-tiered-cache
+    paths:
+      - .github/workflows/materialize-sequential-window-cache.yml
+
+permissions:
+  contents: write
+
+jobs:
+  materialize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: perf/sequential-tiered-cache
+          fetch-depth: 0
+      - name: Apply sequential window/cache changes
+        run: python3 scripts/apply-sequential-window-cache.py
+      - name: Verify diff
+        run: |
+          git diff --check
+          git diff --stat
+      - name: CPU compile server
+        run: |
+          cmake -S . -B build-seq -DGGML_CUDA=OFF -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF
+          cmake --build build-seq --target llama-server -j2
+      - name: Commit
+        run: |
+          git config user.name "openai-perf-bot"
+          git config user.email "openai-perf-bot@users.noreply.github.com"
+          git add ggml/include/ggml-backend.h ggml/src/ggml-backend.cpp src/llama-context.cpp
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git commit -m "perf(sequential): partition VRAM cache and streaming windows"
+          git push origin HEAD:perf/sequential-tiered-cache
