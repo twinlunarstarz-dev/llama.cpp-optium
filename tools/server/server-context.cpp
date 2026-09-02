@@ -304,7 +304,10 @@ struct server_slot {
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
 
-        const size_t cur_size = cur_size_tgt + cur_size_dft;
+        std::vector<uint8_t> spec_state;
+        const bool has_spec_state = spec && common_speculative_get_state(spec, id, spec_state);
+
+        const size_t cur_size = cur_size_tgt + cur_size_dft + spec_state.size();
 
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
@@ -318,6 +321,9 @@ struct server_slot {
         if (ctx_dft) {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
+        if (has_spec_state) {
+            cur->data.spec = std::move(spec_state);
+        }
 
         prompt_cache.store_remote(cur);
 
@@ -325,12 +331,28 @@ struct server_slot {
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
+        // Determine whether this speculative stack owns persistent per-sequence
+        // state.  Stateless n-gram helpers do not require a sidecar restore.
+        std::vector<uint8_t> spec_probe;
+        const bool spec_requires_state = spec && common_speculative_get_state(spec, id, spec_probe);
+
         bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
+            return false;
         }
 
-        return res;
+        if (prompt_cache.restored_any_state && spec_requires_state) {
+            if (!prompt_cache.restored_spec_state_valid) {
+                // Legacy/remote cache records do not carry the sidecar.  Never
+                // combine another agent's speculative state with restored KV.
+                SLT_WRN(*this, "%s", "cached llama state has no matching speculative state; recomputing safely\n");
+                return false;
+            }
+            common_speculative_set_state(spec, id, prompt_cache.restored_spec_state);
+        }
+
+        return true;
     }
 
     void prompt_clear() {
@@ -2992,14 +3014,22 @@ private:
                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
-                        slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                        const llama_tokens * spec_prompt_ptr = nullptr;
+                        if (slot.prompt.tokens.has_mtmd) {
+                            slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                            spec_prompt_ptr = &slot.spec_prompt;
+                        } else {
+                            // Avoid copying the entire 50k/100k/1M-token context on
+                            // every speculative generation round.
+                            spec_prompt_ptr = &slot.prompt.tokens.get_tokens();
+                        }
 
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,
                             /* .n_max    = */ n_draft_max,
                             /* .n_past   = */ slot.prompt.n_tokens(),
                             /* .id_last  = */ slot.sampled,
-                            /* .prompt   = */ &slot.spec_prompt,
+                            /* .prompt   = */ spec_prompt_ptr,
                             /* .result   = */ &slot.spec_draft,
                         };
 

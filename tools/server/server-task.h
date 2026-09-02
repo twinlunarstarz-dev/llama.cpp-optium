@@ -591,8 +591,13 @@ struct server_prompt_data {
     std::vector<uint8_t> main;
     std::vector<uint8_t> drft;
 
+    // State owned by speculative implementations (for example MTP's pending
+    // target hidden row).  Target/draft llama state alone is not sufficient to
+    // resume a speculative agent exactly after another agent used the slot.
+    std::vector<uint8_t> spec;
+
     size_t size() const {
-        return main.size() + drft.size();
+        return main.size() + drft.size() + spec.size();
     }
 };
 
@@ -634,6 +639,13 @@ struct server_prompt_cache {
 
     std::unique_ptr<common_lmcache_client> lmcache;
     std::string lmcache_namespace;
+
+    // Result metadata for the most recent load().  This avoids changing the
+    // public load signature while allowing server_slot to restore the matching
+    // speculative-driver state after the llama target/draft state is restored.
+    bool restored_any_state = false;
+    bool restored_spec_state_valid = false;
+    std::vector<uint8_t> restored_spec_state;
 
     size_t size() const;
 

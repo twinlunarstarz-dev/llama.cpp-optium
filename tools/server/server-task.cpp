@@ -1823,13 +1823,16 @@ size_t server_prompt_cache::n_tokens() const {
 }
 
 server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
-    // first check if the current state is contained fully in the cache
+    // Replace only an exact snapshot.  A shorter prefix is a valid branch/session
+    // root and must survive A -> B -> A agent switching.
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
-        if (cur_lcp_len == (int) prompt.tokens.size()) {
-            SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
-            return nullptr;
+        if (cur_lcp_len == (int) prompt.tokens.size() &&
+                it->prompt.tokens.size() == prompt.tokens.size()) {
+            SRV_TRC(" - replacing exact cached prompt with length %d\n", cur_lcp_len);
+            states.erase(it);
+            break;
         }
     }
 
@@ -1846,19 +1849,6 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, skipping\n",
                 state_size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
         return nullptr;
-    }
-
-    // remove any cached prompts that are fully contained in the current prompt
-    for (auto it = states.begin(); it != states.end();) {
-        const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
-
-        if (len == (int) it->prompt.tokens.size()) {
-            SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
-
-            it = states.erase(it);
-        } else {
-            ++it;
-        }
     }
 
     if (limit_size > 0) {
@@ -1926,6 +1916,10 @@ void server_prompt_cache::store_remote(server_prompt_cache_state * state) {
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+    restored_any_state = false;
+    restored_spec_state_valid = false;
+    restored_spec_state.clear();
+
     if (lmcache && !tokens_new.has_mtmd) {
         std::vector<uint8_t> data;
         bool found = false;
@@ -1942,11 +1936,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             } else {
                 const int lcp_base = prompt.tokens.get_common_prefix(tokens_new);
                 const int lcp_remote = remote.prompt.tokens.get_common_prefix(tokens_new);
-                const float keep_base = prompt.tokens.size() > 0 ? float(lcp_base) / prompt.tokens.size() : -1.0f;
-                const float sim_base = tokens_new.size() > 0 ? float(lcp_base) / tokens_new.size() : 0.0f;
                 const float keep_remote = remote.prompt.tokens.size() > 0 ? float(lcp_remote) / remote.prompt.tokens.size() : 0.0f;
-                const float sim_remote = tokens_new.size() > 0 ? float(lcp_remote) / tokens_new.size() : 0.0f;
-                if (keep_remote >= 0.25f && keep_base < keep_remote && sim_base < sim_remote) {
+                // Maximize actual avoided target work, not two relative ratios.
+                if (keep_remote >= 0.25f && lcp_remote > lcp_base) {
                     const size_t size_tgt = remote.data.main.size();
                     const size_t n_tgt = llama_state_seq_set_data_ext(ctx_tgt, remote.data.main.data(), size_tgt, id_slot, 0);
                     if (n_tgt != size_tgt) {
@@ -1962,20 +1954,23 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                         }
                     }
                     prompt = std::move(remote.prompt);
+                    restored_any_state = true;
                     SRV_TRC(" - restored %zu-token prompt state from LMCache\n", tokens.size());
                     return true;
                 }
-                SRV_TRC(" - LMCache prompt is not better, f_keep = %.3f, f_sim = %.3f\n", keep_remote, sim_remote);
+                SRV_TRC(" - LMCache prompt is not better, lcp = %d (base = %d), f_keep = %.3f\n",
+                        lcp_remote, lcp_base, keep_remote);
             }
         }
     }
 
-    const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
+    int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
-    float f_sim_best  = float(lcp_best) / tokens_new.size();
+    float f_sim_best  = tokens_new.size() > 0 ? float(lcp_best) / tokens_new.size() : 0.0f;
 
-    SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+    SRV_TRC(" - looking for better prompt, base lcp = %d, f_keep = %.3f, f_sim = %.3f\n",
+            lcp_best, f_keep_best, f_sim_best);
 
     auto it_best = states.end();
 
@@ -1993,7 +1988,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             continue;
         }
 
-        if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
+        if (lcp_cur > lcp_best) {
+            lcp_best    = lcp_cur;
             f_keep_best = f_keep_cur;
             f_sim_best  = f_sim_cur;
 
@@ -2005,7 +2001,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
         {
-            auto & data = it_best->data.main;
+            const auto & data = it_best->data.main;
 
             const size_t size = data.size();
             const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
@@ -2014,13 +2010,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
                 return false;
             }
-
-            data.clear();
-            data.shrink_to_fit();
         }
 
         {
-            auto & data = it_best->data.drft;
+            const auto & data = it_best->data.drft;
 
             if (!data.empty()) {
                 GGML_ASSERT(ctx_dft);
@@ -2032,15 +2025,16 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
                     return false;
                 }
-
-                data.clear();
-                data.shrink_to_fit();
             }
         }
 
-        prompt = std::move(it_best->prompt);
+        prompt = it_best->prompt.clone();
+        restored_any_state = true;
+        restored_spec_state = it_best->data.spec;
+        restored_spec_state_valid = !restored_spec_state.empty();
 
-        states.erase(it_best);
+        // True LRU behavior: a successfully restored agent snapshot becomes MRU.
+        states.splice(states.end(), states, it_best);
     }
 
     return true;
