@@ -1,0 +1,28 @@
+name: materialize-master-speedups
+
+on:
+  push:
+    branches:
+      - perf/kv-spec-speedups
+    paths:
+      - .github/workflows/materialize-master-speedups.yml
+
+permissions:
+  contents: write
+
+jobs:
+  materialize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: perf/kv-spec-speedups
+          fetch-depth: 0
+      - name: Cherry-pick existing token-stable speedups
+        run: |
+          git config user.name "openai-perf-bot"
+          git config user.email "openai-perf-bot@users.noreply.github.com"
+          git cherry-pick 9919cce760d0d3b4a62c5cc26b9e2e57d712a05c
+          git cherry-pick 0d80b0c47eb273823c5f5f66e311a00c5ee8af51
+          git diff --check HEAD~2..HEAD
+          git push origin HEAD:perf/kv-spec-speedups
