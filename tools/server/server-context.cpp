@@ -104,6 +104,7 @@ enum slot_state {
     SLOT_STATE_PROCESSING_PROMPT,
     SLOT_STATE_DONE_PROMPT,
     SLOT_STATE_GENERATING,
+    SLOT_STATE_SUSPENDED, // live request; target/draft state is in RAM/disk instead of the unified KV pool
 };
 
 struct server_slot; // forward declaration
@@ -293,6 +294,8 @@ struct server_slot {
 
     // state
     slot_state state = SLOT_STATE_IDLE;
+    slot_state resume_state = SLOT_STATE_IDLE;
+    int64_t t_suspended = -1;
 
     server_prompt prompt;
 
@@ -405,6 +408,8 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
+        resume_state   = SLOT_STATE_IDLE;
+        t_suspended    = -1;
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -502,6 +507,14 @@ struct server_slot {
         return state != SLOT_STATE_IDLE;
     }
 
+    bool is_suspended() const {
+        return state == SLOT_STATE_SUSPENDED;
+    }
+
+    bool is_resident_processing() const {
+        return state != SLOT_STATE_IDLE && state != SLOT_STATE_SUSPENDED;
+    }
+
     bool can_speculate() const {
         return !!spec;
     }
@@ -584,10 +597,13 @@ struct server_slot {
 
             t_last_used = ggml_time_us();
 
+            const bool was_suspended = state == SLOT_STATE_SUSPENDED;
             state = SLOT_STATE_IDLE;
 
-            // do not keep context of the child slots - the parent's context is enough
-            if (task->is_child()) {
+            // A suspended slot has no live sequence state. Do not leave its prompt
+            // attached to an idle slot after cancellation/error, because that would
+            // make later prompt matching believe the missing KV is still resident.
+            if (task->is_child() || was_suspended) {
                 prompt_clear();
             }
 
@@ -726,6 +742,7 @@ struct server_slot {
             {"n_ctx",         n_ctx},
             {"speculative",   can_speculate()},
             {"is_processing", is_processing()},
+            {"is_suspended",  is_suspended()},
         };
 
         const auto & ptask = task ? task : task_prev;
@@ -1155,14 +1172,18 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
-        // Reserve additional sequence IDs for inactive agent contexts without
-        // creating additional active server slots.  With unified KV this does not
-        // divide n_ctx_seq: hidden sequences share the same physical KV pool.
+        // Hidden sequence ownership consumes cells from the same unified KV
+        // pool and therefore makes very large concurrent contexts collide sooner.
+        // Keep it as an explicit experimental opt-in; active RAM/disk suspension
+        // below removes inactive request cells from the live pool instead.
         int32_t gpu_agent_cache_seqs = 0;
         if (!utility_model && params_base.kv_unified && params_base.lora_adapters.empty()) {
-            gpu_agent_cache_seqs = 8;
             if (const char * env = getenv("LLAMA_SERVER_GPU_AGENT_CACHE_SEQS")) {
                 gpu_agent_cache_seqs = std::clamp<int32_t>(atoi(env), 0, 32);
+                if (gpu_agent_cache_seqs > 0) {
+                    SRV_WRN("GPU hidden agent cache explicitly enabled with %d sequences; hidden states consume live unified KV capacity\n",
+                            gpu_agent_cache_seqs);
+                }
             }
         }
 
@@ -1355,6 +1376,9 @@ private:
             SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
 
             slot.callback_on_release = [this](int id_slot) {
+                if (prompt_cache) {
+                    prompt_cache->active_erase(id_slot);
+                }
                 queue_tasks.pop_deferred_task(id_slot);
             };
 
@@ -1403,7 +1427,8 @@ private:
             batch.init(std::max(n_batch, params_base.n_parallel), n_embd);
         }
 
-        if (params_base.cache_ram_mib != 0 || !params_base.lmcache_endpoint.empty() || gpu_agent_cache_seqs > 0) {
+        const bool active_kv_swap = !utility_model && params_base.kv_unified && params_base.n_parallel > 1;
+        if (params_base.cache_ram_mib != 0 || !params_base.lmcache_endpoint.empty() || gpu_agent_cache_seqs > 0 || active_kv_swap) {
             if (params_base.cache_ram_mib < 0) {
                 SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
             } else if (params_base.cache_ram_mib == 0) {
@@ -1424,6 +1449,10 @@ private:
 
             prompt_cache = std::make_unique<server_prompt_cache>(
                     params_base.cache_ram_mib, n_ctx, params_base.lmcache_endpoint, lmcache_namespace);
+            if (active_kv_swap) {
+                SRV_INF("active unified-KV suspension enabled: VRAM -> shared cache RAM -> disk (ctx=%d, parallel=%d)\n",
+                        n_ctx, params_base.n_parallel);
+            }
             if (gpu_agent_cache_seqs > 0 && ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
                 const int32_t seq_total = (int32_t) llama_n_seq_max(ctx_tgt);
                 const int32_t seq_first = params_base.n_parallel;
@@ -2426,6 +2455,198 @@ private:
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
     }
 
+    size_t slot_projected_kv_tokens(const server_slot & slot) const {
+        if (!slot.is_resident_processing() || !slot.task) {
+            return 0;
+        }
+
+        size_t cur = slot.prompt.tokens.size();
+        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+        if (pos_max >= 0) {
+            cur = std::max(cur, (size_t) pos_max + 1);
+        }
+
+        if (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT) {
+            cur = std::max(cur, (size_t) slot.task->n_tokens());
+        }
+
+        if (slot.state == SLOT_STATE_GENERATING && cur < (size_t) slot.n_ctx) {
+            cur++;
+        }
+        return std::min(cur, (size_t) slot.n_ctx);
+    }
+
+    size_t active_kv_headroom() const {
+        if (!ctx_tgt) {
+            return 0;
+        }
+        return std::max<size_t>(2048, 2ull * llama_n_ubatch(ctx_tgt));
+    }
+
+    bool slot_can_suspend(const server_slot & slot) const {
+        if (!slot.is_resident_processing() || !slot.task || slot.task->is_parent() || slot.task->is_child()) {
+            return false;
+        }
+        if (slot.state != SLOT_STATE_STARTED &&
+                slot.state != SLOT_STATE_PROCESSING_PROMPT &&
+                slot.state != SLOT_STATE_GENERATING) {
+            return false;
+        }
+        return slot.spec_i_batch.empty() && slot.spec_draft.empty();
+    }
+
+    bool suspend_active_slot(server_slot & slot, const char * reason) {
+        if (!prompt_cache || !slot_can_suspend(slot)) {
+            return false;
+        }
+
+        llama_synchronize(ctx_tgt);
+        if (ctx_dft) {
+            llama_synchronize(ctx_dft);
+        }
+
+        std::vector<uint8_t> spec_state;
+        if (slot.spec) {
+            common_speculative_get_state(slot.spec, slot.id, spec_state);
+        }
+
+        if (!prompt_cache->active_store(slot.id, ctx_tgt, ctx_dft, spec_state)) {
+            return false;
+        }
+
+        const slot_state saved_resume_state = slot.state;
+        slot.mem.seq_rm(slot.id, -1, -1);
+        slot.resume_state = saved_resume_state;
+        slot.state = SLOT_STATE_SUSPENDED;
+        slot.t_suspended = ggml_time_us();
+        slot.i_batch = -1;
+
+        SLT_INF(slot, "suspended live request (%s), preserved %zu prompt/context tokens outside VRAM KV\n",
+                reason, slot.prompt.tokens.size());
+        return true;
+    }
+
+    bool resume_active_slot(server_slot & slot) {
+        if (!prompt_cache || !slot.is_suspended() || !prompt_cache->active_has(slot.id)) {
+            return false;
+        }
+
+        llama_synchronize(ctx_tgt);
+        if (ctx_dft) {
+            llama_synchronize(ctx_dft);
+        }
+        slot.mem.seq_rm(slot.id, -1, -1);
+
+        std::vector<uint8_t> spec_state;
+        if (!prompt_cache->active_restore(slot.id, ctx_tgt, ctx_dft, spec_state)) {
+            slot.mem.seq_rm(slot.id, -1, -1);
+            return false;
+        }
+        if (slot.spec && !spec_state.empty()) {
+            common_speculative_set_state(slot.spec, slot.id, spec_state);
+        }
+
+        slot.state = slot.resume_state;
+        slot.resume_state = SLOT_STATE_IDLE;
+        slot.t_suspended = -1;
+        SLT_INF(slot, "resumed live request with %zu context tokens\n", slot.prompt.tokens.size());
+        return true;
+    }
+
+    server_slot * largest_suspendable_resident() {
+        server_slot * victim = nullptr;
+        size_t best = 0;
+        for (auto & slot : slots) {
+            if (!slot_can_suspend(slot)) {
+                continue;
+            }
+            const size_t cur = slot_projected_kv_tokens(slot);
+            if (!victim || cur > best) {
+                victim = &slot;
+                best = cur;
+            }
+        }
+        return victim;
+    }
+
+    bool make_room_for_incoming(const server_task & task) {
+        if (!params_base.kv_unified || params_base.n_parallel <= 1 || !prompt_cache ||
+                !task.need_sampling() || task.is_parent() || task.is_child()) {
+            return true;
+        }
+
+        const size_t incoming = std::min<size_t>((size_t) task.n_tokens() + 1, (size_t) n_ctx);
+        const size_t headroom = active_kv_headroom();
+        const size_t shared_limit = (size_t) n_ctx > headroom ? (size_t) n_ctx - headroom : (size_t) n_ctx;
+
+        while (true) {
+            size_t projected = incoming;
+            int n_resident = 0;
+            for (const auto & slot : slots) {
+                if (slot.is_resident_processing()) {
+                    projected += slot_projected_kv_tokens(slot);
+                    n_resident++;
+                }
+            }
+
+            if (n_resident == 0 || projected <= shared_limit) {
+                return true;
+            }
+
+            server_slot * victim = largest_suspendable_resident();
+            if (!victim || !suspend_active_slot(*victim, "admitting another request would exceed unified KV capacity")) {
+                return false;
+            }
+        }
+    }
+
+    void rebalance_active_kv_residency() {
+        if (!params_base.kv_unified || params_base.n_parallel <= 1 || !prompt_cache) {
+            return;
+        }
+
+        int n_resident = 0;
+        for (const auto & slot : slots) {
+            n_resident += slot.is_resident_processing() ? 1 : 0;
+        }
+
+        if (n_resident == 0) {
+            server_slot * oldest = nullptr;
+            for (auto & slot : slots) {
+                if (!slot.is_suspended()) {
+                    continue;
+                }
+                if (!oldest || slot.t_suspended < oldest->t_suspended) {
+                    oldest = &slot;
+                }
+            }
+            if (oldest && !resume_active_slot(*oldest)) {
+                send_error(*oldest, "failed to restore suspended KV state", ERROR_TYPE_SERVER);
+                oldest->release();
+            }
+            return;
+        }
+
+        const size_t headroom = active_kv_headroom();
+        const size_t shared_limit = (size_t) n_ctx > headroom ? (size_t) n_ctx - headroom : (size_t) n_ctx;
+        while (n_resident > 1) {
+            size_t projected = 0;
+            for (const auto & slot : slots) {
+                if (slot.is_resident_processing()) {
+                    projected += slot_projected_kv_tokens(slot);
+                }
+            }
+            if (projected <= shared_limit) {
+                break;
+            }
+            server_slot * victim = largest_suspendable_resident();
+            if (!victim || !suspend_active_slot(*victim, "live contexts approached unified KV capacity")) {
+                break;
+            }
+            n_resident--;
+        }
+    }
+
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
         // while yielding, an encode / decode is running and only reading the server state is safe
@@ -2450,6 +2671,27 @@ private:
 
                     const int id_task = task.id;
 
+                    // Capacity admission must run before get_available_slot(), because
+                    // slot selection may restore a large cached prompt into unified KV.
+                    // Only do this when there is a logically free slot; a third request
+                    // should wait rather than evicting a resident request unnecessarily.
+                    bool has_idle_candidate = false;
+                    for (const auto & candidate : slots) {
+                        if (candidate.is_processing()) {
+                            continue;
+                        }
+                        if (task.id_slot != -1 && candidate.id != task.id_slot) {
+                            continue;
+                        }
+                        has_idle_candidate = true;
+                        break;
+                    }
+                    if (has_idle_candidate && !make_room_for_incoming(task)) {
+                        SRV_DBG("unable to reach a safe active-KV suspension boundary; defer task, id_task = %d\n", id_task);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
                     server_slot * slot = get_available_slot(task);
 
                     //
@@ -2469,6 +2711,7 @@ private:
                         queue_tasks.defer(std::move(task));
                         break;
                     }
+
 
                     if (task.is_parent()) {
                         // try getting free slots for all child tasks
@@ -2858,6 +3101,8 @@ private:
             SRV_INF("avg t_sampl       = %f ms\n", (double) t_sampl / n_sampl / 1000.0);
         }
 #endif
+
+        rebalance_active_kv_residency();
 
         // check if all slots are idle
         {
