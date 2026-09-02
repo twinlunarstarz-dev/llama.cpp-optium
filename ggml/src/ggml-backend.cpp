@@ -956,6 +956,7 @@ struct ggml_backend_sched {
     struct ggml_backend_sched_transient_metrics transient_metrics;
     std::unordered_set<const struct ggml_tensor *> * transient_sources_seen;
     bool residency_enabled[GGML_SCHED_MAX_BACKENDS];
+    size_t residency_budget[GGML_SCHED_MAX_BACKENDS];
     bool persistent_weight_residency;
     uint64_t residency_use_clock;
     ggml_backend_sched_resident_map * residents;
@@ -1581,43 +1582,81 @@ static void ggml_backend_sched_drain_residents(ggml_backend_sched_t sched) {
     }
 }
 
+static ggml_backend_sched_resident_map::iterator ggml_backend_sched_resident_victim(
+        ggml_backend_sched_t sched, int backend_id) {
+    auto victim = sched->residents->end();
+    for (auto it = sched->residents->begin(); it != sched->residents->end(); ++it) {
+        if (it->second.backend_id != backend_id || it->second.executing) {
+            continue;
+        }
+        if (victim == sched->residents->end() || it->second.frequency < victim->second.frequency ||
+                (it->second.frequency == victim->second.frequency &&
+                 it->second.completed_use < victim->second.completed_use)) {
+            victim = it;
+        }
+    }
+    return victim;
+}
+
 static bool ggml_backend_sched_make_resident_space(
-        ggml_backend_sched_t sched, int backend_id, size_t request) {
+        ggml_backend_sched_t sched, int backend_id, size_t request, bool scan_resistant) {
     const size_t window = sched->weight_window_limit[backend_id];
+    const size_t resident_budget = std::min(window, sched->residency_budget[backend_id]);
     if (!sched->weight_window_configured[backend_id] || !sched->weight_window_memory_valid[backend_id] ||
-            request == 0 || request > window) {
+            request == 0 || request > resident_budget) {
         return false;
     }
+
     while (true) {
+        const auto & row = sched->transient_metrics.backends[backend_id];
+        const bool budget_ok = row.current_resident_bytes <= resident_budget - request;
         bool unknown = false;
         bool live_rejected = false;
-        if (ggml_backend_sched_weight_window_admit(
-                sched, backend_id, request, &unknown, &live_rejected)) {
+        const bool window_ok = budget_ok && ggml_backend_sched_weight_window_admit(
+            sched, backend_id, request, &unknown, &live_rejected);
+        if (window_ok) {
             return true;
         }
-        if (unknown) {
+        if (unknown || scan_resistant) {
+            // Dense transformer weights are revisited in the same long cyclic scan.
+            // Once the dedicated resident tier is full, retaining its current subset
+            // produces real hits; replacing equal-frequency entries produces LRU scan
+            // thrash. The active transient path below can still evict this subset when
+            // a larger current split actually needs the bytes to make progress.
             return false;
         }
 
-        // Dense weights and expert slabs share one global budget. Frequency first
-        // makes repeated dense weights scan-resistant, while completed-use breaks
-        // ties in LRU order for the changing MoE active set. Executing entries are
-        // part of the current working set and are never eviction candidates.
-        auto victim = sched->residents->end();
-        for (auto it = sched->residents->begin(); it != sched->residents->end(); ++it) {
-            if (it->second.backend_id != backend_id || it->second.executing) {
-                continue;
-            }
-            if (victim == sched->residents->end() || it->second.frequency < victim->second.frequency ||
-                    (it->second.frequency == victim->second.frequency &&
-                     it->second.completed_use < victim->second.completed_use)) {
-                victim = it;
-            }
-        }
+        auto victim = ggml_backend_sched_resident_victim(sched, backend_id);
         if (victim == sched->residents->end()) {
             return false;
         }
         ggml_backend_sched_evict_resident(sched, victim);
+    }
+}
+
+static bool ggml_backend_sched_make_transient_space(
+        ggml_backend_sched_t sched, int backend_id, size_t request,
+        bool * unknown_memory, bool * live_guard_rejected) {
+    *unknown_memory = false;
+    *live_guard_rejected = false;
+    while (true) {
+        if (ggml_backend_sched_weight_window_admit(
+                sched, backend_id, request, unknown_memory, live_guard_rejected)) {
+            return true;
+        }
+        if (*unknown_memory) {
+            return false;
+        }
+
+        // Correctness/oversized-tensor escape hatch: persistent residency is a cache,
+        // never a requirement. If the current working tensor needs the space, demote
+        // cached VRAM weights and continue from RAM/disk rather than failing inference.
+        auto victim = ggml_backend_sched_resident_victim(sched, backend_id);
+        if (victim == sched->residents->end()) {
+            return false;
+        }
+        ggml_backend_sched_evict_resident(sched, victim);
+        *live_guard_rejected = false;
     }
 }
 
@@ -1649,7 +1688,7 @@ static bool ggml_backend_sched_grow_expert_slab(
     }
 
     slab.executing = true;
-    if (!ggml_backend_sched_make_resident_space(sched, backend_id, new_alloc_size)) {
+    if (!ggml_backend_sched_make_resident_space(sched, backend_id, new_alloc_size, false)) {
         slab.executing = false;
         return false;
     }
@@ -2207,10 +2246,10 @@ static bool ggml_backend_sched_prefetch_resident_transient_input(
     // Full-layer MoE prefetch is intentionally ephemeral.  Caching the entire
     // expert tensor would compete with the compact hot-expert cache used by
     // sequential mode and can consume several GiB per layer.
-    const bool cache_eligible = sched->residency_enabled[backend_id] && !full_moe_prefetch;
+    const bool cache_enabled = sched->residency_enabled[backend_id] && !full_moe_prefetch;
     const std::vector<int32_t> empty_experts;
     const auto resident_key = ggml_backend_sched_resident_key_make(input, backend_id, empty_experts);
-    if (cache_eligible && sched->residents->find(resident_key) != sched->residents->end()) {
+    if (cache_enabled && sched->residents->find(resident_key) != sched->residents->end()) {
         return false;
     }
 
@@ -2218,6 +2257,10 @@ static bool ggml_backend_sched_prefetch_resident_transient_input(
     if (alloc_size == 0) {
         return false;
     }
+    const size_t resident_budget = sched->residency_budget[backend_id];
+    const size_t resident_bytes = sched->transient_metrics.backends[backend_id].current_resident_bytes;
+    const bool cache_eligible = cache_enabled && alloc_size <= resident_budget &&
+        resident_bytes <= resident_budget - alloc_size;
     const size_t split_limit = sched->max_weight_bytes_per_split[backend_id];
     size_t split_bytes = 0;
     for (int i = 0; i < split->n_inputs; ++i) {
@@ -3519,14 +3562,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             const size_t alloc_size = ggml_backend_buft_get_alloc_size(sched->bufts[split_backend_id], input_cpy);
             ggml_backend_sched_counter_add(sched, &metrics.allocation_requested_bytes, alloc_size);
             const size_t split_limit = sched->max_weight_bytes_per_split[split_backend_id];
-            const bool limit_rejected = split_limit > 0 &&
+            const bool limit_rejected = split_limit > 0 && split_transient_bytes > 0 &&
                 alloc_size > split_limit - std::min(split_transient_bytes, split_limit);
             bool unknown_memory = false;
             bool live_guard_rejected = false;
             const bool resident_admitted = cache_eligible && alloc_size > 0 &&
-                ggml_backend_sched_make_resident_space(sched, split_backend_id, alloc_size);
-            const bool window_rejected = alloc_size > 0 && !resident_admitted &&
-                !ggml_backend_sched_weight_window_admit(sched, split_backend_id, alloc_size, &unknown_memory, &live_guard_rejected);
+                ggml_backend_sched_make_resident_space(sched, split_backend_id, alloc_size, !expert_tier);
+            const bool transient_admitted = alloc_size > 0 && !resident_admitted &&
+                ggml_backend_sched_make_transient_space(
+                    sched, split_backend_id, alloc_size, &unknown_memory, &live_guard_rejected);
+            const bool window_rejected = alloc_size > 0 && !resident_admitted && !transient_admitted;
             if (alloc_size == 0 || limit_rejected || window_rejected) {
                 ggml_backend_sched_counter_add(sched, &metrics.allocation_rejected_bytes, alloc_size);
                 if (alloc_size == 0) {
@@ -3987,6 +4032,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
     for (int b = 0; b < n_backends; ++b) {
         sched->transient_metrics.backends[b].backend_index = b;
         sched->transient_metrics.backends[b].backend = backends[b];
+        // Preserve legacy behavior until a sequential context explicitly partitions
+        // the weight window into resident/current/next tiers.
+        sched->residency_budget[b] = SIZE_MAX;
     }
 
     // initialize hash table
@@ -4385,6 +4433,14 @@ void ggml_backend_sched_set_weight_residency(
         }
     }
     sched->residency_enabled[backend_id] = enabled;
+}
+
+void ggml_backend_sched_set_weight_residency_budget(
+        ggml_backend_sched_t sched, ggml_backend_t backend, size_t budget_bytes) {
+    GGML_ASSERT(sched);
+    const int backend_id = ggml_backend_sched_backend_id(sched, backend);
+    GGML_ASSERT(backend_id >= 0);
+    sched->residency_budget[backend_id] = budget_bytes;
 }
 
 void ggml_backend_sched_set_persistent_weight_residency(ggml_backend_sched_t sched, bool persistent) {

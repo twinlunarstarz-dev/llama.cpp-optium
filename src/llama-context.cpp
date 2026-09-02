@@ -16,6 +16,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -23,6 +24,21 @@
 //
 // llama_context
 //
+
+static size_t llama_system_mem_available() {
+#if defined(__linux__)
+    std::ifstream f("/proc/meminfo");
+    std::string key;
+    uint64_t value = 0;
+    std::string unit;
+    while (f >> key >> value >> unit) {
+        if (key == "MemAvailable:") {
+            return value > SIZE_MAX / 1024 ? SIZE_MAX : (size_t) value * 1024;
+        }
+    }
+#endif
+    return 0;
+}
 
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
@@ -651,19 +667,24 @@ void llama_context::sched_reserve() {
             if (cpu_dev) {
                 ggml_backend_dev_memory(cpu_dev, &ram_free, &ram_total);
             }
-            // on Linux the CPU backend reports total physical RAM as "free"
-            // (see ggml_backend_cpu_device_get_memory); use that as the ceiling
+            // Prefer Linux MemAvailable: total physical RAM is not a safe bound when
+            // other processes and the OS already own a large fraction of memory.
             const size_t phys_ram = ram_free > 0 ? ram_free : ram_total;
-            if (phys_ram > 0) {
-                // use at most 1/4 of physical RAM per split:
-                //   1/4 current split, 1/4 prefetch, 1/2 headroom for OS + other processes
-                const size_t ram_budget = phys_ram / 4;
+            const size_t mem_available = llama_system_mem_available();
+            const size_t usable_ram = mem_available > 0 ?
+                (phys_ram > 0 ? std::min(mem_available, phys_ram) : mem_available) : phys_ram;
+            if (usable_ram > 0) {
+                // Two active host-side streaming windows consume at most half of the
+                // currently available RAM; the other half stays available to the OS,
+                // page cache, KV/checkpoints and unrelated processes.
+                const size_t ram_budget = usable_ram / 4;
                 if (sequential_weight_budget == 0 || ram_budget < sequential_weight_budget) {
                     sequential_weight_budget = ram_budget;
                 }
-                LLAMA_LOG_INFO("%s: sequential load: RAM budget  = %.1f GiB (physical = %.1f GiB)\n",
+                LLAMA_LOG_INFO("%s: sequential load: RAM budget  = %.1f GiB (available = %.1f GiB, physical = %.1f GiB)\n",
                     __func__,
                     ram_budget / (1024.0 * 1024.0 * 1024.0),
+                    usable_ram / (1024.0 * 1024.0 * 1024.0),
                     phys_ram / (1024.0 * 1024.0 * 1024.0));
             }
         }
@@ -817,12 +838,36 @@ void llama_context::sched_reserve() {
             const bool memory_valid = ggml_backend_sched_set_weight_window(
                 sched.get(), backend, free_bytes, total_bytes, SIZE_MAX, &window_bytes, &safety_reserve_bytes);
             ggml_backend_sched_set_weight_residency(sched.get(), backend, memory_valid && window_bytes > 0);
-            ggml_backend_sched_set_max_weight_bytes_per_split(sched.get(), backend, window_bytes);
+
+            int resident_pct = 33;
+            if (const char * env = getenv("GGML_SEQUENTIAL_VRAM_CACHE_PERCENT")) {
+                char * end = nullptr;
+                const long parsed = strtol(env, &end, 10);
+                if (end != env) {
+                    resident_pct = (int) std::max<long>(0, std::min<long>(80, parsed));
+                }
+            }
+            size_t resident_budget = memory_valid ? window_bytes * (size_t) resident_pct / 100 : 0;
+            size_t split_budget = memory_valid ? (window_bytes - resident_budget) / 2 : 0;
+            constexpr size_t min_pipeline_split = (size_t) 64 * 1024 * 1024;
+            if (window_bytes >= 2 * min_pipeline_split && split_budget < min_pipeline_split) {
+                // On very tight cards, execution capacity wins over persistent cache.
+                resident_budget = 0;
+                split_budget = window_bytes / 2;
+            }
+            if (memory_valid && split_budget == 0) {
+                split_budget = window_bytes;
+            }
+
+            ggml_backend_sched_set_weight_residency_budget(sched.get(), backend, resident_budget);
+            ggml_backend_sched_set_max_weight_bytes_per_split(sched.get(), backend, split_budget);
             LLAMA_LOG_INFO("%s: sequential weight window: total = %.2f MiB, post-reservation free = %.2f MiB, "
-                           "safety reserve = %.2f MiB, admitted = %.2f MiB, memory valid = %s\n",
+                           "safety reserve = %.2f MiB, admitted = %.2f MiB, resident = %.2f MiB, "
+                           "current/next target = %.2f/%.2f MiB, memory valid = %s\n",
                 __func__, total_bytes / 1024.0 / 1024.0, free_bytes / 1024.0 / 1024.0,
                 safety_reserve_bytes / 1024.0 / 1024.0, window_bytes / 1024.0 / 1024.0,
-                memory_valid ? "yes" : "no");
+                resident_budget / 1024.0 / 1024.0, split_budget / 1024.0 / 1024.0,
+                split_budget / 1024.0 / 1024.0, memory_valid ? "yes" : "no");
         }
     }
 
