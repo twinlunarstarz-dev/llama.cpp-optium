@@ -402,6 +402,12 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_set_weight_residency(
             ggml_backend_sched_t sched, ggml_backend_t backend, bool enabled);
 
+    // Cap persistent sequential weight residency on a backend. Transient current/next
+    // split buffers may still use the rest of the weight window, and oversized single
+    // tensors may evict residents and temporarily borrow the full window.
+    GGML_API void                 ggml_backend_sched_set_weight_residency_budget(
+            ggml_backend_sched_t sched, ggml_backend_t backend, size_t budget_bytes);
+
     // Keep resident host-weight copies across scheduler graph resets. The next
     // graph reattaches matching source tensors to the retained device buffers.
     GGML_API void                 ggml_backend_sched_set_persistent_weight_residency(
