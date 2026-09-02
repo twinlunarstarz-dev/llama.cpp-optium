@@ -1160,7 +1160,6 @@ private:
         // divide n_ctx_seq: hidden sequences share the same physical KV pool.
         int32_t gpu_agent_cache_seqs = 0;
         if (!utility_model && params_base.kv_unified && params_base.lora_adapters.empty()) {
-            gpu_agent_cache_seqs = 8;
             if (const char * env = getenv("LLAMA_SERVER_GPU_AGENT_CACHE_SEQS")) {
                 gpu_agent_cache_seqs = std::clamp<int32_t>(atoi(env), 0, 32);
             }
@@ -1197,9 +1196,10 @@ private:
             {
                 common_params params_dft = common_base_params_to_speculative(params_base);
                 // The draft/MTP context must understand the same hidden sequence
-                // IDs as the target context.  Keep output limits from params_base;
-                // only sequence-addressability is widened.
+                // IDs as the target context.  Match its output capacity as well.
                 params_dft.n_parallel = llama_n_seq_max(ctx_tgt);
+                params_dft.n_outputs_max = params_dft.n_parallel;
+                params_dft.n_outputs_max_per_seq = 1;
 
                 // progress callback
                 params_dft.load_progress_callback           = load_progress_callback;
