@@ -22,6 +22,26 @@ jobs:
       - name: Apply active KV residency changes
         run: python3 scripts/materialize-active-kv-swap.py
 
+      - name: Fix materialized source
+        shell: bash
+        run: |
+          sed -i 's/SRV_TRC(" - prompt cache RAM is reserved by active suspended state; skipping reusable entry\\n");/SRV_TRC("%s", " - prompt cache RAM is reserved by active suspended state; skipping reusable entry\\n");/' tools/server/server-task.cpp
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('tools/server/server-context.cpp')
+          s = p.read_text()
+          anchor = '''                    const int id_task = task.id;\n\n                    server_slot * slot = get_available_slot(task);'''
+          replacement = '''                    const int id_task = task.id;\n\n                    // Capacity admission must run before get_available_slot(), because\n                    // slot selection may restore a large cached prompt into unified KV.\n                    // Only do this when there is a logically free slot; a third request\n                    // should wait rather than evicting a resident request unnecessarily.\n                    bool has_idle_candidate = false;\n                    for (const auto & candidate : slots) {\n                        if (candidate.is_processing()) {\n                            continue;\n                        }\n                        if (task.id_slot != -1 && candidate.id != task.id_slot) {\n                            continue;\n                        }\n                        has_idle_candidate = true;\n                        break;\n                    }\n                    if (has_idle_candidate && !make_room_for_incoming(task)) {\n                        SRV_DBG("unable to reach a safe active-KV suspension boundary; defer task, id_task = %d\\n", id_task);\n                        queue_tasks.defer(std::move(task));\n                        break;\n                    }\n\n                    server_slot * slot = get_available_slot(task);'''
+          if s.count(anchor) != 1:
+              raise SystemExit(f'admission anchor count={s.count(anchor)}')
+          s = s.replace(anchor, replacement, 1)
+          duplicate = '''\n                    if (!make_room_for_incoming(task)) {\n                        SRV_DBG("unable to reach a safe active-KV suspension boundary; defer task, id_task = %d\\n", id_task);\n                        queue_tasks.defer(std::move(task));\n                        break;\n                    }\n'''
+          if s.count(duplicate) != 1:
+              raise SystemExit(f'post-selection admission block count={s.count(duplicate)}')
+          s = s.replace(duplicate, '\n', 1)
+          p.write_text(s)
+          PY
+
       - name: Verify diff
         run: |
           git diff --check
