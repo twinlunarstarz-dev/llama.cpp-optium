@@ -160,6 +160,7 @@ extern "C" {
         LLAMA_FTYPE_MOSTLY_PQ2_0_LEGACY  = 142, // legacy Prism file type
         LLAMA_FTYPE_MOSTLY_PTQ1_0        = 143, // Prism group-128 ternary
         LLAMA_FTYPE_MOSTLY_Q1_0_g128     = 42, // except 1d tensors
+        LLAMA_FTYPE_MOSTLY_Q1_T_g128     = 43, // except 1d tensors
 
         LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
     };
