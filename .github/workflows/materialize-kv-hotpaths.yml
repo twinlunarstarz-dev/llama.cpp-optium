@@ -1,0 +1,28 @@
+name: materialize-kv-hotpaths
+
+on:
+  push:
+    branches:
+      - perf/kv-spec-speedups
+    paths:
+      - .github/workflows/materialize-kv-hotpaths.yml
+
+permissions:
+  contents: write
+
+jobs:
+  materialize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: perf/kv-spec-speedups
+          fetch-depth: 0
+      - name: Port KV hot-path optimizations
+        run: |
+          git config user.name "openai-perf-bot"
+          git config user.email "openai-perf-bot@users.noreply.github.com"
+          git cherry-pick 0d80b0c47eb273823c5f5f66e311a00c5ee8af51
+          git cherry-pick e148c3ffa5a14a4b93ba4e593bdbcd26b4e0ca9c
+          git diff --check HEAD~2..HEAD
+          git push origin HEAD:perf/kv-spec-speedups
