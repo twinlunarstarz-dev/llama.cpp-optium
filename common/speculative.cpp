@@ -1782,6 +1782,57 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
     }
+
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return false;
+        }
+
+        constexpr uint32_t magic = 0x3150544d; // "MTP1" little-endian
+        constexpr uint32_t version = 1;
+        const uint32_t width = (uint32_t) n_embd;
+        const size_t header_size = 3*sizeof(uint32_t);
+        const size_t row_bytes = (size_t) n_embd*sizeof(float);
+
+        data.resize(header_size + row_bytes);
+        size_t off = 0;
+        std::memcpy(data.data() + off, &magic, sizeof(magic)); off += sizeof(magic);
+        std::memcpy(data.data() + off, &version, sizeof(version)); off += sizeof(version);
+        std::memcpy(data.data() + off, &width, sizeof(width)); off += sizeof(width);
+        std::memcpy(data.data() + off, pending_h[seq_id].data(), row_bytes);
+        return true;
+    }
+
+    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+
+        constexpr uint32_t magic_expected = 0x3150544d;
+        constexpr uint32_t version_expected = 1;
+        const size_t header_size = 3*sizeof(uint32_t);
+        const size_t row_bytes = (size_t) n_embd*sizeof(float);
+        if (data.size() != header_size + row_bytes) {
+            return;
+        }
+
+        uint32_t magic = 0, version = 0, width = 0;
+        size_t off = 0;
+        std::memcpy(&magic, data.data() + off, sizeof(magic)); off += sizeof(magic);
+        std::memcpy(&version, data.data() + off, sizeof(version)); off += sizeof(version);
+        std::memcpy(&width, data.data() + off, sizeof(width)); off += sizeof(width);
+        if (magic != magic_expected || version != version_expected || width != (uint32_t) n_embd) {
+            return;
+        }
+
+        std::memcpy(pending_h[seq_id].data(), data.data() + off, row_bytes);
+        verify_h[seq_id].clear();
+        verify_h_rows[seq_id] = 0;
+        i_last[seq_id] = -1;
+        if (chain_heads) {
+            chain_h[seq_id].clear();
+        }
+    }
 };
 
 // state of self-speculation (simple implementation, not ngram-map)
@@ -2932,19 +2983,52 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
     }
 }
 
-// TODO: support the case of more than one speculative implementations having a state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data) {
     if (spec == nullptr) {
         return false;
     }
 
+    constexpr uint32_t magic = 0x31504353; // "SCP1" little-endian
+    constexpr uint32_t version = 1;
+
+    struct item {
+        uint32_t type;
+        std::vector<uint8_t> data;
+    };
+    std::vector<item> items;
     for (auto & impl : spec->impls) {
-        if (impl->get_state(seq_id, data)) {
-            return true;
+        std::vector<uint8_t> state;
+        if (impl->get_state(seq_id, state)) {
+            items.push_back({ (uint32_t) impl->type, std::move(state) });
         }
     }
+    if (items.empty()) {
+        data.clear();
+        return false;
+    }
 
-    return false;
+    size_t total = 3*sizeof(uint32_t);
+    for (const auto & item : items) {
+        total += sizeof(uint32_t) + sizeof(uint64_t) + item.data.size();
+    }
+    data.resize(total);
+
+    size_t off = 0;
+    auto put = [&](const void * src, size_t n) {
+        std::memcpy(data.data() + off, src, n);
+        off += n;
+    };
+    const uint32_t count = (uint32_t) items.size();
+    put(&magic, sizeof(magic));
+    put(&version, sizeof(version));
+    put(&count, sizeof(count));
+    for (const auto & item : items) {
+        const uint64_t n = item.data.size();
+        put(&item.type, sizeof(item.type));
+        put(&n, sizeof(n));
+        if (n > 0) put(item.data.data(), (size_t) n);
+    }
+    return true;
 }
 
 void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data) {
@@ -2952,6 +3036,39 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
         return;
     }
 
+    constexpr uint32_t magic_expected = 0x31504353;
+    constexpr uint32_t version_expected = 1;
+    if (data.size() >= 3*sizeof(uint32_t)) {
+        size_t off = 0;
+        auto get = [&](void * dst, size_t n) -> bool {
+            if (off > data.size() || data.size() - off < n) return false;
+            std::memcpy(dst, data.data() + off, n);
+            off += n;
+            return true;
+        };
+        uint32_t magic = 0, version = 0, count = 0;
+        if (get(&magic, sizeof(magic)) && get(&version, sizeof(version)) && get(&count, sizeof(count)) &&
+                magic == magic_expected && version == version_expected) {
+            for (uint32_t i = 0; i < count; ++i) {
+                uint32_t type = 0;
+                uint64_t n = 0;
+                if (!get(&type, sizeof(type)) || !get(&n, sizeof(n)) || n > data.size() - off) {
+                    return;
+                }
+                std::vector<uint8_t> state((size_t) n);
+                if (n > 0 && !get(state.data(), (size_t) n)) return;
+                for (auto & impl : spec->impls) {
+                    if ((uint32_t) impl->type == type) {
+                        impl->set_state(seq_id, state);
+                        break;
+                    }
+                }
+            }
+            return;
+        }
+    }
+
+    // Backward-compatible fallback for old single-implementation checkpoint data.
     for (auto & impl : spec->impls) {
         impl->set_state(seq_id, data);
     }

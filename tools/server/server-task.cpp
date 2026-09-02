@@ -1823,13 +1823,16 @@ size_t server_prompt_cache::n_tokens() const {
 }
 
 server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
-    // first check if the current state is contained fully in the cache
+    // Replace only an exact snapshot.  A shorter prefix is a valid branch/session
+    // root and must survive A -> B -> A agent switching.
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
-        if (cur_lcp_len == (int) prompt.tokens.size()) {
-            SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
-            return nullptr;
+        if (cur_lcp_len == (int) prompt.tokens.size() &&
+                it->prompt.tokens.size() == prompt.tokens.size()) {
+            SRV_TRC(" - replacing exact cached prompt with length %d\n", cur_lcp_len);
+            states.erase(it);
+            break;
         }
     }
 
@@ -1846,19 +1849,6 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, skipping\n",
                 state_size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
         return nullptr;
-    }
-
-    // remove any cached prompts that are fully contained in the current prompt
-    for (auto it = states.begin(); it != states.end();) {
-        const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
-
-        if (len == (int) it->prompt.tokens.size()) {
-            SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
-
-            it = states.erase(it);
-        } else {
-            ++it;
-        }
     }
 
     if (limit_size > 0) {
@@ -1898,6 +1888,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),
             /*.drft =*/ std::move(state_data_dft),
+            /*.spec =*/ {},
         },
     });
 
@@ -1926,6 +1917,10 @@ void server_prompt_cache::store_remote(server_prompt_cache_state * state) {
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+    restored_any_state = false;
+    restored_spec_state_valid = false;
+    restored_spec_state.clear();
+
     if (lmcache && !tokens_new.has_mtmd) {
         std::vector<uint8_t> data;
         bool found = false;
@@ -1942,11 +1937,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             } else {
                 const int lcp_base = prompt.tokens.get_common_prefix(tokens_new);
                 const int lcp_remote = remote.prompt.tokens.get_common_prefix(tokens_new);
-                const float keep_base = prompt.tokens.size() > 0 ? float(lcp_base) / prompt.tokens.size() : -1.0f;
-                const float sim_base = tokens_new.size() > 0 ? float(lcp_base) / tokens_new.size() : 0.0f;
                 const float keep_remote = remote.prompt.tokens.size() > 0 ? float(lcp_remote) / remote.prompt.tokens.size() : 0.0f;
-                const float sim_remote = tokens_new.size() > 0 ? float(lcp_remote) / tokens_new.size() : 0.0f;
-                if (keep_remote >= 0.25f && keep_base < keep_remote && sim_base < sim_remote) {
+                // Maximize actual avoided target work, not two relative ratios.
+                if (keep_remote >= 0.25f && lcp_remote > lcp_base) {
                     const size_t size_tgt = remote.data.main.size();
                     const size_t n_tgt = llama_state_seq_set_data_ext(ctx_tgt, remote.data.main.data(), size_tgt, id_slot, 0);
                     if (n_tgt != size_tgt) {
@@ -1962,20 +1955,23 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                         }
                     }
                     prompt = std::move(remote.prompt);
+                    restored_any_state = true;
                     SRV_TRC(" - restored %zu-token prompt state from LMCache\n", tokens.size());
                     return true;
                 }
-                SRV_TRC(" - LMCache prompt is not better, f_keep = %.3f, f_sim = %.3f\n", keep_remote, sim_remote);
+                SRV_TRC(" - LMCache prompt is not better, lcp = %d (base = %d), f_keep = %.3f\n",
+                        lcp_remote, lcp_base, keep_remote);
             }
         }
     }
 
-    const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
+    int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
-    float f_sim_best  = float(lcp_best) / tokens_new.size();
+    float f_sim_best  = tokens_new.size() > 0 ? float(lcp_best) / tokens_new.size() : 0.0f;
 
-    SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+    SRV_TRC(" - looking for better prompt, base lcp = %d, f_keep = %.3f, f_sim = %.3f\n",
+            lcp_best, f_keep_best, f_sim_best);
 
     auto it_best = states.end();
 
@@ -1993,7 +1989,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             continue;
         }
 
-        if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
+        if (lcp_cur > lcp_best) {
+            lcp_best    = lcp_cur;
             f_keep_best = f_keep_cur;
             f_sim_best  = f_sim_cur;
 
@@ -2005,7 +2002,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
         {
-            auto & data = it_best->data.main;
+            const auto & data = it_best->data.main;
 
             const size_t size = data.size();
             const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
@@ -2014,13 +2011,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
                 return false;
             }
-
-            data.clear();
-            data.shrink_to_fit();
         }
 
         {
-            auto & data = it_best->data.drft;
+            const auto & data = it_best->data.drft;
 
             if (!data.empty()) {
                 GGML_ASSERT(ctx_dft);
@@ -2032,17 +2026,211 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
                     return false;
                 }
-
-                data.clear();
-                data.shrink_to_fit();
             }
         }
 
-        prompt = std::move(it_best->prompt);
+        prompt = it_best->prompt.clone();
+        restored_any_state = true;
+        restored_spec_state = it_best->data.spec;
+        restored_spec_state_valid = !restored_spec_state.empty();
 
-        states.erase(it_best);
+        // True LRU behavior: a successfully restored agent snapshot becomes MRU.
+        states.splice(states.end(), states, it_best);
     }
 
+    return true;
+}
+
+void server_prompt_cache::configure_gpu(
+        llama_context * ctx_tgt,
+        llama_context * ctx_dft,
+        llama_seq_id seq_first,
+        int32_t seq_count) {
+    gpu_ctx_tgt = ctx_tgt;
+    gpu_ctx_dft = ctx_dft;
+    gpu_seq_first = seq_first;
+    gpu_seq_count = std::max<int32_t>(0, seq_count);
+
+    if (gpu_enabled()) {
+        SRV_INF("GPU agent cache enabled: %d hidden sequence ids [%d, %d)\n",
+                gpu_seq_count, (int) gpu_seq_first, (int) (gpu_seq_first + gpu_seq_count));
+    }
+}
+
+bool server_prompt_cache::gpu_demote_lru() {
+    if (!gpu_enabled() || gpu_states.empty()) {
+        return false;
+    }
+
+    auto it = gpu_states.begin();
+    const llama_seq_id seq_id = it->seq_id;
+
+    // Preserve the hidden entry in the existing level-2 cache when one exists.
+    // If RAM/LMCache is disabled, dropping the oldest hidden entry is still the
+    // correct response to device KV pressure and lets decode make progress.
+    if (local_enabled || lmcache) {
+        const size_t size_tgt = llama_state_seq_get_size_ext(gpu_ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t size_dft = gpu_ctx_dft
+            ? llama_state_seq_get_size_ext(gpu_ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE)
+            : 0;
+
+        if (auto * dst = alloc(it->prompt, size_tgt, size_dft)) {
+            const size_t n_tgt = llama_state_seq_get_data_ext(
+                    gpu_ctx_tgt, dst->data.main.data(), size_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            if (n_tgt == size_tgt) {
+                bool ok = true;
+                if (gpu_ctx_dft && size_dft > 0) {
+                    const size_t n_dft = llama_state_seq_get_data_ext(
+                            gpu_ctx_dft, dst->data.drft.data(), size_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                    ok = n_dft == size_dft;
+                }
+                if (ok) {
+                    dst->data.spec = it->spec;
+                    store_remote(dst);
+                    SRV_TRC(" - demoted %d-token GPU agent state from seq %d to level-2 cache\n",
+                            it->prompt.n_tokens(), (int) seq_id);
+                } else {
+                    SRV_WRN(" - failed to serialize hidden GPU agent seq %d; dropping it\n", (int) seq_id);
+                }
+            } else {
+                SRV_WRN(" - failed to serialize hidden GPU agent target seq %d; dropping it\n", (int) seq_id);
+            }
+        } else {
+            SRV_WRN(" - level-2 cache could not accept hidden GPU agent seq %d; dropping it\n", (int) seq_id);
+        }
+    }
+
+    llama_memory_seq_rm(llama_get_memory(gpu_ctx_tgt), seq_id, -1, -1);
+    if (gpu_ctx_dft) {
+        llama_memory_seq_rm(llama_get_memory(gpu_ctx_dft), seq_id, -1, -1);
+    }
+    gpu_states.erase(it);
+    return true;
+}
+
+bool server_prompt_cache::gpu_save(
+        const server_prompt & prompt,
+        const std::vector<uint8_t> & spec,
+        llama_seq_id active_seq) {
+    if (!gpu_enabled() || prompt.tokens.empty()) {
+        return false;
+    }
+
+    llama_seq_id seq_id = -1;
+    auto it_exact = gpu_states.end();
+
+    // Reuse the hidden id for an exact snapshot replacement.  Shorter prefixes
+    // remain valid branch roots and are intentionally retained.
+    for (auto it = gpu_states.begin(); it != gpu_states.end(); ++it) {
+        const int lcp = it->prompt.tokens.get_common_prefix(prompt.tokens);
+        if (lcp == (int) prompt.tokens.size() && it->prompt.tokens.size() == prompt.tokens.size()) {
+            seq_id = it->seq_id;
+            it_exact = it;
+            break;
+        }
+    }
+
+    if (seq_id < 0) {
+        for (int32_t i = 0; i < gpu_seq_count; ++i) {
+            const llama_seq_id candidate = gpu_seq_first + i;
+            const bool used = std::any_of(gpu_states.begin(), gpu_states.end(),
+                    [candidate](const server_gpu_prompt_cache_state & s) { return s.seq_id == candidate; });
+            if (!used) {
+                seq_id = candidate;
+                break;
+            }
+        }
+    }
+
+    // Hidden-id metadata is deliberately bounded.  Demote only when every id is
+    // occupied; normal alternation among a small agent set remains device-only.
+    if (seq_id < 0) {
+        if (!gpu_demote_lru()) {
+            return false;
+        }
+        for (int32_t i = 0; i < gpu_seq_count; ++i) {
+            const llama_seq_id candidate = gpu_seq_first + i;
+            const bool used = std::any_of(gpu_states.begin(), gpu_states.end(),
+                    [candidate](const server_gpu_prompt_cache_state & s) { return s.seq_id == candidate; });
+            if (!used) {
+                seq_id = candidate;
+                break;
+            }
+        }
+    }
+
+    if (seq_id < 0) {
+        return false;
+    }
+
+    // Remove an older exact version before re-tagging.  The active sequence still
+    // owns the cells, so this only drops the stale hidden ownership bit.
+    if (it_exact != gpu_states.end()) {
+        llama_memory_seq_rm(llama_get_memory(gpu_ctx_tgt), seq_id, -1, -1);
+        if (gpu_ctx_dft) {
+            llama_memory_seq_rm(llama_get_memory(gpu_ctx_dft), seq_id, -1, -1);
+        }
+        gpu_states.erase(it_exact);
+    }
+
+    llama_memory_seq_cp(llama_get_memory(gpu_ctx_tgt), active_seq, seq_id, -1, -1);
+    if (gpu_ctx_dft) {
+        llama_memory_seq_cp(llama_get_memory(gpu_ctx_dft), active_seq, seq_id, -1, -1);
+    }
+
+    gpu_states.push_back({ prompt.clone(), spec, seq_id });
+    SRV_TRC(" - retained %d-token agent state on device as hidden seq %d\n",
+            prompt.n_tokens(), (int) seq_id);
+    return true;
+}
+
+bool server_prompt_cache::gpu_load(
+        server_prompt & prompt,
+        const server_tokens & tokens_new,
+        llama_seq_id active_seq) {
+    if (!gpu_enabled() || gpu_states.empty() || tokens_new.empty()) {
+        return false;
+    }
+
+    const int lcp_base = prompt.tokens.get_common_prefix(tokens_new);
+    int lcp_best = lcp_base;
+    auto it_best = gpu_states.end();
+
+    for (auto it = gpu_states.begin(); it != gpu_states.end(); ++it) {
+        const int lcp = it->prompt.tokens.get_common_prefix(tokens_new);
+        const float keep = it->prompt.tokens.size() > 0
+            ? float(lcp) / it->prompt.tokens.size()
+            : 0.0f;
+        if (keep >= 0.25f && lcp > lcp_best) {
+            lcp_best = lcp;
+            it_best = it;
+        }
+    }
+
+    if (it_best == gpu_states.end()) {
+        return false;
+    }
+
+    // Remove the previous active ownership, then alias the selected hidden
+    // sequence back into the active slot.  KV tensor bytes stay in-place.
+    llama_memory_seq_rm(llama_get_memory(gpu_ctx_tgt), active_seq, -1, -1);
+    llama_memory_seq_cp(llama_get_memory(gpu_ctx_tgt), it_best->seq_id, active_seq, -1, -1);
+    if (gpu_ctx_dft) {
+        llama_memory_seq_rm(llama_get_memory(gpu_ctx_dft), active_seq, -1, -1);
+        llama_memory_seq_cp(llama_get_memory(gpu_ctx_dft), it_best->seq_id, active_seq, -1, -1);
+    }
+
+    prompt = it_best->prompt.clone();
+    restored_any_state = true;
+    restored_spec_state = it_best->spec;
+    restored_spec_state_valid = !restored_spec_state.empty();
+
+    SRV_TRC(" - restored %d-token agent state from hidden GPU seq %d (lcp=%d)\n",
+            prompt.n_tokens(), (int) it_best->seq_id, lcp_best);
+
+    // Successful restores are MRU; retain the hidden tag so the same branch can
+    // be selected again without another state copy.
+    gpu_states.splice(gpu_states.end(), gpu_states, it_best);
     return true;
 }
 

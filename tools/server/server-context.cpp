@@ -304,10 +304,19 @@ struct server_slot {
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
 
-        const size_t cur_size = cur_size_tgt + cur_size_dft;
+        std::vector<uint8_t> spec_state;
+        const bool has_spec_state = spec && common_speculative_get_state(spec, id, spec_state);
+
+        const size_t cur_size = cur_size_tgt + cur_size_dft + spec_state.size();
 
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
+
+        // Level-1: retain KV in the unified device pool under a hidden
+        // sequence id.  This is metadata-only and avoids serializing the state.
+        if (prompt_cache.gpu_save(prompt, spec_state, id)) {
+            return true;
+        }
 
         auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
         if (cur == nullptr) {
@@ -318,6 +327,9 @@ struct server_slot {
         if (ctx_dft) {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
+        if (has_spec_state) {
+            cur->data.spec = std::move(spec_state);
+        }
 
         prompt_cache.store_remote(cur);
 
@@ -325,12 +337,33 @@ struct server_slot {
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
+        // Determine whether this speculative stack owns persistent per-sequence
+        // state.  Stateless n-gram helpers do not require a sidecar restore.
+        std::vector<uint8_t> spec_probe;
+        const bool spec_requires_state = spec && common_speculative_get_state(spec, id, spec_probe);
+
+        // Prefer the device-resident tier.  If no hidden sequence has a better
+        // exact prefix, fall back to the serialized RAM/LMCache state.
+        bool res = prompt_cache.gpu_load(prompt, tokens, id);
+        if (!res) {
+            res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
+        }
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
+            return false;
         }
 
-        return res;
+        if (prompt_cache.restored_any_state && spec_requires_state) {
+            if (!prompt_cache.restored_spec_state_valid) {
+                // Legacy/remote cache records do not carry the sidecar.  Never
+                // combine another agent's speculative state with restored KV.
+                SLT_WRN(*this, "%s", "cached llama state has no matching speculative state; recomputing safely\n");
+                return false;
+            }
+            common_speculative_set_state(spec, id, prompt_cache.restored_spec_state);
+        }
+
+        return true;
     }
 
     void prompt_clear() {
@@ -1013,6 +1046,30 @@ private:
         const bool is_resume = sleeping;
 
         params_base = params;
+
+        // Embedding and rerank models are stateless utility workloads.  Keeping
+        // their server slot count tied to generation --parallel=1 serializes
+        // independent documents and leaves GPU batch GEMMs under-filled.  Give
+        // utility models an internal batch lane while preserving generation
+        // models' stateful parallel setting.
+        const bool utility_model = params_base.embedding ||
+                (params_base.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED &&
+                 params_base.pooling_type != LLAMA_POOLING_TYPE_NONE);
+        if (utility_model && params_base.n_parallel == 1) {
+            int32_t utility_parallel = 16;
+            if (const char * env = getenv("LLAMA_SERVER_UTILITY_PARALLEL")) {
+                utility_parallel = std::max<int32_t>(1, atoi(env));
+            }
+            utility_parallel = std::min<int32_t>(utility_parallel, std::max<int32_t>(1, params_base.n_batch));
+            if (utility_parallel > 1) {
+                params_base.n_parallel = utility_parallel;
+                // Dynamic shared KV keeps the full configured context available to
+                // every utility sequence instead of dividing it into fixed slots.
+                params_base.kv_unified = true;
+                SRV_INF("utility model: widening internal parallel lane to %d slots\n", utility_parallel);
+            }
+        }
+
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
@@ -1098,7 +1155,20 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
-        llama_init = common_init_from_params(params_base);
+        // Reserve additional sequence IDs for inactive agent contexts without
+        // creating additional active server slots.  With unified KV this does not
+        // divide n_ctx_seq: hidden sequences share the same physical KV pool.
+        int32_t gpu_agent_cache_seqs = 0;
+        if (!utility_model && params_base.kv_unified && params_base.lora_adapters.empty()) {
+            gpu_agent_cache_seqs = 8;
+            if (const char * env = getenv("LLAMA_SERVER_GPU_AGENT_CACHE_SEQS")) {
+                gpu_agent_cache_seqs = std::clamp<int32_t>(atoi(env), 0, 32);
+            }
+        }
+
+        common_params params_ctx = params_base;
+        params_ctx.n_parallel += gpu_agent_cache_seqs;
+        llama_init = common_init_from_params(params_ctx);
 
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
@@ -1126,6 +1196,10 @@ private:
 
             {
                 common_params params_dft = common_base_params_to_speculative(params_base);
+                // The draft/MTP context must understand the same hidden sequence
+                // IDs as the target context.  Keep output limits from params_base;
+                // only sequence-addressability is widened.
+                params_dft.n_parallel = llama_n_seq_max(ctx_tgt);
 
                 // progress callback
                 params_dft.load_progress_callback           = load_progress_callback;
@@ -1329,7 +1403,7 @@ private:
             batch.init(std::max(n_batch, params_base.n_parallel), n_embd);
         }
 
-        if (params_base.cache_ram_mib != 0 || !params_base.lmcache_endpoint.empty()) {
+        if (params_base.cache_ram_mib != 0 || !params_base.lmcache_endpoint.empty() || gpu_agent_cache_seqs > 0) {
             if (params_base.cache_ram_mib < 0) {
                 SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
             } else if (params_base.cache_ram_mib == 0) {
@@ -1350,6 +1424,12 @@ private:
 
             prompt_cache = std::make_unique<server_prompt_cache>(
                     params_base.cache_ram_mib, n_ctx, params_base.lmcache_endpoint, lmcache_namespace);
+            if (gpu_agent_cache_seqs > 0 && ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+                const int32_t seq_total = (int32_t) llama_n_seq_max(ctx_tgt);
+                const int32_t seq_first = params_base.n_parallel;
+                const int32_t seq_count = std::max<int32_t>(0, seq_total - seq_first);
+                prompt_cache->configure_gpu(ctx_tgt, ctx_dft, seq_first, seq_count);
+            }
             if (!params_base.lmcache_endpoint.empty()) {
                 SRV_INF("LMCache prompt state reuse enabled at %s\n", params_base.lmcache_endpoint.c_str());
             }
@@ -1671,6 +1751,12 @@ private:
                 // clear slots one by one
                 break;
             }
+        }
+
+        // If all active idle slots are already clear, reclaim the oldest hidden
+        // GPU agent.  It is first demoted to RAM/LMCache when configured.
+        if (!res && prompt_cache && prompt_cache->gpu_demote_lru()) {
+            res = true;
         }
 
         return res;
@@ -2992,14 +3078,22 @@ private:
                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
-                        slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                        const llama_tokens * spec_prompt_ptr = nullptr;
+                        if (slot.prompt.tokens.has_mtmd) {
+                            slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                            spec_prompt_ptr = &slot.spec_prompt;
+                        } else {
+                            // Avoid copying the entire 50k/100k/1M-token context on
+                            // every speculative generation round.
+                            spec_prompt_ptr = &slot.prompt.tokens.get_tokens();
+                        }
 
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,
                             /* .n_max    = */ n_draft_max,
                             /* .n_past   = */ slot.prompt.n_tokens(),
                             /* .id_last  = */ slot.sampled,
-                            /* .prompt   = */ &slot.spec_prompt,
+                            /* .prompt   = */ spec_prompt_ptr,
                             /* .result   = */ &slot.spec_draft,
                         };
 

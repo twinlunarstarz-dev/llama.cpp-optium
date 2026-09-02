@@ -6,7 +6,11 @@
 // common_ngram_mod
 //
 
-common_ngram_mod::common_ngram_mod(uint16_t n, size_t size) : n(n), used(0) {
+common_ngram_mod::common_ngram_mod(uint16_t n, size_t size)
+    : n(n)
+    , used(0)
+    , index_mask(size > 0 ? size - 1 : 0)
+    , index_is_pow2(size > 0 && (size & (size - 1)) == 0) {
     entries.resize(size);
 
     reset();
@@ -19,9 +23,11 @@ size_t common_ngram_mod::idx(const entry_t * tokens) const {
         res = res*6364136223846793005ULL + tokens[i];
     }
 
-    res = res % entries.size();
+    if (index_is_pow2) {
+        return res & index_mask;
+    }
 
-    return res;
+    return res % entries.size();
 }
 
 void common_ngram_mod::add(const entry_t * tokens) {

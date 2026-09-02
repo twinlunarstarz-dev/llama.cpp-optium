@@ -1,0 +1,29 @@
+name: materialize-fa-q5
+
+on:
+  push:
+    branches:
+      - perf/kv-spec-speedups
+    paths:
+      - .github/workflows/materialize-fa-q5.yml
+
+permissions:
+  contents: write
+
+jobs:
+  materialize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: perf/kv-spec-speedups
+          fetch-depth: 0
+      - run: python3 scripts/apply-fa-q5-hotpath.py
+      - run: git diff --check
+      - name: Commit
+        run: |
+          git config user.name "openai-perf-bot"
+          git config user.email "openai-perf-bot@users.noreply.github.com"
+          git add ggml/src/ggml-cuda/fattn.cu
+          git commit -m "perf(cuda): compile q8/q5 KV FlashAttention by default"
+          git push origin HEAD:perf/kv-spec-speedups

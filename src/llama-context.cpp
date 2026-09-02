@@ -1355,19 +1355,12 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
     LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
 
-    if (sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
-        static bool warned = false;
-        if (!warned) {
-            LLAMA_LOG_WARN("%s: backend sampling not supported with SPLIT_MODE_TENSOR; using CPU\n", __func__);
-            warned = true;
-        }
-        if (sampling.samplers.count(seq_id) > 0) {
-            sched_need_reserve = true;
-        }
-        sampling.samplers.erase(seq_id);
-        return false;
-    }
-
+    // Tensor-split output lives on the Meta backend.  Do not reject it merely
+    // because the model is tensor-parallel: sampler backend_init already probes
+    // every operation against the supplied buffer type, and Meta reports support
+    // only when its child backends can execute the operation.  Unsupported chains
+    // therefore retain the normal CPU fallback, while supported chains avoid the
+    // n_vocab logits D2H copy on every decode step.
     const bool can_offload =
         sampler &&
         sampler->iface->backend_init &&
@@ -1377,7 +1370,15 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (sampler && can_offload) {
         auto * buft = ggml_backend_dev_buffer_type(model.dev_output());
 
-        sampler->iface->backend_init(sampler, buft, cparams.n_outputs_max_per_seq);
+        // backend_init returns how much of the chain can actually stay on the
+        // backend.  A Meta buffer is valid here; its capability query is the
+        // intersection of the child devices.
+        if (!sampler->iface->backend_init(sampler, buft, cparams.n_outputs_max_per_seq)) {
+            LLAMA_LOG_WARN("%s: sampler '%s' for seq_id = %d cannot be initialized on output backend '%s'; using CPU\n",
+                    __func__, llama_sampler_name(sampler), seq_id, ggml_backend_buft_name(buft));
+            sampling.samplers.erase(seq_id);
+            return false;
+        }
 
         sampling.samplers[seq_id] = sampler;
 
