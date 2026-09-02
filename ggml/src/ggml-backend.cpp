@@ -3562,12 +3562,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             const size_t alloc_size = ggml_backend_buft_get_alloc_size(sched->bufts[split_backend_id], input_cpy);
             ggml_backend_sched_counter_add(sched, &metrics.allocation_requested_bytes, alloc_size);
             const size_t split_limit = sched->max_weight_bytes_per_split[split_backend_id];
-            const bool limit_rejected = split_limit > 0 && split_transient_bytes > 0 &&
+            const bool limit_rejected = split_limit > 0 &&
                 alloc_size > split_limit - std::min(split_transient_bytes, split_limit);
             bool unknown_memory = false;
             bool live_guard_rejected = false;
+            const bool scan_resistant = !expert_tier && sched->residency_budget[split_backend_id] != SIZE_MAX;
             const bool resident_admitted = cache_eligible && alloc_size > 0 &&
-                ggml_backend_sched_make_resident_space(sched, split_backend_id, alloc_size, !expert_tier);
+                ggml_backend_sched_make_resident_space(sched, split_backend_id, alloc_size, scan_resistant);
             const bool transient_admitted = alloc_size > 0 && !resident_admitted &&
                 ggml_backend_sched_make_transient_space(
                     sched, split_backend_id, alloc_size, &unknown_memory, &live_guard_rejected);
