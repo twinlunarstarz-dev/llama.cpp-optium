@@ -1,0 +1,41 @@
+name: materialize-sequential-host-disk-cache
+
+on:
+  push:
+    branches:
+      - perf/sequential-tiered-cache
+    paths:
+      - .github/workflows/materialize-sequential-host-disk-cache.yml
+
+permissions:
+  contents: write
+
+jobs:
+  materialize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: perf/sequential-tiered-cache
+          fetch-depth: 0
+      - name: Apply sequential host/disk tier changes
+        run: python3 scripts/apply-sequential-host-disk-cache.py
+      - name: Verify diff
+        run: |
+          git diff --check
+          git diff --stat
+      - name: CPU compile server
+        run: |
+          cmake -S . -B build-seq-io -DGGML_CUDA=OFF -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF
+          cmake --build build-seq-io --target llama-server -j2
+      - name: Commit
+        run: |
+          git config user.name "openai-perf-bot"
+          git config user.email "openai-perf-bot@users.noreply.github.com"
+          git add src/llama-model.cpp src/llama-mmap.cpp
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git commit -m "perf(sequential): optimize RAM and disk weight tiers"
+          git push origin HEAD:perf/sequential-tiered-cache
