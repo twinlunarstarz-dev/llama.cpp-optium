@@ -182,16 +182,24 @@ struct llama_file::impl {
 #else
     impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false) : fname(fname) {
 #ifdef __linux__
-        // Try unbuffered I/O for read only
-        if (use_direct_io && std::strcmp(mode, "rb") == 0) {
+        direct_io_requested = use_direct_io && std::strcmp(mode, "rb") == 0;
+        // Try unbuffered I/O for read only. Filesystems that reject O_DIRECT fall
+        // back to an mmap/pread source below; both remain bounded by the kernel's
+        // page cache and therefore support files much larger than physical RAM.
+        if (direct_io_requested) {
             if (init_fd()) {
                 return;
             }
-            LLAMA_LOG_WARN("Failed to open file '%s' with error: %s. Falling back to buffered I/O",
+            LLAMA_LOG_WARN("Failed to open file '%s' with O_DIRECT: %s. Falling back to mmap/pread\n",
                            fname, strerror(errno));
         }
 #endif
         init_fp(mode);
+#ifdef __linux__
+        if (direct_io_requested) {
+            init_direct_fallback_map();
+        }
+#endif
     }
 
 #ifdef __linux__
@@ -224,6 +232,38 @@ struct llama_file::impl {
         size = tell();
         seek(0, SEEK_SET);
     }
+
+#ifdef __linux__
+    void init_direct_fallback_map() {
+#if defined(_POSIX_MAPPED_FILES)
+        if (fp == NULL || size == 0) {
+            return;
+        }
+        const int map_fd = fileno(fp);
+        if (map_fd < 0) {
+            return;
+        }
+        void * mapped = mmap(NULL, size, PROT_READ, MAP_SHARED, map_fd, 0);
+        if (mapped == MAP_FAILED) {
+            LLAMA_LOG_WARN("%s: mmap fallback failed for '%s': %s; using pread\n",
+                           __func__, fname.c_str(), strerror(errno));
+            return;
+        }
+        direct_fallback_map = mapped;
+        direct_fallback_map_size = size;
+#ifdef MADV_SEQUENTIAL
+        (void) madvise(mapped, size, MADV_SEQUENTIAL);
+#endif
+#ifdef POSIX_FADV_SEQUENTIAL
+        (void) posix_fadvise(map_fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+#endif
+        LLAMA_LOG_INFO("%s: sequential mmap fallback enabled for '%s' (%.2f GiB virtual)\n",
+                      __func__, fname.c_str(), size / (1024.0 * 1024.0 * 1024.0));
+#else
+        GGML_UNUSED(direct_io_requested);
+#endif
+    }
+#endif
 
     impl(FILE * file) : fname("(file*)"), owns_fp(false) {
         fp = file;
@@ -374,6 +414,13 @@ struct llama_file::impl {
     }
 
     ~impl() {
+#if defined(_POSIX_MAPPED_FILES)
+        if (direct_fallback_map != nullptr) {
+            munmap(direct_fallback_map, direct_fallback_map_size);
+            direct_fallback_map = nullptr;
+            direct_fallback_map_size = 0;
+        }
+#endif
         if (fd != -1) {
             close(fd);
         } else if (owns_fp) {
@@ -382,6 +429,9 @@ struct llama_file::impl {
     }
     int fd = -1;
     std::string fname;
+    bool direct_io_requested = false;
+    void * direct_fallback_map = nullptr;
+    size_t direct_fallback_map_size = 0;
 #endif
 
     size_t read_alignment() const {
@@ -411,10 +461,14 @@ bool llama_file::has_direct_io() const { return pimpl->has_direct_io(); }
 
 void llama_file::read_at(void * ptr, size_t len, size_t offset) const {
 #ifdef __linux__
+    if (len == 0) {
+        return;
+    }
+    if (offset > pimpl->size || len > pimpl->size - offset) {
+        throw std::runtime_error("pread range exceeds file size");
+    }
     if (pimpl->fd != -1) {
         const size_t alignment = pimpl->alignment;
-        if (len == 0) return;
-        if (offset > pimpl->size) throw std::runtime_error("direct pread offset exceeds file size");
         const size_t aligned_offset = offset & ~(alignment - 1);
         const size_t prefix = offset - aligned_offset;
         const size_t aligned_size = (prefix + len + alignment - 1) & ~(alignment - 1);
@@ -433,6 +487,27 @@ void llama_file::read_at(void * ptr, size_t len, size_t offset) const {
         }
         memcpy(ptr, static_cast<uint8_t *>(raw) + prefix, len);
         return;
+    }
+#if defined(_POSIX_MAPPED_FILES)
+    if (pimpl->direct_fallback_map != nullptr) {
+        GGML_ASSERT(offset <= pimpl->direct_fallback_map_size && len <= pimpl->direct_fallback_map_size - offset);
+        memcpy(ptr, static_cast<const uint8_t *>(pimpl->direct_fallback_map) + offset, len);
+        return;
+    }
+#endif
+    if (pimpl->fp != nullptr) {
+        const int raw_fd = fileno(pimpl->fp);
+        if (raw_fd >= 0) {
+            size_t done = 0;
+            while (done < len) {
+                const ssize_t n = pread(raw_fd, static_cast<uint8_t *>(ptr) + done, len - done, offset + done);
+                if (n < 0 && errno == EINTR) continue;
+                if (n < 0) throw std::runtime_error(format("pread error: %s", strerror(errno)));
+                if (n == 0) throw std::runtime_error("unexpectedly reached end of file");
+                done += static_cast<size_t>(n);
+            }
+            return;
+        }
     }
 #endif
     const size_t saved = tell();
