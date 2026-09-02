@@ -4350,7 +4350,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
 
     static bool enable_graph_optimization = [] {
         const char * env     = getenv("GGML_CUDA_GRAPH_OPT");
-        return env != nullptr && atoi(env) == 1;
+        // Graph replay is a production optimization.  Keep an explicit 0 as the
+        // escape hatch, but do not require every launcher to opt in.
+        return env == nullptr || atoi(env) != 0;
     }();
 
     if (!enable_graph_optimization) {
@@ -4360,7 +4362,11 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     ggml_cuda_stream_context & stream_context = cuda_ctx->stream_context();
     stream_context.reset();
 
-    if (!use_cuda_graph || ggml_backend_cuda_get_device_count() != 1) {
+    // This callback operates on one CUDA backend subgraph.  The old global
+    // visible-device-count check disabled graph optimization even when the
+    // current model/subgraph lived entirely on one GPU (for example a 3090
+    // utility model while a 2060 was merely visible).
+    if (!use_cuda_graph) {
         return;
     }
 
@@ -4398,8 +4404,12 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         }
         for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
             const ggml_tensor * src = cgraph->nodes[node_idx]->src[src_idx];
-            //TODO: check why nrows > 1 fails
-            if (node && !is_noop(node) && ggml_nrows(node) <= 1) {
+            // Track fan-out for batched decode as well.  Restricting this to
+            // single-row tensors prevented the Q/K/V stream scheduler from
+            // seeing independent branches when several decode rows were
+            // present.  Tensor lifetime synchronization below is already
+            // graph based, so row count is not a dependency criterion.
+            if (node && !is_noop(node)) {
                 fan_out[src] += 1;
             }
         }

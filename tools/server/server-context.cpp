@@ -1035,6 +1035,30 @@ private:
         const bool is_resume = sleeping;
 
         params_base = params;
+
+        // Embedding and rerank models are stateless utility workloads.  Keeping
+        // their server slot count tied to generation --parallel=1 serializes
+        // independent documents and leaves GPU batch GEMMs under-filled.  Give
+        // utility models an internal batch lane while preserving generation
+        // models' stateful parallel setting.
+        const bool utility_model = params_base.embedding ||
+                (params_base.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED &&
+                 params_base.pooling_type != LLAMA_POOLING_TYPE_NONE);
+        if (utility_model && params_base.n_parallel == 1) {
+            int32_t utility_parallel = 16;
+            if (const char * env = getenv("LLAMA_SERVER_UTILITY_PARALLEL")) {
+                utility_parallel = std::max<int32_t>(1, atoi(env));
+            }
+            utility_parallel = std::min<int32_t>(utility_parallel, std::max<int32_t>(1, params_base.n_batch));
+            if (utility_parallel > 1) {
+                params_base.n_parallel = utility_parallel;
+                // Dynamic shared KV keeps the full configured context available to
+                // every utility sequence instead of dividing it into fixed slots.
+                params_base.kv_unified = true;
+                SRV_INF("utility model: widening internal parallel lane to %d slots\n", utility_parallel);
+            }
+        }
+
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
