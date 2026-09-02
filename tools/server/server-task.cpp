@@ -11,6 +11,7 @@
 #include "server-common.h"
 
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <sstream>
 
@@ -1802,11 +1803,21 @@ static bool lmcache_deserialize(const std::vector<uint8_t> & data, server_prompt
 
 }
 
+server_prompt_cache::~server_prompt_cache() {
+    if (!active_disk_dir.empty()) {
+        std::error_code ec;
+        std::filesystem::remove_all(active_disk_dir, ec);
+    }
+}
+
 size_t server_prompt_cache::size() const {
     size_t res = 0;
 
     for (const auto & state : states) {
         res += state.size();
+    }
+    for (const auto & entry : active_states) {
+        res += entry.second.size();
     }
 
     return res;
@@ -1852,12 +1863,18 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     }
 
     if (limit_size > 0) {
-        // make room before allocating the new vectors to avoid breaching the limit
+        // make room before allocating the new vectors to avoid breaching the limit.
+        // Active suspended states are never evicted; ordinary reusable prompt
+        // entries yield to them because dropping a live request is not allowed.
         while (!states.empty() && size() + state_size_new > limit_size) {
             SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
                     states.front().size() / (1024.0 * 1024.0));
 
             states.pop_front();
+        }
+        if (size() + state_size_new > limit_size) {
+            SRV_TRC("%s", " - prompt cache RAM is reserved by active suspended state; skipping reusable entry\n");
+            return nullptr;
         }
     }
 
@@ -1893,6 +1910,213 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     });
 
     return &states.back();
+}
+
+bool server_prompt_cache::active_has(int32_t id_slot) const {
+    return active_states.find(id_slot) != active_states.end();
+}
+
+void server_prompt_cache::active_erase(int32_t id_slot) {
+    auto it = active_states.find(id_slot);
+    if (it == active_states.end()) {
+        return;
+    }
+    if (it->second.on_disk) {
+        std::error_code ec;
+        if (!it->second.file_tgt.empty()) {
+            std::filesystem::remove(it->second.file_tgt, ec);
+            ec.clear();
+        }
+        if (!it->second.file_dft.empty()) {
+            std::filesystem::remove(it->second.file_dft, ec);
+        }
+    }
+    active_states.erase(it);
+}
+
+bool server_prompt_cache::active_store(
+        int32_t id_slot,
+        llama_context * ctx_tgt,
+        llama_context * ctx_dft,
+        const std::vector<uint8_t> & spec) {
+    GGML_ASSERT(ctx_tgt);
+    active_erase(id_slot);
+
+    const size_t size_tgt = llama_state_seq_get_size_ext(ctx_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+    const size_t size_dft = ctx_dft
+        ? llama_state_seq_get_size_ext(ctx_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE)
+        : 0;
+    const size_t ram_need = size_tgt + size_dft + spec.size();
+
+    bool use_ram = local_enabled;
+    if (use_ram && limit_size > 0) {
+        while (!states.empty() && size() + ram_need > limit_size) {
+            SRV_TRC(" - evicting reusable prompt cache entry for active KV suspension (%.3f MiB)\n",
+                    states.front().size() / (1024.0 * 1024.0));
+            states.pop_front();
+        }
+        use_ram = ram_need <= limit_size && size() <= limit_size - ram_need;
+    }
+
+    server_active_prompt_cache_state state;
+    state.data.spec = spec;
+
+    if (use_ram) {
+        try {
+            state.data.main.resize(size_tgt);
+            state.data.drft.resize(size_dft);
+        } catch (const std::bad_alloc &) {
+            state.data.main.clear();
+            state.data.drft.clear();
+            use_ram = false;
+        }
+    }
+
+    if (use_ram) {
+        const size_t n_tgt = llama_state_seq_get_data_ext(
+                ctx_tgt, state.data.main.data(), size_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (n_tgt != size_tgt) {
+            SRV_ERR("failed to capture active target state for slot %d (%zu/%zu bytes)\n",
+                    id_slot, n_tgt, size_tgt);
+            return false;
+        }
+        if (ctx_dft && size_dft > 0) {
+            const size_t n_dft = llama_state_seq_get_data_ext(
+                    ctx_dft, state.data.drft.data(), size_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+            if (n_dft != size_dft) {
+                SRV_ERR("failed to capture active draft state for slot %d (%zu/%zu bytes)\n",
+                        id_slot, n_dft, size_dft);
+                return false;
+            }
+        }
+        active_states.emplace(id_slot, std::move(state));
+        SRV_INF("active KV slot %d suspended to RAM: %.3f MiB\n",
+                id_slot, ram_need / (1024.0 * 1024.0));
+        return true;
+    }
+
+    // Disk is the unbounded correctness tier. It is used when --cache-ram is
+    // disabled/full or when one exact live state is larger than that budget.
+    // The OS page cache remains free to keep hot pages in RAM, but it can reclaim
+    // them under pressure, so this does not create another fixed host-RAM budget.
+    try {
+        if (active_disk_dir.empty()) {
+            const char * env = getenv("LLAMA_SERVER_KV_SWAP_DIR");
+            std::filesystem::path base = env && env[0]
+                ? std::filesystem::path(env)
+                : std::filesystem::temp_directory_path();
+            std::ostringstream name;
+            name << "llama-kv-swap-" << static_cast<const void *>(this);
+            active_disk_dir = (base / name.str()).string();
+            std::filesystem::create_directories(active_disk_dir);
+            SRV_INF("active KV disk tier: %s\n", active_disk_dir.c_str());
+        }
+
+        const auto base = std::filesystem::path(active_disk_dir) /
+            ("slot-" + std::to_string(id_slot));
+        state.file_tgt = base.string() + ".target.bin";
+        state.file_dft = size_dft > 0 ? base.string() + ".draft.bin" : std::string();
+
+        const llama_token marker_token = 0;
+        const size_t n_tgt = llama_state_seq_save_file(
+                ctx_tgt, state.file_tgt.c_str(), id_slot, &marker_token, 1);
+        if (n_tgt == 0) {
+            SRV_ERR("failed to spill active target state for slot %d to disk\n", id_slot);
+            std::error_code ec;
+            std::filesystem::remove(state.file_tgt, ec);
+            return false;
+        }
+        if (ctx_dft && size_dft > 0) {
+            const size_t n_dft = llama_state_seq_save_file(
+                    ctx_dft, state.file_dft.c_str(), id_slot, &marker_token, 1);
+            if (n_dft == 0) {
+                SRV_ERR("failed to spill active draft state for slot %d to disk\n", id_slot);
+                std::error_code ec;
+                std::filesystem::remove(state.file_tgt, ec);
+                std::filesystem::remove(state.file_dft, ec);
+                return false;
+            }
+        }
+        state.on_disk = true;
+        active_states.emplace(id_slot, std::move(state));
+        SRV_INF("active KV slot %d suspended to disk (state %.3f MiB exceeds/avoids RAM tier)\n",
+                id_slot, ram_need / (1024.0 * 1024.0));
+        return true;
+    } catch (const std::exception & e) {
+        SRV_ERR("active KV disk spill failed for slot %d: %s\n", id_slot, e.what());
+        return false;
+    }
+}
+
+bool server_prompt_cache::active_restore(
+        int32_t id_slot,
+        llama_context * ctx_tgt,
+        llama_context * ctx_dft,
+        std::vector<uint8_t> & spec) {
+    auto it = active_states.find(id_slot);
+    if (it == active_states.end()) {
+        return false;
+    }
+
+    auto fail_clean = [&]() {
+        llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, -1, -1);
+        if (ctx_dft) {
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), id_slot, -1, -1);
+        }
+        return false;
+    };
+
+    auto & state = it->second;
+    if (!state.on_disk) {
+        const size_t size_tgt = state.data.main.size();
+        const size_t n_tgt = llama_state_seq_set_data_ext(
+                ctx_tgt, state.data.main.data(), size_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (n_tgt != size_tgt) {
+            SRV_ERR("failed to restore active target RAM state for slot %d (%zu/%zu bytes)\n",
+                    id_slot, n_tgt, size_tgt);
+            return fail_clean();
+        }
+        if (!state.data.drft.empty()) {
+            if (!ctx_dft) {
+                return fail_clean();
+            }
+            const size_t size_dft = state.data.drft.size();
+            const size_t n_dft = llama_state_seq_set_data_ext(
+                    ctx_dft, state.data.drft.data(), size_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+            if (n_dft != size_dft) {
+                SRV_ERR("failed to restore active draft RAM state for slot %d (%zu/%zu bytes)\n",
+                        id_slot, n_dft, size_dft);
+                return fail_clean();
+            }
+        }
+    } else {
+        llama_token marker_token = 0;
+        size_t n_token_count = 0;
+        const size_t n_tgt = llama_state_seq_load_file(
+                ctx_tgt, state.file_tgt.c_str(), id_slot, &marker_token, 1, &n_token_count);
+        if (n_tgt == 0 || n_token_count != 1) {
+            SRV_ERR("failed to restore active target disk state for slot %d\n", id_slot);
+            return fail_clean();
+        }
+        if (!state.file_dft.empty()) {
+            if (!ctx_dft) {
+                return fail_clean();
+            }
+            n_token_count = 0;
+            const size_t n_dft = llama_state_seq_load_file(
+                    ctx_dft, state.file_dft.c_str(), id_slot, &marker_token, 1, &n_token_count);
+            if (n_dft == 0 || n_token_count != 1) {
+                SRV_ERR("failed to restore active draft disk state for slot %d\n", id_slot);
+                return fail_clean();
+            }
+        }
+    }
+
+    spec = state.data.spec;
+    const bool was_disk = state.on_disk;
+    active_erase(id_slot);
+    SRV_INF("active KV slot %d restored from %s tier\n", id_slot, was_disk ? "disk" : "RAM");
+    return true;
 }
 
 void server_prompt_cache::store_remote(server_prompt_cache_state * state) {

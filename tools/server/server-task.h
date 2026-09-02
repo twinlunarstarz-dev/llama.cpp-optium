@@ -626,6 +626,19 @@ struct server_gpu_prompt_cache_state {
     llama_seq_id seq_id = -1;
 };
 
+// Exact state for a live request that has been temporarily removed from the
+// unified KV pool. RAM-resident target/draft bytes share --cache-ram with the
+// ordinary prompt cache; when they cannot fit, target/draft state spills to
+// files and only the small speculative sidecar remains in host memory.
+struct server_active_prompt_cache_state {
+    server_prompt_data data;
+    bool on_disk = false;
+    std::string file_tgt;
+    std::string file_dft;
+
+    size_t size() const { return data.size(); }
+};
+
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens, const std::string & lmcache_endpoint, const std::string & lmcache_namespace) {
         this->local_enabled = limit_size_mib != 0;
@@ -637,8 +650,12 @@ struct server_prompt_cache {
         }
     }
 
+    ~server_prompt_cache();
+
     std::list<server_prompt_cache_state> states;
     std::list<server_gpu_prompt_cache_state> gpu_states;
+    std::map<int32_t, server_active_prompt_cache_state> active_states;
+    std::string active_disk_dir;
 
     llama_context * gpu_ctx_tgt = nullptr;
     llama_context * gpu_ctx_dft = nullptr;
@@ -672,6 +689,14 @@ struct server_prompt_cache {
     void store_remote(server_prompt_cache_state * state);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+
+    // Active request residency. These methods preserve an exact sequence while
+    // the request object/sampler remains live, allowing another request to use
+    // the fixed-size unified KV pool without truncating either context.
+    bool active_store(int32_t id_slot, llama_context * ctx_tgt, llama_context * ctx_dft, const std::vector<uint8_t> & spec);
+    bool active_restore(int32_t id_slot, llama_context * ctx_tgt, llama_context * ctx_dft, std::vector<uint8_t> & spec);
+    bool active_has(int32_t id_slot) const;
+    void active_erase(int32_t id_slot);
 
     // Configure hidden sequence ids [seq_first, seq_first + seq_count) for a
     // unified-KV, GPU-resident inactive-agent tier.
