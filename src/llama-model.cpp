@@ -566,6 +566,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             if (is_dsv4) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             }
+            // Qwen3.5/Qwen3.8 vocabulary logits must be complete before TOP_K/sampling.
+            // Mirror only this final projection; internal layers remain tensor-parallel.
+            if (ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            }
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
         }
         if (std::regex_match(tensor_name, pattern_output_bias)) {
@@ -1947,6 +1952,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         return true;
     }
 
+    // without mmap, load non-host buffers first: their tensors go through a staging buffer, which is cheapest while the fewest weights are resident
+    if (!ml.use_mmap) {
+        std::stable_partition(ctx_buf_maps.begin(), ctx_buf_maps.end(), [](const auto & ctx_buf_map) {
+            const auto & buf_map = ctx_buf_map.second;
+            return !buf_map.empty() && !ggml_backend_buffer_is_host(buf_map.begin()->second);
+        });
+    }
+
     // load tensor data
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
@@ -2485,6 +2498,91 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
 
+    // Recurrent state has one R/S row per resident sequence.  Keep the
+    // logical sequence count (used by the server and state format) separate
+    // from the physical row count so large --parallel values do not
+    // preallocate an unsafe F32 state buffer.  The server suspends logical
+    // sequences whose rows are not resident.
+    const auto recurrent_rs_size = [&](const llama_memory_i::layer_filter_cb & filter) {
+        const uint32_t requested = std::max(1u, cparams.n_seq_max);
+        if (requested <= 1) {
+            return requested;
+        }
+
+        auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        const size_t row_bytes = ggml_row_size(GGML_TYPE_F32, hparams.n_embd_r()) +
+                                 ggml_row_size(GGML_TYPE_F32, hparams.n_embd_s());
+        const size_t row_plane_bytes = row_bytes * (1u + cparams.n_rs_seq);
+        std::map<ggml_backend_dev_t, size_t> bytes_per_row;
+        size_t total_per_row = 0;
+
+        for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+            if (filter && !filter(il)) {
+                continue;
+            }
+
+            total_per_row += row_plane_bytes;
+        }
+
+        if (cparams.offload_kqv) {
+            // During context construction dev_layer() and model.devices may
+            // still expose the Meta aggregate device. Enumerate physical GPU
+            // backends directly so the aggregate free-memory report cannot
+            // admit an unsafe recurrent allocation.
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                auto * dev = ggml_backend_dev_get(i);
+                const auto type = ggml_backend_dev_type(dev);
+                if (dev != nullptr &&
+                        (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU)) {
+                    bytes_per_row[dev] = total_per_row;
+                }
+            }
+            if (bytes_per_row.empty()) {
+                for (const auto & device : devices) {
+                    if (device.dev != nullptr) {
+                        bytes_per_row[device.dev] = total_per_row;
+                    }
+                }
+            }
+        } else if (cpu_dev != nullptr && total_per_row > 0) {
+            bytes_per_row[cpu_dev] = total_per_row;
+        }
+
+        uint32_t physical = requested;
+        for (const auto & [dev, per_row] : bytes_per_row) {
+            if (per_row == 0) {
+                continue;
+            }
+
+            size_t free_bytes = 0;
+            size_t total_bytes = 0;
+            ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
+            if (free_bytes == 0) {
+                continue;
+            }
+
+            // Keep a bounded reserve for graph workspaces, activations, and
+            // concurrent attention KV allocations.  One row is retained as a
+            // hard minimum; additional logical sequences are suspended when
+            // the physical pool is full.
+            const size_t reserve = std::min(
+                std::max(free_bytes / 8, size_t(256) * 1024 * 1024),
+                size_t(2) * 1024 * 1024 * 1024);
+            const size_t usable = free_bytes > reserve ? free_bytes - reserve : free_bytes / 2;
+            const uint32_t dev_physical = std::max<uint32_t>(1, usable / per_row);
+            physical = std::min(physical, dev_physical);
+
+            LLAMA_LOG_INFO("%s: recurrent state device %s free = %.2f GiB, per-row = %.2f GiB, physical rows = %u\n",
+                           __func__, ggml_backend_dev_name(dev),
+                           free_bytes / (1024.0 * 1024.0 * 1024.0),
+                           per_row / (1024.0 * 1024.0 * 1024.0), dev_physical);
+        }
+
+        LLAMA_LOG_INFO("%s: recurrent logical sequences = %u, resident physical rows = %u\n",
+                       __func__, requested, physical);
+        return physical;
+    };
+
     switch (arch) {
         // Models that need specific instantiation should be handled in the
         // switch statement
@@ -2719,7 +2817,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             GGML_TYPE_F32,
                             GGML_TYPE_F32,
                             cparams.offload_kqv,
-                            std::max((uint32_t) 1, cparams.n_seq_max),
+                            recurrent_rs_size(nullptr),
                             cparams.n_seq_max,
                             cparams.n_rs_seq,
                             nullptr);
@@ -2760,7 +2858,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_n_pad        */ 1,
                             /* recurrent_type_r  */ GGML_TYPE_F32,
                             /* recurrent_type_s  */ GGML_TYPE_F32,
-                            /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+                            /* recurrent_rs_size */ recurrent_rs_size(filter_recr),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
                             /* offload           */ cparams.offload_kqv,
@@ -2779,7 +2877,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_swa_type     */ hparams.swa_type,
                             /* recurrent_type_k  */ GGML_TYPE_F32,
                             /* recurrent_type_v  */ GGML_TYPE_F32,
-                            /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+                            /* recurrent_kv_size */ recurrent_rs_size(filter_recr),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
                             /* offload           */ cparams.offload_kqv,

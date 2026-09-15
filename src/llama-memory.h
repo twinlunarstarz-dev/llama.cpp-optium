@@ -6,6 +6,7 @@
 #include <map>
 #include <memory>
 #include <functional>
+#include <limits>
 
 struct llama_ubatch;
 
@@ -99,6 +100,13 @@ struct llama_memory_i {
 
     // getters
     virtual bool get_can_shift() const = 0;
+
+    // Maximum number of logical sequences whose recurrent state can be resident
+    // in the device buffers at once. Attention-only memories have no separate
+    // physical recurrent-state limit.
+    virtual uint32_t max_resident_sequences() const {
+        return std::numeric_limits<uint32_t>::max();
+    }
 
     //
     // ops

@@ -347,8 +347,29 @@ llama_context::llama_context(
     }
 
     if (!hparams.vocab_only) {
-        // GPU backends
-        for (const auto & dev : model.devices) {
+        // GPU backends. Shared-memory draft architectures (DFlash/DSpark)
+        // may reference target weights allocated on a GPU that is not selected
+        // for draft weights; keep that target backend in the draft scheduler.
+        std::vector<llama_device> context_devices = model.devices;
+        if (cparams.ctx_other != nullptr) {
+            const llama_model * model_other = llama_get_model(cparams.ctx_other);
+            for (const auto & dev : model_other->devices) {
+                // Tensor-split targets expose a logical Meta device.  It is a
+                // model-placement wrapper, not a compute backend; importing it
+                // into a DFlash/DSpark draft scheduler causes mixed CUDA/Meta
+                // graphs to abort during draft decode.
+                const std::string device_name = ggml_backend_dev_name(dev.dev);
+                if (device_name.find("Meta") != std::string::npos) {
+                    continue;
+                }
+                const bool already_present = std::any_of(context_devices.begin(), context_devices.end(),
+                    [&](const llama_device & current) { return current.dev == dev.dev; });
+                if (!already_present) {
+                    context_devices.push_back(dev);
+                }
+            }
+        }
+        for (const auto & dev : context_devices) {
             ggml_backend_t backend = ggml_backend_dev_init(dev.dev, nullptr);
             if (backend == nullptr) {
                 throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev.dev)));
@@ -616,7 +637,9 @@ void llama_context::sched_reserve() {
 
     const int64_t t_start_us = ggml_time_us();
 
-    const uint32_t n_seqs = cparams.n_seq_max;
+    const uint32_t n_seqs = std::min(
+        cparams.n_seq_max,
+        memory ? memory->max_resident_sequences() : cparams.n_seq_max);
     const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
     const size_t max_nodes = this->graph_max_nodes(n_tokens);
@@ -963,6 +986,10 @@ uint32_t llama_context::n_threads_batch() const {
     return cparams.n_threads_batch;
 }
 
+uint32_t llama_context::n_seq_max_resident() const {
+    return memory ? memory->max_resident_sequences() : cparams.n_seq_max;
+}
+
 llama_memory_t llama_context::get_memory() const {
     return memory.get();
 }
@@ -1009,7 +1036,9 @@ bool llama_context::memory_update(bool optimize) {
             throw std::runtime_error("failed to initialize memory context");
         }
 
-        const uint32_t n_seqs = cparams.n_seq_max;
+        const uint32_t n_seqs = std::min(
+            cparams.n_seq_max,
+            memory->max_resident_sequences());
         const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
         const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
@@ -1839,8 +1868,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const auto & hparams = model.hparams;
 
     const int64_t n_vocab = vocab.n_tokens();
-    const bool    mtp_embd = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && batch_inp.embd;
-    const int64_t n_embd  = mtp_embd ? hparams.n_embd_out() : hparams.n_embd_inp();
+    const bool    mtp_embd   = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && batch_inp.embd;
+    const bool    dflash_embd = model.arch == LLM_ARCH_DFLASH && batch_inp.embd;
+    const int64_t n_embd     = mtp_embd ? hparams.n_embd_out() : dflash_embd ? hparams.n_embd_inp_enc() : hparams.n_embd_inp();
 
     // when computing embeddings, all tokens are output
     const bool output_all   = cparams.embeddings;
@@ -3867,6 +3897,10 @@ uint32_t llama_n_ubatch(const llama_context * ctx) {
 
 uint32_t llama_n_seq_max(const llama_context * ctx) {
     return ctx->n_seq_max();
+}
+
+uint32_t llama_n_seq_max_resident(const llama_context * ctx) {
+    return ctx->n_seq_max_resident();
 }
 
 uint32_t llama_n_rs_seq(const llama_context * ctx) {

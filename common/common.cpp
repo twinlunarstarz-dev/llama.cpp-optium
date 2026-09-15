@@ -1655,30 +1655,41 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
 
     llama_memory_clear(mem, true);
 
-    // eval 2 tokens to check if the context is compatible
-    std::vector<llama_token> tmp;
-    tmp.push_back(0);
-    tmp.push_back(0);
-
-    int ret = llama_decode(ctx, llama_batch_get_one(tmp.data(), tmp.size()));
-    if (ret != 0) {
-        COM_ERR("llama_decode() failed: %d\n", ret);
-        res = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
-        goto done;
-    }
-
+    // Recurrent memory exposes bounded partial sequence removal directly.
+    // Avoid the two-token probe here: Meta-backed tensor graphs may reject
+    // the probe batch before the capability query can return.
     if (llama_n_rs_seq(ctx) > 0) {
         COM_TRC("%s", "the context supports bounded partial sequence removal\n");
         res = COMMON_CONTEXT_SEQ_RM_TYPE_RS;
-        goto done;
+    } else {
+        // eval 2 tokens to check if the context is compatible
+        std::vector<llama_token> tmp;
+        tmp.push_back(0);
+        tmp.push_back(0);
+
+        int ret = llama_decode(ctx, llama_batch_get_one(tmp.data(), tmp.size()));
+        if (ret != 0) {
+            COM_ERR("llama_decode() failed: %d\n", ret);
+            res = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+            goto done;
+        }
+
+        // try to remove the last tokens
+        if (llama_n_rs_seq(ctx) > 0) {
+            COM_TRC("%s", "the context supports bounded partial sequence removal\n");
+            res = COMMON_CONTEXT_SEQ_RM_TYPE_RS;
+            goto done;
+        }
+
+        // try to remove the last tokens
+        if (!llama_memory_seq_rm(mem, 0, 1, -1)) {
+            COM_TRC("%s", "the context does not support partial sequence removal\n");
+            res = COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+            goto done;
+        }
     }
 
-    // try to remove the last tokens
-    if (!llama_memory_seq_rm(mem, 0, 1, -1)) {
-        COM_TRC("%s", "the context does not support partial sequence removal\n");
-        res = COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
-        goto done;
-    }
+    goto done;
 
 done:
     llama_memory_clear(mem, true);
@@ -2346,12 +2357,13 @@ void common_prompt_checkpoint::update_pos(
     this->pos_max  = pos_max;
 }
 
-void common_prompt_checkpoint::update_tgt(
+bool common_prompt_checkpoint::update_tgt(
         llama_context * ctx,
         llama_seq_id seq_id,
         llama_state_seq_flags flags) {
     if (ctx == nullptr) {
-        return;
+        data_tgt.clear();
+        return true;
     }
 
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
@@ -2360,16 +2372,21 @@ void common_prompt_checkpoint::update_tgt(
 
     const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {
-        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
+        LOG_WRN("%s: checkpoint target capture failed: expected %zu, got %zu\n", __func__, ckpt_size, n);
+        data_tgt.clear();
+        return false;
     }
+
+    return true;
 }
 
-void common_prompt_checkpoint::update_dft(
+bool common_prompt_checkpoint::update_dft(
         llama_context * ctx,
         llama_seq_id seq_id,
         llama_state_seq_flags flags) {
     if (ctx == nullptr) {
-        return;
+        data_dft.clear();
+        return true;
     }
 
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
@@ -2378,44 +2395,46 @@ void common_prompt_checkpoint::update_dft(
 
     const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags);
     if (n != ckpt_size) {
-        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
+        LOG_WRN("%s: checkpoint draft capture failed: expected %zu, got %zu\n", __func__, ckpt_size, n);
+        data_dft.clear();
+        return false;
     }
+
+    return true;
 }
 
-void common_prompt_checkpoint::load_tgt(
+bool common_prompt_checkpoint::load_tgt(
         llama_context * ctx,
         llama_seq_id seq_id,
         llama_state_seq_flags flags) const {
-    if (ctx == nullptr) {
-        return;
-    }
-
-    if (data_tgt.empty()) {
-        return;
+    if (ctx == nullptr || data_tgt.empty()) {
+        return true;
     }
 
     const size_t n = llama_state_seq_set_data_ext(ctx, data_tgt.data(), data_tgt.size(), seq_id, flags);
     if (n != data_tgt.size()) {
-        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", data_tgt.size(), n);
+        LOG_WRN("%s: checkpoint target restore failed: expected %zu, got %zu; caller must recompute\n", __func__, data_tgt.size(), n);
+        return false;
     }
+
+    return true;
 }
 
-void common_prompt_checkpoint::load_dft(
+bool common_prompt_checkpoint::load_dft(
         llama_context * ctx,
         llama_seq_id seq_id,
         llama_state_seq_flags flags) const {
-    if (ctx == nullptr) {
-        return;
-    }
-
-    if (data_dft.empty()) {
-        return;
+    if (ctx == nullptr || data_dft.empty()) {
+        return true;
     }
 
     const size_t n = llama_state_seq_set_data_ext(ctx, data_dft.data(), data_dft.size(), seq_id, flags);
     if (n != data_dft.size()) {
-        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", data_dft.size(), n);
+        LOG_WRN("%s: checkpoint draft restore failed: expected %zu, got %zu; caller must recompute\n", __func__, data_dft.size(), n);
+        return false;
     }
+
+    return true;
 }
 
 void common_prompt_checkpoint::clear_tgt() {

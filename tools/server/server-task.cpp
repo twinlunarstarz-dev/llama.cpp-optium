@@ -11,9 +11,173 @@
 #include "server-common.h"
 
 #include <cstring>
+#include <cstdlib>
+#include <cerrno>
 #include <filesystem>
+#include <fstream>
+#include <fcntl.h>
 #include <limits>
 #include <sstream>
+#include <unistd.h>
+
+namespace {
+
+constexpr size_t KV_SWAP_DEFAULT_MAX_MIB       = 48ull * 1024ull;
+constexpr size_t KV_SWAP_DEFAULT_MIN_FREE_MIB  = 8ull * 1024ull;
+constexpr size_t KV_SWAP_DEFAULT_MAX_FILES     = 128;
+
+size_t kv_swap_env_size(const char * name, size_t fallback) {
+    const char * value = std::getenv(name);
+    if (!value || !value[0]) {
+        return fallback;
+    }
+
+    errno = 0;
+    char * end = nullptr;
+    const unsigned long long parsed = std::strtoull(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0') {
+        SRV_WRN("invalid %s=%s; using default %zu\n", name, value, fallback);
+        return fallback;
+    }
+
+    return parsed > std::numeric_limits<size_t>::max() ? fallback : static_cast<size_t>(parsed);
+}
+
+size_t kv_swap_tree_bytes(const std::filesystem::path & root, size_t * file_count = nullptr) {
+    size_t bytes = 0;
+    size_t files = 0;
+    std::error_code ec;
+    if (!std::filesystem::exists(root, ec)) {
+        if (file_count) {
+            *file_count = 0;
+        }
+        return 0;
+    }
+
+    for (std::filesystem::recursive_directory_iterator it(root,
+            std::filesystem::directory_options::skip_permission_denied, ec), end;
+            it != end && !ec; it.increment(ec)) {
+        if (!it->is_regular_file(ec)) {
+            continue;
+        }
+        const uintmax_t size = it->file_size(ec);
+        if (ec || size > std::numeric_limits<size_t>::max() - bytes) {
+            bytes = std::numeric_limits<size_t>::max();
+            continue;
+        }
+        bytes += static_cast<size_t>(size);
+        ++files;
+    }
+
+    if (file_count) {
+        *file_count = files;
+    }
+    return bytes;
+}
+
+bool kv_swap_sync_file(const std::filesystem::path & path) {
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return false;
+    }
+    const bool ok = ::fsync(fd) == 0;
+    ::close(fd);
+    return ok;
+}
+
+bool kv_swap_sync_dir(const std::filesystem::path & path) {
+    const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) {
+        return false;
+    }
+    const bool ok = ::fsync(fd) == 0;
+    ::close(fd);
+    return ok;
+}
+
+bool kv_swap_admit(const std::filesystem::path & root,
+        size_t bytes_needed, size_t bytes_replaced, size_t files_replaced, size_t files_needed) {
+    const size_t max_mib = kv_swap_env_size("LLAMA_SERVER_KV_SWAP_MAX_MIB", KV_SWAP_DEFAULT_MAX_MIB);
+    const size_t min_free_mib = kv_swap_env_size("LLAMA_SERVER_KV_SWAP_MIN_FREE_MIB", KV_SWAP_DEFAULT_MIN_FREE_MIB);
+    const size_t max_files = kv_swap_env_size("LLAMA_SERVER_KV_SWAP_MAX_FILES", KV_SWAP_DEFAULT_MAX_FILES);
+    const size_t max_bytes = max_mib > std::numeric_limits<size_t>::max() / (1024ull * 1024ull)
+        ? std::numeric_limits<size_t>::max() : max_mib * 1024ull * 1024ull;
+    const size_t min_free_bytes = min_free_mib > std::numeric_limits<size_t>::max() / (1024ull * 1024ull)
+        ? std::numeric_limits<size_t>::max() : min_free_mib * 1024ull * 1024ull;
+
+    size_t file_count = 0;
+    const size_t used = kv_swap_tree_bytes(root, &file_count);
+    const size_t used_without_replaced = used >= bytes_replaced ? used - bytes_replaced : 0;
+    const size_t files_without_replaced = file_count >= files_replaced ? file_count - files_replaced : 0;
+
+    if (max_bytes > 0 && (bytes_needed > max_bytes || used_without_replaced > max_bytes - bytes_needed)) {
+        SRV_WRN("KV disk admission denied: need %.3f MiB, quota %.3f MiB, used %.3f MiB\n",
+                bytes_needed / (1024.0 * 1024.0), max_bytes / (1024.0 * 1024.0), used / (1024.0 * 1024.0));
+        return false;
+    }
+    if (max_files > 0 && (files_without_replaced > max_files || files_needed > max_files - files_without_replaced)) {
+        SRV_WRN("KV disk admission denied: need %zu files, quota %zu, used %zu files\n",
+                files_needed, max_files, file_count);
+        return false;
+    }
+
+    std::error_code ec;
+    const auto space = std::filesystem::space(root, ec);
+    if (ec || space.available < bytes_needed || space.available - bytes_needed < min_free_bytes) {
+        SRV_WRN("KV disk admission denied: need %.3f MiB plus %.3f MiB free headroom (available %.3f MiB)\n",
+                bytes_needed / (1024.0 * 1024.0), min_free_bytes / (1024.0 * 1024.0),
+                ec ? 0.0 : space.available / (1024.0 * 1024.0));
+        return false;
+    }
+
+    return true;
+}
+
+bool kv_swap_write_commit(const std::filesystem::path & stage, size_t target_bytes, size_t draft_bytes) {
+    const auto commit = stage / ".commit";
+    std::ofstream out(commit, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        return false;
+    }
+    out << "LLAMA_KV_SWAP_V1\n" << target_bytes << "\n" << draft_bytes << "\n";
+    out.flush();
+    if (!out) {
+        return false;
+    }
+    out.close();
+    return kv_swap_sync_file(commit) && kv_swap_sync_dir(stage);
+}
+
+bool kv_swap_verify_commit(const server_active_prompt_cache_state & state) {
+    if (state.disk_dir.empty() || state.file_tgt.empty()) {
+        return false;
+    }
+
+    std::ifstream in(std::filesystem::path(state.disk_dir) / ".commit", std::ios::binary);
+    std::string magic;
+    size_t target_bytes = 0;
+    size_t draft_bytes = 0;
+    if (!(in >> magic >> target_bytes >> draft_bytes) || magic != "LLAMA_KV_SWAP_V1") {
+        return false;
+    }
+
+    std::error_code ec;
+    const auto target_size = std::filesystem::file_size(state.file_tgt, ec);
+    if (ec || target_size != target_bytes) {
+        return false;
+    }
+    if (!state.file_dft.empty()) {
+        const auto draft_size = std::filesystem::file_size(state.file_dft, ec);
+        if (ec || draft_size != draft_bytes) {
+            return false;
+        }
+    } else if (draft_bytes != 0) {
+        return false;
+    }
+    return true;
+}
+
+} // namespace
 
 //
 // task_params
@@ -1810,6 +1974,198 @@ server_prompt_cache::~server_prompt_cache() {
     }
 }
 
+void server_prompt_cache::configure_tiered(size_t max_entries) {
+    tiered_cache_entries = max_entries;
+    if (max_entries > 1 && limit_tokens > 0 && limit_tokens <= std::numeric_limits<size_t>::max() / max_entries) {
+        limit_tokens *= max_entries;
+    }
+    SRV_INF("tiered agent cache enabled: %zu reusable lower-tier entries (active KV keeps the full slot context)\n",
+            tiered_cache_entries);
+}
+
+void server_prompt_cache::erase_state(std::list<server_prompt_cache_state>::iterator it) {
+    if (it == states.end()) {
+        return;
+    }
+    if (it->on_disk) {
+        std::error_code ec;
+        if (!it->disk_dir.empty()) {
+            std::filesystem::remove_all(it->disk_dir, ec);
+        } else {
+            if (!it->file_tgt.empty()) {
+                std::filesystem::remove(it->file_tgt, ec);
+                ec.clear();
+            }
+            if (!it->file_dft.empty()) {
+                std::filesystem::remove(it->file_dft, ec);
+            }
+        }
+    }
+    states.erase(it);
+}
+
+bool server_prompt_cache::store_disk(
+        const server_prompt & prompt,
+        const std::vector<uint8_t> & spec,
+        llama_context * ctx_tgt,
+        llama_context * ctx_dft,
+        int32_t id_slot) {
+    GGML_ASSERT(ctx_tgt);
+
+    const size_t size_tgt = llama_state_seq_get_size_ext(ctx_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+    const size_t size_dft = ctx_dft
+        ? llama_state_seq_get_size_ext(ctx_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE)
+        : 0;
+    if (size_tgt == 0) {
+        SRV_WRN(" - refusing to spill an empty prompt state for slot %d\n", id_slot);
+        return false;
+    }
+
+    try {
+        if (active_disk_dir.empty()) {
+            const char * env = std::getenv("LLAMA_SERVER_KV_SWAP_DIR");
+            const std::filesystem::path base = env && env[0]
+                ? std::filesystem::path(env)
+                : std::filesystem::path("/tmp/.kv-cache");
+            std::ostringstream name;
+            name << "llama-kv-swap-" << static_cast<const void *>(this);
+            active_disk_dir = (base / name.str()).string();
+            std::filesystem::create_directories(active_disk_dir);
+            SRV_INF("prompt cache disk tier: %s (quota %.3f GiB, min free %.3f GiB)\n",
+                    active_disk_dir.c_str(),
+                    kv_swap_env_size("LLAMA_SERVER_KV_SWAP_MAX_MIB", KV_SWAP_DEFAULT_MAX_MIB) / 1024.0,
+                    kv_swap_env_size("LLAMA_SERVER_KV_SWAP_MIN_FREE_MIB", KV_SWAP_DEFAULT_MIN_FREE_MIB) / 1024.0);
+        }
+
+        auto exact = [&]() {
+            return std::find_if(states.begin(), states.end(), [&prompt](const server_prompt_cache_state & state) {
+                return state.prompt.tokens.size() == prompt.tokens.size() &&
+                       static_cast<size_t>(state.prompt.tokens.get_common_prefix(prompt.tokens)) == prompt.tokens.size();
+            });
+        };
+
+        auto old = exact();
+        size_t old_disk_bytes = 0;
+        size_t old_disk_files = 0;
+        if (old != states.end() && old->on_disk && !old->disk_dir.empty()) {
+            old_disk_bytes = kv_swap_tree_bytes(old->disk_dir, &old_disk_files);
+        }
+
+        const size_t disk_need = size_tgt + size_dft + spec.size() + 8192;
+        // target + commit, plus draft when present.  Stage files are not
+        // published and are removed on every failure path.
+        const size_t disk_files = size_dft > 0 ? 4 : 3;
+        while (!kv_swap_admit(active_disk_dir, disk_need, old_disk_bytes, old_disk_files, disk_files)) {
+            // Disk state is a reusable cache, never the only copy of a live
+            // request.  Evict the oldest committed disk entry and retry so a
+            // 4 GiB quota cannot turn a new request into a context error.
+            auto victim = std::find_if(states.begin(), states.end(), [this, &old](const server_prompt_cache_state & state) {
+                return state.on_disk && &state != (old == states.end() ? nullptr : &*old);
+            });
+            if (victim == states.end()) {
+                SRV_WRN(" - prompt cache disk tier is full; skipping reusable state for slot %d\n", id_slot);
+                return false;
+            }
+            SRV_WRN(" - evicting oldest disk prompt cache entry (%zu tokens) to admit slot %d\n",
+                    victim->prompt.tokens.size(), id_slot);
+            erase_state(victim);
+            old = exact();
+            old_disk_bytes = 0;
+            old_disk_files = 0;
+            if (old != states.end() && old->on_disk && !old->disk_dir.empty()) {
+                old_disk_bytes = kv_swap_tree_bytes(old->disk_dir, &old_disk_files);
+            }
+        }
+
+        const auto root = std::filesystem::path(active_disk_dir);
+        std::filesystem::path stage;
+        for (uint64_t generation = 0; ; ++generation) {
+            stage = root / (".stage-cache-" + std::to_string(id_slot) + "-" +
+                    std::to_string(generation) + "-" +
+                    std::to_string(static_cast<unsigned long long>(::getpid())));
+            std::error_code ec;
+            if (std::filesystem::create_directory(stage, ec)) {
+                break;
+            }
+            if (generation == std::numeric_limits<uint64_t>::max()) {
+                SRV_ERR("could not allocate a unique prompt cache disk generation for slot %d\n", id_slot);
+                return false;
+            }
+        }
+
+        const auto target_tmp = stage / "target.bin.tmp";
+        const auto draft_tmp = stage / "draft.bin.tmp";
+        const auto target = stage / "target.bin";
+        const auto draft = stage / "draft.bin";
+        const llama_token marker_token = 0;
+        const size_t n_tgt = llama_state_seq_save_file(ctx_tgt, target_tmp.c_str(), id_slot, &marker_token, 1);
+        if (n_tgt == 0 || !std::filesystem::exists(target_tmp) || !kv_swap_sync_file(target_tmp)) {
+            SRV_ERR("failed to spill prompt target state for slot %d to disk\n", id_slot);
+            std::error_code ec;
+            std::filesystem::remove_all(stage, ec);
+            return false;
+        }
+
+        size_t n_dft = 0;
+        if (ctx_dft && size_dft > 0) {
+            n_dft = llama_state_seq_save_file(ctx_dft, draft_tmp.c_str(), id_slot, &marker_token, 1);
+            if (n_dft == 0 || !std::filesystem::exists(draft_tmp) || !kv_swap_sync_file(draft_tmp)) {
+                SRV_ERR("failed to spill prompt draft state for slot %d to disk\n", id_slot);
+                std::error_code ec;
+                std::filesystem::remove_all(stage, ec);
+                return false;
+            }
+        }
+
+        std::error_code ec;
+        std::filesystem::rename(target_tmp, target, ec);
+        if (ec || (n_dft > 0 && (std::filesystem::rename(draft_tmp, draft, ec), ec))) {
+            SRV_ERR("failed to publish prompt cache disk generation for slot %d: %s\n", id_slot, ec.message().c_str());
+            ec.clear();
+            std::filesystem::remove_all(stage, ec);
+            return false;
+        }
+
+        server_active_prompt_cache_state verify_state;
+        verify_state.on_disk = true;
+        verify_state.disk_dir = stage.string();
+        verify_state.file_tgt = target.string();
+        verify_state.file_dft = n_dft > 0 ? draft.string() : std::string();
+        if (!kv_swap_write_commit(stage, n_tgt, n_dft) || !kv_swap_verify_commit(verify_state)) {
+            SRV_ERR("prompt cache disk commit validation failed for slot %d\n", id_slot);
+            ec.clear();
+            std::filesystem::remove_all(stage, ec);
+            return false;
+        }
+
+        auto old_after_commit = exact();
+        if (old_after_commit != states.end()) {
+            erase_state(old_after_commit);
+        }
+        server_prompt_cache_state state;
+        state.prompt = prompt.clone();
+        state.data.spec = spec;
+        state.on_disk = true;
+        state.disk_dir = stage.string();
+        state.file_tgt = target.string();
+        state.file_dft = n_dft > 0 ? draft.string() : std::string();
+        states.push_back(std::move(state));
+
+        if (tiered_cache_entries > 0) {
+            while (states.size() > tiered_cache_entries) {
+                erase_state(states.begin());
+            }
+        }
+
+        SRV_INF(" - spilled %d-token prompt state to disk: target %.3f MiB, draft %.3f MiB\n",
+                prompt.n_tokens(), n_tgt / (1024.0 * 1024.0), n_dft / (1024.0 * 1024.0));
+        return true;
+    } catch (const std::exception & e) {
+        SRV_ERR("prompt cache disk spill failed for slot %d: %s\n", id_slot, e.what());
+        return false;
+    }
+}
+
 size_t server_prompt_cache::size() const {
     size_t res = 0;
 
@@ -1842,7 +2198,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         if (cur_lcp_len == (int) prompt.tokens.size() &&
                 it->prompt.tokens.size() == prompt.tokens.size()) {
             SRV_TRC(" - replacing exact cached prompt with length %d\n", cur_lcp_len);
-            states.erase(it);
+            erase_state(it);
             break;
         }
     }
@@ -1870,7 +2226,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
                     states.front().size() / (1024.0 * 1024.0));
 
-            states.pop_front();
+            erase_state(states.begin());
         }
         if (size() + state_size_new > limit_size) {
             SRV_TRC("%s", " - prompt cache RAM is reserved by active suspended state; skipping reusable entry\n");
@@ -1897,17 +2253,17 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         return nullptr;
     }
 
-    states.push_back({
-        /*.prompt =*/ {
-            /*.tokens      =*/ prompt.tokens.clone(),
-            /*.checkpoints =*/ prompt.checkpoints,
-        },
-        /*.data   =*/ {
-            /*.main =*/ std::move(state_data_tgt),
-            /*.drft =*/ std::move(state_data_dft),
-            /*.spec =*/ {},
-        },
-    });
+    server_prompt_cache_state state;
+    state.prompt = server_prompt {
+        prompt.tokens.clone(),
+        prompt.checkpoints,
+    };
+    state.data = server_prompt_data {
+        std::move(state_data_tgt),
+        std::move(state_data_dft),
+        {},
+    };
+    states.push_back(std::move(state));
 
     return &states.back();
 }
@@ -1923,12 +2279,16 @@ void server_prompt_cache::active_erase(int32_t id_slot) {
     }
     if (it->second.on_disk) {
         std::error_code ec;
-        if (!it->second.file_tgt.empty()) {
-            std::filesystem::remove(it->second.file_tgt, ec);
-            ec.clear();
-        }
-        if (!it->second.file_dft.empty()) {
-            std::filesystem::remove(it->second.file_dft, ec);
+        if (!it->second.disk_dir.empty()) {
+            std::filesystem::remove_all(it->second.disk_dir, ec);
+        } else {
+            if (!it->second.file_tgt.empty()) {
+                std::filesystem::remove(it->second.file_tgt, ec);
+                ec.clear();
+            }
+            if (!it->second.file_dft.empty()) {
+                std::filesystem::remove(it->second.file_dft, ec);
+            }
         }
     }
     active_states.erase(it);
@@ -1940,7 +2300,13 @@ bool server_prompt_cache::active_store(
         llama_context * ctx_dft,
         const std::vector<uint8_t> & spec) {
     GGML_ASSERT(ctx_tgt);
-    active_erase(id_slot);
+
+    auto old_active = active_states.find(id_slot);
+    size_t old_disk_bytes = 0;
+    size_t old_disk_files = 0;
+    if (old_active != active_states.end() && old_active->second.on_disk && !old_active->second.disk_dir.empty()) {
+        old_disk_bytes = kv_swap_tree_bytes(old_active->second.disk_dir, &old_disk_files);
+    }
 
     const size_t size_tgt = llama_state_seq_get_size_ext(ctx_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
     const size_t size_dft = ctx_dft
@@ -1953,7 +2319,7 @@ bool server_prompt_cache::active_store(
         while (!states.empty() && size() + ram_need > limit_size) {
             SRV_TRC(" - evicting reusable prompt cache entry for active KV suspension (%.3f MiB)\n",
                     states.front().size() / (1024.0 * 1024.0));
-            states.pop_front();
+            erase_state(states.begin());
         }
         use_ram = ram_need <= limit_size && size() <= limit_size - ram_need;
     }
@@ -1989,58 +2355,109 @@ bool server_prompt_cache::active_store(
                 return false;
             }
         }
+        active_erase(id_slot);
         active_states.emplace(id_slot, std::move(state));
         SRV_INF("active KV slot %d suspended to RAM: %.3f MiB\n",
                 id_slot, ram_need / (1024.0 * 1024.0));
         return true;
     }
 
-    // Disk is the unbounded correctness tier. It is used when --cache-ram is
-    // disabled/full or when one exact live state is larger than that budget.
-    // The OS page cache remains free to keep hot pages in RAM, but it can reclaim
-    // them under pressure, so this does not create another fixed host-RAM budget.
+    // Disk is the correctness tier when RAM is full or disabled.  Build a
+    // complete generation in a private directory, fsync every file, and publish
+    // it with a commit marker.  The previous generation stays restorable until
+    // the new generation has passed all checks.
     try {
         if (active_disk_dir.empty()) {
-            const char * env = getenv("LLAMA_SERVER_KV_SWAP_DIR");
-            std::filesystem::path base = env && env[0]
+            const char * env = std::getenv("LLAMA_SERVER_KV_SWAP_DIR");
+            const std::filesystem::path base = env && env[0]
                 ? std::filesystem::path(env)
-                : std::filesystem::temp_directory_path();
+                : std::filesystem::path("/tmp/.kv-cache");
             std::ostringstream name;
             name << "llama-kv-swap-" << static_cast<const void *>(this);
             active_disk_dir = (base / name.str()).string();
             std::filesystem::create_directories(active_disk_dir);
-            SRV_INF("active KV disk tier: %s\n", active_disk_dir.c_str());
+            SRV_INF("active KV disk tier: %s (quota %.3f GiB, min free %.3f GiB)\n",
+                    active_disk_dir.c_str(),
+                    kv_swap_env_size("LLAMA_SERVER_KV_SWAP_MAX_MIB", KV_SWAP_DEFAULT_MAX_MIB) / 1024.0,
+                    kv_swap_env_size("LLAMA_SERVER_KV_SWAP_MIN_FREE_MIB", KV_SWAP_DEFAULT_MIN_FREE_MIB) / 1024.0);
         }
 
-        const auto base = std::filesystem::path(active_disk_dir) /
-            ("slot-" + std::to_string(id_slot));
-        state.file_tgt = base.string() + ".target.bin";
-        state.file_dft = size_dft > 0 ? base.string() + ".draft.bin" : std::string();
-
-        const llama_token marker_token = 0;
-        const size_t n_tgt = llama_state_seq_save_file(
-                ctx_tgt, state.file_tgt.c_str(), id_slot, &marker_token, 1);
-        if (n_tgt == 0) {
-            SRV_ERR("failed to spill active target state for slot %d to disk\n", id_slot);
-            std::error_code ec;
-            std::filesystem::remove(state.file_tgt, ec);
+        const size_t disk_need = size_tgt + size_dft + spec.size() + 8192;
+        const size_t disk_files = size_dft > 0 ? 4 : 3;
+        if (!kv_swap_admit(active_disk_dir, disk_need, old_disk_bytes, old_disk_files, disk_files)) {
+            SRV_WRN("active KV disk admission denied for slot %d; retaining active state\n", id_slot);
             return false;
         }
-        if (ctx_dft && size_dft > 0) {
-            const size_t n_dft = llama_state_seq_save_file(
-                    ctx_dft, state.file_dft.c_str(), id_slot, &marker_token, 1);
-            if (n_dft == 0) {
-                SRV_ERR("failed to spill active draft state for slot %d to disk\n", id_slot);
-                std::error_code ec;
-                std::filesystem::remove(state.file_tgt, ec);
-                std::filesystem::remove(state.file_dft, ec);
+
+        const auto root = std::filesystem::path(active_disk_dir);
+        std::filesystem::path stage;
+        for (uint64_t generation = 0; ; ++generation) {
+            stage = root / (".stage-slot-" + std::to_string(id_slot) + "-" + std::to_string(generation) +
+                    "-" + std::to_string(static_cast<unsigned long long>(::getpid())));
+            std::error_code ec;
+            if (std::filesystem::create_directory(stage, ec)) {
+                break;
+            }
+            if (generation == std::numeric_limits<uint64_t>::max()) {
+                SRV_ERR("could not allocate a unique KV disk generation for slot %d\n", id_slot);
                 return false;
             }
         }
+
+        const auto target_tmp = stage / "target.bin.tmp";
+        const auto draft_tmp = stage / "draft.bin.tmp";
+        const auto target = stage / "target.bin";
+        const auto draft = stage / "draft.bin";
+        const llama_token marker_token = 0;
+        const size_t n_tgt = llama_state_seq_save_file(
+                ctx_tgt, target_tmp.c_str(), id_slot, &marker_token, 1);
+        if (n_tgt == 0 || !std::filesystem::exists(target_tmp) || !kv_swap_sync_file(target_tmp)) {
+            SRV_ERR("failed to spill active target state for slot %d to disk\n", id_slot);
+            std::error_code ec;
+            std::filesystem::remove_all(stage, ec);
+            return false;
+        }
+
+        size_t n_dft = 0;
+        if (ctx_dft && size_dft > 0) {
+            n_dft = llama_state_seq_save_file(
+                    ctx_dft, draft_tmp.c_str(), id_slot, &marker_token, 1);
+            if (n_dft == 0 || !std::filesystem::exists(draft_tmp) || !kv_swap_sync_file(draft_tmp)) {
+                SRV_ERR("failed to spill active draft state for slot %d to disk\n", id_slot);
+                std::error_code ec;
+                std::filesystem::remove_all(stage, ec);
+                return false;
+            }
+        }
+
+        std::error_code ec;
+        std::filesystem::rename(target_tmp, target, ec);
+        if (ec || (n_dft > 0 && (std::filesystem::rename(draft_tmp, draft, ec), ec))) {
+            SRV_ERR("failed to publish KV disk generation for slot %d: %s\n", id_slot, ec.message().c_str());
+            ec.clear();
+            std::filesystem::remove_all(stage, ec);
+            return false;
+        }
+        server_active_prompt_cache_state verify_state;
+        verify_state.on_disk = true;
+        verify_state.disk_dir = stage.string();
+        verify_state.file_tgt = target.string();
+        verify_state.file_dft = n_dft > 0 ? draft.string() : std::string();
+        if (!kv_swap_write_commit(stage, n_tgt, n_dft) || !kv_swap_verify_commit(verify_state)) {
+            SRV_ERR("KV disk commit validation failed for slot %d\n", id_slot);
+            ec.clear();
+            std::filesystem::remove_all(stage, ec);
+            return false;
+        }
         state.on_disk = true;
+        state.disk_dir = stage.string();
+        state.file_tgt = target.string();
+        state.file_dft = n_dft > 0 ? draft.string() : std::string();
+        active_erase(id_slot);
         active_states.emplace(id_slot, std::move(state));
-        SRV_INF("active KV slot %d suspended to disk (state %.3f MiB exceeds/avoids RAM tier)\n",
-                id_slot, ram_need / (1024.0 * 1024.0));
+        SRV_INF("active KV slot %d suspended to disk: target %.3f MiB, draft %.3f MiB, dir=%s\n",
+                id_slot, n_tgt / (1024.0 * 1024.0), n_dft / (1024.0 * 1024.0),
+                active_states.at(id_slot).disk_dir.c_str());
         return true;
     } catch (const std::exception & e) {
         SRV_ERR("active KV disk spill failed for slot %d: %s\n", id_slot, e.what());
@@ -2090,6 +2507,11 @@ bool server_prompt_cache::active_restore(
             }
         }
     } else {
+        if (!kv_swap_verify_commit(state)) {
+            SRV_ERR("refusing to restore incomplete/corrupt active KV disk generation for slot %d (dir=%s)\n",
+                    id_slot, state.disk_dir.c_str());
+            return fail_clean();
+        }
         llama_token marker_token = 0;
         size_t n_token_count = 0;
         const size_t n_tgt = llama_state_seq_load_file(
@@ -2119,13 +2541,16 @@ bool server_prompt_cache::active_restore(
     return true;
 }
 
-void server_prompt_cache::store_remote(server_prompt_cache_state * state) {
+bool server_prompt_cache::store_remote(server_prompt_cache_state * state) {
+    bool stored = local_enabled;
+
     if (lmcache && !state->prompt.tokens.has_mtmd) {
         std::string error;
         const llama_tokens & tokens = state->prompt.tokens.get_tokens();
         if (!lmcache->put(lmcache_key(lmcache_namespace, tokens), lmcache_serialize(*state), error)) {
             SRV_WRN("failed to store prompt state in LMCache: %s\n", error.c_str());
         } else {
+            stored = true;
             SRV_TRC(" - stored %zu-token prompt state in LMCache\n", tokens.size());
         }
     }
@@ -2138,6 +2563,8 @@ void server_prompt_cache::store_remote(server_prompt_cache_state * state) {
             }
         }
     }
+
+    return stored;
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
@@ -2225,32 +2652,59 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
-        {
+        bool restored = true;
+        if (it_best->on_disk) {
+            server_active_prompt_cache_state verify_state;
+            verify_state.on_disk = true;
+            verify_state.disk_dir = it_best->disk_dir;
+            verify_state.file_tgt = it_best->file_tgt;
+            verify_state.file_dft = it_best->file_dft;
+            if (!kv_swap_verify_commit(verify_state)) {
+                SRV_ERR("%s", "refusing to restore incomplete/corrupt prompt cache disk generation\n");
+                restored = false;
+            } else {
+                llama_token marker_token = 0;
+                size_t n_token_count = 0;
+                const size_t n_tgt = llama_state_seq_load_file(
+                        ctx_tgt, it_best->file_tgt.c_str(), id_slot, &marker_token, 1, &n_token_count);
+                restored = n_tgt > 0 && n_token_count == 1;
+                if (restored && !it_best->file_dft.empty()) {
+                    if (!ctx_dft) {
+                        restored = false;
+                    } else {
+                        n_token_count = 0;
+                        const size_t n_dft = llama_state_seq_load_file(
+                                ctx_dft, it_best->file_dft.c_str(), id_slot, &marker_token, 1, &n_token_count);
+                        restored = n_dft > 0 && n_token_count == 1;
+                    }
+                }
+            }
+        } else {
             const auto & data = it_best->data.main;
-
             const size_t size = data.size();
             const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
-            if (n != size) {
-                SRV_ERR("failed to restore state with size %zu\n", size);
-
-                return false;
+            restored = n == size;
+            if (restored && !it_best->data.drft.empty()) {
+                if (!ctx_dft) {
+                    restored = false;
+                } else {
+                    const auto & draft_data = it_best->data.drft;
+                    const size_t draft_size = draft_data.size();
+                    const size_t n_dft = llama_state_seq_set_data_ext(
+                            ctx_dft, draft_data.data(), draft_size, id_slot, 0);
+                    restored = n_dft == draft_size;
+                }
             }
         }
 
-        {
-            const auto & data = it_best->data.drft;
-
-            if (!data.empty()) {
-                GGML_ASSERT(ctx_dft);
-
-                const size_t size = data.size();
-                const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
-                if (n != size) {
-                    SRV_WRN("failed to restore state with size %zu\n", size);
-
-                    return false;
-                }
+        if (!restored) {
+            SRV_WRN("%s", "discarding unusable prompt cache entry and recomputing the prompt\n");
+            llama_memory_seq_rm(llama_get_memory(ctx_tgt), id_slot, -1, -1);
+            if (ctx_dft) {
+                llama_memory_seq_rm(llama_get_memory(ctx_dft), id_slot, -1, -1);
             }
+            erase_state(it_best);
+            return false;
         }
 
         prompt = it_best->prompt.clone();
@@ -2290,8 +2744,9 @@ bool server_prompt_cache::gpu_demote_lru() {
     const llama_seq_id seq_id = it->seq_id;
 
     // Preserve the hidden entry in the existing level-2 cache when one exists.
-    // If RAM/LMCache is disabled, dropping the oldest hidden entry is still the
-    // correct response to device KV pressure and lets decode make progress.
+    // A successful lower-tier commit is required before the GPU ownership can be
+    // removed.  If RAM/LMCache is unavailable or serialization fails, retain the
+    // GPU branch and let admission apply backpressure instead of losing state.
     if (local_enabled || lmcache) {
         const size_t size_tgt = llama_state_seq_get_size_ext(gpu_ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t size_dft = gpu_ctx_dft
@@ -2299,29 +2754,42 @@ bool server_prompt_cache::gpu_demote_lru() {
             : 0;
 
         if (auto * dst = alloc(it->prompt, size_tgt, size_dft)) {
+            auto discard = [this, dst]() {
+                for (auto entry = states.begin(); entry != states.end(); ++entry) {
+                    if (&*entry == dst) {
+                        states.erase(entry);
+                        return;
+                    }
+                }
+            };
+
             const size_t n_tgt = llama_state_seq_get_data_ext(
                     gpu_ctx_tgt, dst->data.main.data(), size_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
-            if (n_tgt == size_tgt) {
-                bool ok = true;
-                if (gpu_ctx_dft && size_dft > 0) {
-                    const size_t n_dft = llama_state_seq_get_data_ext(
-                            gpu_ctx_dft, dst->data.drft.data(), size_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
-                    ok = n_dft == size_dft;
-                }
-                if (ok) {
-                    dst->data.spec = it->spec;
-                    store_remote(dst);
-                    SRV_TRC(" - demoted %d-token GPU agent state from seq %d to level-2 cache\n",
-                            it->prompt.n_tokens(), (int) seq_id);
-                } else {
-                    SRV_WRN(" - failed to serialize hidden GPU agent seq %d; dropping it\n", (int) seq_id);
-                }
+            bool ok = n_tgt == size_tgt;
+            if (ok && gpu_ctx_dft && size_dft > 0) {
+                const size_t n_dft = llama_state_seq_get_data_ext(
+                        gpu_ctx_dft, dst->data.drft.data(), size_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                ok = n_dft == size_dft;
+            }
+            if (ok) {
+                dst->data.spec = it->spec;
+                ok = store_remote(dst);
+            }
+            if (ok) {
+                SRV_TRC(" - demoted %d-token GPU agent state from seq %d to level-2 cache\n",
+                        it->prompt.n_tokens(), (int) seq_id);
             } else {
-                SRV_WRN(" - failed to serialize hidden GPU agent target seq %d; dropping it\n", (int) seq_id);
+                discard();
+                SRV_WRN(" - failed to commit hidden GPU agent seq %d to a lower tier; retaining it\n", (int) seq_id);
+                return false;
             }
         } else {
-            SRV_WRN(" - level-2 cache could not accept hidden GPU agent seq %d; dropping it\n", (int) seq_id);
+            SRV_WRN(" - level-2 cache could not accept hidden GPU agent seq %d; retaining it\n", (int) seq_id);
+            return false;
         }
+    } else {
+        SRV_WRN(" - no lower KV tier is configured for hidden GPU agent seq %d; retaining it\n", (int) seq_id);
+        return false;
     }
 
     llama_memory_seq_rm(llama_get_memory(gpu_ctx_tgt), seq_id, -1, -1);
@@ -2330,6 +2798,39 @@ bool server_prompt_cache::gpu_demote_lru() {
     }
     gpu_states.erase(it);
     return true;
+}
+
+void server_prompt_cache::gpu_make_room_for_tokens(size_t incoming_tokens, size_t kv_capacity_tokens) {
+    if (!gpu_enabled() || gpu_states.empty() || kv_capacity_tokens == 0) {
+        return;
+    }
+
+    auto retained_tokens = [this]() {
+        const size_t max_size = static_cast<size_t>(-1);
+        size_t total = 0;
+        for (const auto & state : gpu_states) {
+            const size_t tokens = state.prompt.n_tokens();
+            if (tokens > max_size - total) {
+                return max_size;
+            }
+            total += tokens;
+        }
+        return total;
+    };
+
+    size_t retained = retained_tokens();
+    while (!gpu_states.empty() &&
+           (retained > kv_capacity_tokens || incoming_tokens > kv_capacity_tokens - retained)) {
+        if (!gpu_demote_lru()) {
+            break;
+        }
+        retained = retained_tokens();
+    }
+
+    if (retained > kv_capacity_tokens || incoming_tokens > kv_capacity_tokens - retained) {
+        SRV_WRN("gpu_make_room: incoming prompt has %zu tokens; retained hidden branches use %zu/%zu KV tokens\n",
+                incoming_tokens, retained, kv_capacity_tokens);
+    }
 }
 
 bool server_prompt_cache::gpu_save(
@@ -2397,9 +2898,24 @@ bool server_prompt_cache::gpu_save(
         gpu_states.erase(it_exact);
     }
 
+    const size_t expected_tgt = llama_state_seq_get_size_ext(
+            gpu_ctx_tgt, active_seq, LLAMA_STATE_SEQ_FLAGS_NONE);
     llama_memory_seq_cp(llama_get_memory(gpu_ctx_tgt), active_seq, seq_id, -1, -1);
+    if (llama_state_seq_get_size_ext(gpu_ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE) != expected_tgt) {
+        llama_memory_seq_rm(llama_get_memory(gpu_ctx_tgt), seq_id, -1, -1);
+        SRV_WRN(" - hidden target copy for seq %d was incomplete; retaining active branch only\n", (int) seq_id);
+        return false;
+    }
     if (gpu_ctx_dft) {
+        const size_t expected_dft = llama_state_seq_get_size_ext(
+                gpu_ctx_dft, active_seq, LLAMA_STATE_SEQ_FLAGS_NONE);
         llama_memory_seq_cp(llama_get_memory(gpu_ctx_dft), active_seq, seq_id, -1, -1);
+        if (llama_state_seq_get_size_ext(gpu_ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE) != expected_dft) {
+            llama_memory_seq_rm(llama_get_memory(gpu_ctx_tgt), seq_id, -1, -1);
+            llama_memory_seq_rm(llama_get_memory(gpu_ctx_dft), seq_id, -1, -1);
+            SRV_WRN(" - hidden draft copy for seq %d was incomplete; retaining active branch only\n", (int) seq_id);
+            return false;
+        }
     }
 
     gpu_states.push_back({ prompt.clone(), spec, seq_id });
@@ -2444,17 +2960,28 @@ bool server_prompt_cache::gpu_load(
         llama_memory_seq_cp(llama_get_memory(gpu_ctx_dft), it_best->seq_id, active_seq, -1, -1);
     }
 
+    // Transfer ownership of the selected branch to the active sequence. Keeping
+    // the hidden source alive here duplicates a large recurrent state and can
+    // leave no contiguous range for checkpoint rollback (state_read_meta then
+    // reports "failed to find ... available cells"). The next release will
+    // create a fresh hidden snapshot if this branch is still worth retaining.
+    const llama_seq_id hidden_seq = it_best->seq_id;
+    llama_memory_seq_rm(llama_get_memory(gpu_ctx_tgt), hidden_seq, -1, -1);
+    if (gpu_ctx_dft) {
+        llama_memory_seq_rm(llama_get_memory(gpu_ctx_dft), hidden_seq, -1, -1);
+    }
+
     prompt = it_best->prompt.clone();
     restored_any_state = true;
     restored_spec_state = it_best->spec;
     restored_spec_state_valid = !restored_spec_state.empty();
 
-    SRV_TRC(" - restored %d-token agent state from hidden GPU seq %d (lcp=%d)\n",
-            prompt.n_tokens(), (int) it_best->seq_id, lcp_best);
+    SRV_TRC(" - restored %d-token agent state from hidden GPU seq %d (lcp=%d); transferred ownership to active seq %d\n",
+            prompt.n_tokens(), (int) hidden_seq, lcp_best, (int) active_seq);
 
-    // Successful restores are MRU; retain the hidden tag so the same branch can
-    // be selected again without another state copy.
-    gpu_states.splice(gpu_states.end(), gpu_states, it_best);
+    // The hidden sequence was removed above, so its metadata must not remain as
+    // a false cache hit. A later release creates a new hidden entry if needed.
+    gpu_states.erase(it_best);
     return true;
 }
 
@@ -2463,7 +2990,7 @@ void server_prompt_cache::update() {
         while (!states.empty() && size() > limit_size) {
             SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
 
-            states.pop_front();
+            erase_state(states.begin());
         }
     }
 
@@ -2478,7 +3005,7 @@ void server_prompt_cache::update() {
             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
                     limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
 
-            states.pop_front();
+            erase_state(states.begin());
         }
     }
 

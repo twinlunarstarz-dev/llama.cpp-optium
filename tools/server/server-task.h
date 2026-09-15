@@ -604,8 +604,13 @@ struct server_prompt_data {
 struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
+    bool on_disk = false;
+    std::string disk_dir;
+    std::string file_tgt;
+    std::string file_dft;
 
     size_t size() const {
+        // Disk-backed state bytes are not charged against the RAM cache quota.
         size_t res = data.size();
 
         for (const auto & ckpt : prompt.checkpoints) {
@@ -616,10 +621,9 @@ struct server_prompt_cache_state {
     }
 };
 
-// Level-1 agent cache: KV remains in the unified device cache and is retained
-// under a hidden sequence id.  Only the small speculative-driver sidecar stays
-// in host memory.  This avoids D2H/H2D state serialization on normal A->B->A
-// agent switches.  Entries are demoted to server_prompt_cache_state on pressure.
+// Lower-tier agent cache entry. Target/draft KV bytes live in RAM or committed
+// disk files; the active request remains the sole live sequence in the unified
+// KV pool, so its configured context is never divided by cache entries.
 struct server_gpu_prompt_cache_state {
     server_prompt prompt;
     std::vector<uint8_t> spec;
@@ -633,6 +637,7 @@ struct server_gpu_prompt_cache_state {
 struct server_active_prompt_cache_state {
     server_prompt_data data;
     bool on_disk = false;
+    std::string disk_dir;
     std::string file_tgt;
     std::string file_dft;
 
@@ -656,6 +661,7 @@ struct server_prompt_cache {
     std::list<server_gpu_prompt_cache_state> gpu_states;
     std::map<int32_t, server_active_prompt_cache_state> active_states;
     std::string active_disk_dir;
+    size_t tiered_cache_entries = 0;
 
     llama_context * gpu_ctx_tgt = nullptr;
     llama_context * gpu_ctx_dft = nullptr;
@@ -686,7 +692,15 @@ struct server_prompt_cache {
 
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
-    void store_remote(server_prompt_cache_state * state);
+    // Store an active sequence directly on the disk tier when it cannot fit in
+    // the RAM prompt cache.  The state is published atomically and remains
+    // disposable cache data if admission or serialization fails.
+    bool store_disk(const server_prompt & prompt, const std::vector<uint8_t> & spec,
+                    llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+    void configure_tiered(size_t max_entries);
+    void erase_state(std::list<server_prompt_cache_state>::iterator it);
+
+    bool store_remote(server_prompt_cache_state * state);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
@@ -705,6 +719,12 @@ struct server_prompt_cache {
     bool gpu_save(const server_prompt & prompt, const std::vector<uint8_t> & spec, llama_seq_id active_seq);
     bool gpu_load(server_prompt & prompt, const server_tokens & tokens_new, llama_seq_id active_seq);
     bool gpu_demote_lru();
+
+    // Reclaim hidden sequences until an incoming prompt can fit in the
+    // unified KV pool.  This is intentionally conservative: shared prefixes
+    // may reduce the actual footprint, but overestimating is safer than
+    // allowing a hidden branch to turn a later request into an OOM.
+    void gpu_make_room_for_tokens(size_t incoming_tokens, size_t kv_capacity_tokens);
 
     void update();
 };

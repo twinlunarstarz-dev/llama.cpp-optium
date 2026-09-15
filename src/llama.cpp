@@ -454,6 +454,36 @@ static struct llama_model * llama_model_load_from_file_impl(
         return nullptr;
     }
 
+    if (params.split_mode == LLAMA_SPLIT_MODE_ROW) {
+        bool has_gpu = false;
+        bool native_row = true;
+        auto check_row_backend = [&](ggml_backend_dev_t dev) {
+            if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                return;
+            }
+            has_gpu = true;
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+            auto split_buffer_type_fn = (ggml_backend_split_buffer_type_t)
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_split_buffer_type");
+            native_row = native_row && split_buffer_type_fn != nullptr;
+        };
+
+        if (params.devices != nullptr) {
+            for (ggml_backend_dev_t * it = params.devices; *it != nullptr; ++it) {
+                check_row_backend(*it);
+            }
+        } else {
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                check_row_backend(ggml_backend_dev_get(i));
+            }
+        }
+
+        if (!has_gpu || !native_row) {
+            LLAMA_LOG_WARN("%s: selected backend lacks native row split buffers; falling back to tensor split\n", __func__);
+            params.split_mode = LLAMA_SPLIT_MODE_TENSOR;
+        }
+    }
+
     unsigned cur_percentage = 0;
     if (params.progress_callback == NULL) {
         params.progress_callback_user_data = &cur_percentage;

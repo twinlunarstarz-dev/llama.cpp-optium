@@ -135,6 +135,10 @@ bool llama_memory_hybrid::get_can_shift() const {
     return mem_attn->get_can_shift();
 }
 
+uint32_t llama_memory_hybrid::max_resident_sequences() const {
+    return mem_recr->max_resident_sequences();
+}
+
 void llama_memory_hybrid::clear(bool data) {
     mem_attn->clear(data);
     mem_recr->clear(data);

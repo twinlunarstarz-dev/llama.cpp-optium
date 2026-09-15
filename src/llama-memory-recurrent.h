@@ -61,6 +61,8 @@ public:
 
     bool get_can_shift() const override;
 
+    uint32_t max_resident_sequences() const override { return size; }
+
     // state write/load
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
@@ -107,6 +109,11 @@ public:
     };
 
     std::vector<mem_cell> cells;
+
+    // Logical sequence IDs are not physical recurrent-cache rows. This is
+    // separate from cells so a context can expose more logical slots than the
+    // number of resident R/S rows and suspend/restore them safely.
+    std::vector<int32_t> seq_tail;
 
     // per layer
     std::vector<ggml_tensor *> r_l;

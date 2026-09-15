@@ -859,7 +859,30 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 continue;
             }
             src_ss[i] = ggml_backend_meta_get_split_state(stc, tensor->src[i], /*assume_sync =*/ true);
-            GGML_ASSERT(src_ss[i].axis != GGML_BACKEND_SPLIT_AXIS_UNKNOWN);
+            if (src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_UNKNOWN) {
+                // A single-backend Meta context cannot have a meaningful distributed
+                // split.  This occurs for MTP result tensors crossing the target/draft
+                // context boundary; treat the descriptor as mirrored locally.
+                //
+                // The sampling graph also adds one dummy row with PAD to the complete
+                // result_output logits tensor.  That result can cross the target/draft
+                // context boundary without carrying its Meta descriptor, but it must
+                // remain complete before sampling.  Keep rejecting every other
+                // unknown state when multiple devices could hide a shard.
+                const ggml_tensor * src = tensor->src[i];
+                const bool is_complete_logits_pad = tensor->op == GGML_OP_PAD && i == 0 &&
+                    src != nullptr && src->op == GGML_OP_MUL_MAT &&
+                    strcmp(src->name, "result_output") == 0 &&
+                    tensor->ne[0] == src->ne[0] && tensor->ne[1] == src->ne[1] + 1 &&
+                    tensor->ne[2] == src->ne[2] && tensor->ne[3] == src->ne[3];
+                if (n_bufs == 1 || is_complete_logits_pad) {
+                    src_ss[i] = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+                } else {
+                    GGML_ABORT("unknown split state: op=%s tensor=%s src[%zu]=%s src_op=%s assume_sync=%d",
+                        ggml_op_name(tensor->op), tensor->name, i, tensor->src[i]->name,
+                        ggml_op_name(tensor->src[i]->op), (int) assume_sync);
+                }
+            }
         }
 
         ggml_backend_meta_split_state split_state;

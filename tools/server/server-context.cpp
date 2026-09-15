@@ -323,6 +323,12 @@ struct server_slot {
 
         auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
         if (cur == nullptr) {
+            // A state larger than --cache-ram goes directly to the atomic disk
+            // tier.  Caching is optional: failure here must never fail the new
+            // request, because the caller will recompute from its prompt.
+            if (prompt_cache.store_disk(prompt, spec_state, ctx_tgt, ctx_dft, id)) {
+                return true;
+            }
             return false;
         }
 
@@ -334,9 +340,7 @@ struct server_slot {
             cur->data.spec = std::move(spec_state);
         }
 
-        prompt_cache.store_remote(cur);
-
-        return true;
+        return prompt_cache.store_remote(cur);
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
@@ -1172,24 +1176,24 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
-        // Hidden sequence ownership consumes cells from the same unified KV
-        // pool and therefore makes very large concurrent contexts collide sooner.
-        // Keep it as an explicit experimental opt-in; active RAM/disk suspension
-        // below removes inactive request cells from the live pool instead.
-        int32_t gpu_agent_cache_seqs = 0;
+        // Agent cache entries are lower-tier snapshots, not extra live KV
+        // sequences.  Adding them to n_parallel would divide the single
+        // unified cache and make a configured 262144-token slot effectively
+        // smaller.  Keep the active slot as the sole live owner instead.
+        int32_t tiered_cache_entries = 0;
         if (!utility_model && params_base.kv_unified && params_base.lora_adapters.empty()) {
             if (const char * env = getenv("LLAMA_SERVER_GPU_AGENT_CACHE_SEQS")) {
-                gpu_agent_cache_seqs = std::clamp<int32_t>(atoi(env), 0, 32);
-                if (gpu_agent_cache_seqs > 0) {
-                    SRV_WRN("GPU hidden agent cache explicitly enabled with %d sequences; hidden states consume live unified KV capacity\n",
-                            gpu_agent_cache_seqs);
-                }
+                tiered_cache_entries = std::clamp<int32_t>(atoi(env), 0, 32);
+            }
+            if (tiered_cache_entries > 0) {
+                SRV_INF("tiered agent cache enabled with %d reusable entries; active slot retains its full context (no hidden KV reservation)\n",
+                        tiered_cache_entries);
             }
         }
 
         common_params params_ctx = params_base;
-        params_ctx.n_parallel += gpu_agent_cache_seqs;
         llama_init = common_init_from_params(params_ctx);
+        params_base.sampling = params_ctx.sampling;
 
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
@@ -1345,7 +1349,19 @@ private:
         }
 
         if (ctx_dft) {
-            ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
+            const bool spec_dflash = std::find(params_base.speculative.types.begin(),
+                                              params_base.speculative.types.end(),
+                                              COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params_base.speculative.types.end();
+            const bool spec_dspark = std::find(params_base.speculative.types.begin(),
+                                              params_base.speculative.types.end(),
+                                              COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params_base.speculative.types.end();
+            if (spec_dflash || spec_dspark) {
+                // DFlash/DSpark draft contexts require ctx_other and, under tensor
+                // split, do not support the generic two-token capability probe.
+                ctx_dft_seq_rm_type = ctx_tgt_seq_rm_type;
+            } else {
+                ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft);
+            }
         }
 
         if (spec) {
@@ -1429,7 +1445,7 @@ private:
         }
 
         const bool active_kv_swap = !utility_model && params_base.kv_unified && params_base.n_parallel > 1;
-        if (params_base.cache_ram_mib != 0 || !params_base.lmcache_endpoint.empty() || gpu_agent_cache_seqs > 0 || active_kv_swap) {
+        if (params_base.cache_ram_mib != 0 || !params_base.lmcache_endpoint.empty() || tiered_cache_entries > 0 || active_kv_swap) {
             if (params_base.cache_ram_mib < 0) {
                 SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
             } else if (params_base.cache_ram_mib == 0) {
@@ -1454,11 +1470,8 @@ private:
                 SRV_INF("active unified-KV suspension enabled: VRAM -> shared cache RAM -> disk (ctx=%d, parallel=%d)\n",
                         n_ctx, params_base.n_parallel);
             }
-            if (gpu_agent_cache_seqs > 0 && ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
-                const int32_t seq_total = (int32_t) llama_n_seq_max(ctx_tgt);
-                const int32_t seq_first = params_base.n_parallel;
-                const int32_t seq_count = std::max<int32_t>(0, seq_total - seq_first);
-                prompt_cache->configure_gpu(ctx_tgt, ctx_dft, seq_first, seq_count);
+            if (tiered_cache_entries > 0) {
+                prompt_cache->configure_tiered((size_t) tiered_cache_entries);
             }
             if (!params_base.lmcache_endpoint.empty()) {
                 SRV_INF("LMCache prompt state reuse enabled at %s\n", params_base.lmcache_endpoint.c_str());
@@ -1742,6 +1755,9 @@ private:
                 ret->prompt_save(*prompt_cache);
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                    // No hidden GPU branches are reserved: the active unified
+                    // KV sequence remains the full configured context.
+                    prompt_cache->gpu_make_room_for_tokens(task.tokens.size(), n_ctx);
                     ret->prompt_clear();
                 }
 
@@ -1783,8 +1799,9 @@ private:
             }
         }
 
-        // If all active idle slots are already clear, reclaim the oldest hidden
-        // GPU agent.  It is first demoted to RAM/LMCache when configured.
+        // Cached prompt state is lower-tier data; if no idle slot is available,
+        // the scheduler can still reclaim a disposable entry without reducing
+        // the active slot's configured context.
         if (!res && prompt_cache && prompt_cache->gpu_demote_lru()) {
             res = true;
         }
@@ -2579,6 +2596,7 @@ private:
         const size_t incoming = std::min<size_t>((size_t) task.n_tokens() + 1, (size_t) n_ctx);
         const size_t headroom = active_kv_headroom();
         const size_t shared_limit = (size_t) n_ctx > headroom ? (size_t) n_ctx - headroom : (size_t) n_ctx;
+        const uint32_t resident_limit = std::max<uint32_t>(1, llama_n_seq_max_resident(ctx_tgt));
 
         while (true) {
             size_t projected = incoming;
@@ -2590,12 +2608,15 @@ private:
                 }
             }
 
-            if (n_resident == 0 || projected <= shared_limit) {
+            if (n_resident < (int) resident_limit && projected <= shared_limit) {
                 return true;
             }
 
             server_slot * victim = largest_suspendable_resident();
-            if (!victim || !suspend_active_slot(*victim, "admitting another request would exceed unified KV capacity")) {
+            const char * reason = n_resident >= (int) resident_limit
+                ? "admitting another request would exceed resident recurrent-state capacity"
+                : "admitting another request would exceed unified KV capacity";
+            if (!victim || !suspend_active_slot(*victim, reason)) {
                 return false;
             }
         }
@@ -2643,6 +2664,15 @@ private:
 
         const size_t headroom = active_kv_headroom();
         const size_t shared_limit = (size_t) n_ctx > headroom ? (size_t) n_ctx - headroom : (size_t) n_ctx;
+        const uint32_t resident_limit = std::max<uint32_t>(1, llama_n_seq_max_resident(ctx_tgt));
+        while (n_resident > (int) resident_limit) {
+            server_slot * victim = largest_suspendable_resident();
+            if (!victim || !suspend_active_slot(*victim, "live contexts exceeded resident recurrent-state capacity")) {
+                break;
+            }
+            n_resident--;
+        }
+
         while (n_resident > 1) {
             size_t projected = 0;
             for (const auto & slot : slots) {
@@ -3381,7 +3411,11 @@ private:
 
             if (ctx_dft) {
                 if (use_ckpt_dft) {
-                    ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    if (!ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+                        SLT_WRN(slot, "%s", "speculative draft checkpoint unavailable; continuing without draft replay\n");
+                        draft.clear();
+                        ckpt.clear_dft();
+                    }
                 }
 
                 if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
@@ -3398,9 +3432,12 @@ private:
                    (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_dft));
 
                 if (use_ckpt_tgt) {
-                    //const int64_t t_start = ggml_time_us();
+                    if (!ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+                        SLT_WRN(slot, "%s", "speculative target checkpoint capture failed; continuing without checkpoint replay\n");
+                        ckpt.clear_tgt();
+                    }
 
-                    ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    //const int64_t t_start = ggml_time_us();
 
                     //const int64_t t_total = ggml_time_us() - t_start;
                     //printf("checkpoint total: %f ms\n", t_total / 1000.0);
@@ -3687,15 +3724,25 @@ private:
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
 
                                     if (!do_reset) {
-                                        // restore the context checkpoint
-                                        it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                        it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                        // restore the draft's speculative state
-                                        common_speculative_set_state(spec.get(), slot.id, it->data_spec);
+                                        // Restoring a checkpoint may fail when a hidden
+                                        // GPU branch still owns the required recurrent
+                                        // cells.  A failed restore is recoverable: the
+                                        // helper clears the destination sequence, so
+                                        // discard this checkpoint and recompute.
+                                        const bool restored_tgt = it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        const bool restored_dft = restored_tgt && it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        if (!restored_tgt || !restored_dft) {
+                                            SLT_WRN(slot, "discarding unusable context checkpoint at [%d, %d]; recomputing prompt\n", it->pos_min, it->pos_max);
+                                            slot.prompt.checkpoints.erase(std::prev(it.base()));
+                                            do_reset = true;
+                                        } else {
+                                            // restore the draft's speculative state
+                                            common_speculative_set_state(spec.get(), slot.id, it->data_spec);
 
-                                        pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
-                                        n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
-                                        SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+                                            pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
+                                            n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                            SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+                                        }
                                     }
 
                                     if (do_reset) {
@@ -4264,10 +4311,25 @@ private:
 
                         SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
 
-                        ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                        bool restored = ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
                         if (slot.ctx_dft) {
-                            ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            restored = ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) && restored;
+                        }
+
+                        if (!restored) {
+                            SLT_WRN(slot, "%s", "speculative checkpoint restore failed; recomputing the original prompt without unloading the model\n");
+                            slot.prompt_clear();
+                            slot.spec_draft.clear();
+                            slot.spec_i_batch.clear();
+                            slot.spec_ckpt.clear();
+                            slot.spec_is_replay = false;
+                            slot.state = SLOT_STATE_STARTED;
+                            if (slot.task->need_sampling()) {
+                                auto sampling = slot.task->params.sampling;
+                                slot.smpl.reset(common_sampler_init(model_tgt, sampling));
+                            }
+                            return;
                         }
 
                         slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);

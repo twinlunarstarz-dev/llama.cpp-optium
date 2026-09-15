@@ -4362,11 +4362,12 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     ggml_cuda_stream_context & stream_context = cuda_ctx->stream_context();
     stream_context.reset();
 
-    // Multi-GPU graph optimization can change execution ordering and token
-    // results.  Keep the established single-device safety boundary.
-    if (!use_cuda_graph || ggml_backend_cuda_get_device_count() != 1) {
+    // Multi-GPU graph optimization is safe per backend split; select the owning device before graph work.
+    if (!use_cuda_graph) {
         return;
     }
+
+    ggml_cuda_set_device(cuda_ctx->device);
 
     // number of out-degrees for a particular node
     std::unordered_map<const ggml_tensor *, int> fan_out;

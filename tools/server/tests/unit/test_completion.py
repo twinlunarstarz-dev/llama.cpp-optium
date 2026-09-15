@@ -570,6 +570,39 @@ def test_n_probs_post_backend_sampling():
         for (aa, bb) in zip(a["top_probs"], b["top_probs"]):
             verify_token(aa, bb)
 
+@pytest.mark.parametrize("ignore_eos", [False, True])
+def test_ignore_eos_overrides_positive_bias(ignore_eos):
+    global server
+    server.start()
+    props = server.make_request("GET", "/props")
+    assert props.status_code == 200
+    tokenized = server.make_request("POST", "/tokenize", data={
+        "content": props.body["eos_token"],
+        "add_special": False,
+        "parse_special": True,
+    })
+    assert tokenized.status_code == 200
+    assert len(tokenized.body["tokens"]) == 1
+    eos = tokenized.body["tokens"][0]
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "I believe the meaning of life is",
+        "n_predict": 4,
+        "temperature": 0.0,
+        "cache_prompt": False,
+        "return_tokens": True,
+        "logit_bias": [[eos, 1000.0]],
+        "ignore_eos": ignore_eos,
+    })
+    assert res.status_code == 200
+    if ignore_eos:
+        assert res.body["timings"]["predicted_n"] == 4
+        assert res.body["stop_type"] == "limit"
+        assert eos not in res.body["tokens"]
+    else:
+        assert res.body["timings"]["predicted_n"] == 1
+        assert res.body["stop_type"] == "eos"
+
+
 @pytest.mark.parametrize("tokenize,openai_style", [(False, False), (False, True), (True, False), (True, True)])
 def test_logit_bias(tokenize, openai_style):
     global server
