@@ -38,16 +38,17 @@ jobs:
               raise RuntimeError('expected one graph build in optimizer loop')
           path.write_text(before + separator + training.replace(old, 'const auto gparams = graph_params(res, ubatch, mctx.get(), LLM_GRAPH_TYPE_TRAINING);', 1))
           patch('examples/training/finetune.cpp', '    auto llama_init = common_init_from_params(params);', '    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;\n    auto llama_init = common_init_from_params(params);')
+          patch('examples/training/finetune.cpp', '    llama_model_save_to_file(model, params.out_file.c_str());', '    if (params.out_file.empty()) { params.out_file = "finetuned-model.gguf"; }\n    llama_model_save_to_file(model, params.out_file.c_str());')
           PY
-      - name: Build CPU fine-tuner
+      - name: Build CPU fine-tuner and inference CLI
         run: |
           cmake -S . -B build -DGGML_CUDA=OFF -DLLAMA_BUILD_EXAMPLES=ON -DLLAMA_BUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release
-          cmake --build build --target llama-finetune -j 2
+          cmake --build build --target llama-finetune llama-cli -j 2
       - name: Download pinned test model
         run: |
           curl --fail --location --retry 3 --max-time 180 https://huggingface.co/ggml-org/tiny-llamas/resolve/6e091d8/stories260K.gguf --output tiny.gguf
           echo '047bf46455a544931cff6fef14d7910154c56afbc23ab1c5e56a72e69912c04b  tiny.gguf' | sha256sum --check
-      - name: Train and verify a real GGUF output
+      - name: Train, export, and reload the actual tiny GGUF
         run: |
           python3 - <<'PY'
           from pathlib import Path
@@ -55,3 +56,11 @@ jobs:
           PY
           timeout 240 ./build/bin/llama-finetune --model tiny.gguf --file tiny-train.txt -c 64 -b 64 -ub 64 --epochs 1
           test -s finetuned-model.gguf
+          python3 - <<'PY'
+          from pathlib import Path
+          data = Path('finetuned-model.gguf').read_bytes()
+          assert data[:4] == b'GGUF'
+          print('EXPORTED_GGUF_BYTES', len(data))
+          PY
+          timeout 60 ./build/bin/llama-cli -m finetuned-model.gguf -p 'Once upon a time' -n 4 --no-warmup > reload.log 2>&1 || { cat reload.log; exit 1; }
+          tail -n 20 reload.log
