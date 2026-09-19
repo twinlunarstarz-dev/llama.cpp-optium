@@ -3,7 +3,7 @@ title: "llama.cpp-optium: Ternary Training, QLoRA, Tiered Memory, and Bonsai 2"
 aliases:
   - "Optium ternary training architecture"
 date: 2026-09-19
-status: design-proposal
+status: implementation-in-progress
 repository: "https://github.com/twinlunarstarz-dev/llama.cpp-optium"
 branch: testing
 tags:
@@ -18,89 +18,84 @@ tags:
 
 # llama.cpp-optium: Ternary training architecture
 
-> Status: design proposal only. This note is not an implementation report; no Bonsai 2 inference repair or end-to-end training build has been verified.
+> Status: partial implementation. The teacher dataset helper is committed and tested using a fake server. Full ternary training, tiered backward execution, and Bonsai 2 inference repair are NOT implemented or verified.
+
+## Existing implementation, verified from source
+
+- `examples/CMakeLists.txt` includes `add_subdirectory(training)` and `examples/training/CMakeLists.txt` builds the `llama-finetune` target. The previous version of this note incorrectly inferred its absence from `tools/CMakeLists.txt`.
+- `examples/training/finetune.cpp` loads a model, tokenizes `params.prompt`, creates `common_opt_dataset_init`, calls `llama_opt_init` and `llama_opt_epoch`, and exports GGUF. It forces non-mmap loading for writable weights and F32 KV cache. Its README describes FP32 training on a limited set of hardware; this is NOT a general quantized or out-of-core trainer.
+- `src/llama-train-quant.h` exposes bounded row dequantization, per-tensor deterministic stochastic rounding, FP32 error feedback, and type-support checks. Its interface expressly excludes optimizer, paging, and CLI.
+- `README.md` documents sequential VRAM/RAM/disk inference and overlapped CUDA transfer/compute. This is a useful foundation but does not imply that backward graphs, activations, and optimizer state can already be paged safely.
+- `examples/training/teacher_dataset.py` now launches a teacher `llama-server` in an isolated process, generates OpenAI-compatible chat records, writes an atomic JSONL output, and terminates and waits for the teacher. It requires supplied fixture responses for tool calls; it does not execute arbitrary tools or fabricate results.
+- `examples/training/test_teacher_dataset.py` covers four cases, including simulated-server process teardown. Its local tests passed. Real GGUF generation and end-to-end training integration remain untested.
 
 ## Objective
 
-Add `llama-finetune` with (1) teacher-generated supervised data from a separate base GGUF, (2) full-parameter training in a ternary forward representation, (3) LoRA and QLoRA for ordinary and ternary base models, (4) a strictly ternary *deployed* adapter option, and (5) bounded VRAM -> RAM -> disk storage for model weights, activations, gradients, optimizer state, and checkpoints. Preserve conventional F16/BF16 training and quantization-aware training (QAT) for supported quantized types. Fix the Bonsai 2 inference loader and its required rotation rather than merely accepting custom tensor IDs.
+Build on `llama-finetune`, not a competing executable. Load any inference-compatible GGUF as a teacher; generate a varied, validated, provenance-tracked training corpus; fully unload the teacher; then initialize the student and train using full parameters or adapters. Add strictly ternary deployed full weights and LoRA factors; conventional F16/BF16 and nonternary QAT/QLoRA; safe VRAM -> RAM -> disk placement for weights, activations, gradients, optimizer states, and checkpoints; and verified Bonsai 2 inference support.
 
-## Confirmed repository starting points
+## Numerical invariants
 
-- `README.md` describes sequential storage-backed loading with mmap/direct I/O, bounded host/device windows, and overlapped CUDA transfer and compute; this is an inference foundation, not proven backward/optimizer support.
-- `src/llama-train-quant.h` exposes bounded row dequantization, per-tensor deterministic stochastic rounding, FP32 error-feedback state, and type-support checks. Its own header places optimizer, paging, and CLI out of scope.
-- `tools/CMakeLists.txt` on `testing` does not register a `llama-finetune` executable.
-- `docs/architecture-sequential-loading-v2.md` records earlier scheduler allocation/OOM/NaN failure modes. Treat it as architecture history, not evidence that all configurations now work.
+1. During ternary training, *every forward step* must use packed or equivalent ternary weights, `W_forward = scale * Q` with `Q in {-1,0,+1}`. Trainable master weights, surrogate gradients, error feedback, and optimizer moments may use higher precision as transient and tiered training state. Do not train a floating-point student and only ternarize once at export.
+2. Preserve exact architecture-specific transforms: Bonsai requires corresponding weight and activation rotations. Type-ID registration without the forward transform is not sufficient.
+3. Strictly ternary deployed adapters need ternary A and B factors (plus required scales). Conventional floating-point LoRA does not meet that requirement; merging a ternary adapter into a single ternary plane is not generally lossless.
+4. A frozen quantized base plus a trainable adapter is QLoRA, whereas full QAT updates quantized forward weights. Keep their checkpoint formats and numerical tests distinct.
+5. Higher-precision normalization, recurrent state, and scales may be essential even when all eligible trainable *weight matrices* are ternary. Define the strict-ternary format contract in metadata rather than silently removing required numerical state.
+6. Support as a teacher any model currently supported for inference, subject to the usual working-set requirements. Student training additionally requires backward operators for its particular architecture; provide explicit diagnostics when they are unavailable.
+7. No arbitrary model size can be promised on every machine. Admission checks must cover disk capacity, device/host working-set minima, backend operations, and checkpoint spill space; allow CPU fallback where genuinely supported.
 
-## Non-negotiable numerical contracts
+## Teacher-first lifecycle and dataset format
 
-1. A packed ternary forward weight is represented as `W_forward = scale * Q`, `Q in {-1,0,+1}`. If a required Hadamard/sign transform exists, preserve the exact transform and its placement in the graph.
-2. A training algorithm needs gradients and an update state. For full ternary fine-tuning, use a bounded, shardable higher-precision *training-only* latent/master or error-feedback state and a straight-through or otherwise specified surrogate gradient. Re-ternarize each update in the forward path; do not train a floating student and perform a one-time final ternarization.
-3. The deployed GGUF may contain only ternary trainable weight tensors plus indispensable scalar/group scales, metadata, and architecture-specific non-weight tensors. A strict interpretation of 'all fully ternary' cannot also prohibit floating-point group scales or normalization/state values without a new numerical design.
-4. A conventional LoRA update `B @ A` stored as F16 is not a ternary-only adapter. A ternary LoRA mode must explicitly quantize/store BOTH factors (with their necessary scales), run their quantized forward path during training, and test merged and unmerged behavior. Merging a ternary LoRA into a one-plane ternary base is not generally lossless.
-5. QLoRA keeps the base quantized/frozen and trains adapters; ordinary full QAT updates quantized forward weights. These are distinct training modes, with distinct checkpoint schemas.
-6. 'Any model supported for inference' means teacher generation can use the existing inference loader. Training support requires an explicit architecture-specific differentiable graph and supported backward kernels; fail with a precise unsupported-op diagnostic otherwise.
-7. No universal model-size guarantee: admission control must check disk capacity, minimum live working set, supported compute backend, temporary spill capacity, and predicted wall-clock/I/O costs.
+`validate teacher -> load teacher in isolated server process -> generate and verify examples -> write and fsync complete dataset -> shut down and wait for teacher -> load student and train -> atomically checkpoint/export`.
 
-## Teacher-first execution pipeline
+- Preserve exact roles, content, OpenAI-compatible `assistant.tool_calls` and corresponding `tool_call_id` results. Record model hash, tokenizer/chat-template version, sampling seed/settings, tool schema, and record provenance in a future manifest.
+- Use supplied tool fixtures or real authorized tool execution in a sandbox; never label fabricated search results as observed facts. Tool outputs are untrusted. The current generator only supports fixtures and at most one tool-call round.
+- Generate and validate diverse categories: general tasks, coding and debugging, abstention, research with actual retrieved sources, tool selection, sequential and parallel tools, tool errors, and multi-turn recovery. The six built-in prompts are smoke tests, not a balanced dataset.
+- Tool descriptions are an OpenAI JSON `tools` array. Map Hermes and zoo-code harness message formats to this intermediate schema only after verifying the exact deployed harness versions. MCP is a transport and tool discovery protocol, not a universal transcript encoding.
+- Crucial missing integration: the `llama-finetune` dataset loader presently consumes tokenized text. Do **not** pass the generated JSONL as ordinary text and assume its roles or loss masks are respected. Add chat-template-aware tokenization, assistant-only targets, tool-call target handling, splitting, and packing first.
 
-`validate teacher GGUF -> load teacher through inference API -> generate diverse candidate prompts and responses -> parse/validate and deduplicate -> persist append-only dataset manifest + records -> flush and fsync -> destroy inference contexts and release model/backend buffers -> load student checkpoint and training state -> train -> atomically publish checkpoint/export`.
+## Training implementation sequence
 
-- Teacher and student may be different GGUF files. Record teacher model hash, tokenizer and chat-template hashes, generation parameters, tool schemas, sampling seeds, record provenance, and split assignment.
-- Store transcripts in a structured format with role, content parts, tool-call ID/name/JSON arguments, tool responses, and target token masks. Never fabricate tool execution results: execute authorized sandboxed tools or mark responses as synthetic scenarios. Tool outputs are untrusted data.
-- Default schema: OpenAI-compatible `tools`, `tool_choice`, `assistant.tool_calls`, matching `tool_call_id` responses. Supply configurable adapters for Hermes-style tool templates and the specific zoo-code harness schema after examining those versions. MCP is a tool discovery/transport protocol, not itself a single universal transcript format.
-- Generate categories including coding, debugging, tool selection, multi-step and parallel tool calls, research, search with citations, general knowledge, abstention, clarification, and recovery from tool failures. Balance categories and hold out task families and prompts for evaluation. Avoid training on benchmark test sets or assuming teacher generations are ground truth.
-- Resume teacher generation without duplicates after crashes; commit the completed dataset manifest before unloading the teacher.
+1. Add chat-aware dataset loader and masks to the existing `llama-finetune`. Keep the old `--file` text path working. Integrate the isolated teacher helper and resource-lifecycle tests.
+2. Establish full F16/BF16 training and conventional LoRA with numerical gradient tests, loss-decrease tests, resume, and export on tiny supported models; preserve current FP32 behavior.
+3. Extend the scheduler with bounded residency for weights, saved activations, backward gradients, train-only master weights, optimizer shards, and checkpoint writes. Make dependency and last-use accounting correct before introducing overlap.
+4. Add out-of-core synchronous reference execution; then double-buffered prefetch/compute/writeback with bounded queue depths and backpressure. Compare gradients and updates against reference execution.
+5. Add frozen quantized base plus LoRA, nonternary QAT, and then projected ternary full training and ternary LoRA. Each mode needs validated backward behavior and checkpoint metadata.
+6. Independently reproduce Bonsai 2's custom GGML codec and Hadamard/architecture path against the Prism reference, and verify actual model loading, short deterministic logits, and offloaded inference before declaring the repair complete.
 
-## Storage and overlapped scheduling
+## Tiered residency and correctness
 
-Implement a shared tensor-store abstraction with durable tensor identity and versioning across VRAM, pinned/pageable RAM, and local disk. Track distinct states: resident, prefetched, computing, dirty, writing, evictable. Reserve bounded windows for **forward weights, backward activations/gradients, optimizer state, and prefetch**, rather than sharing one unbounded cache. Reuse sequential inference placement only after verifying its allocator and synchronization assumptions for backward graphs.
+Model a tensor as resident, prefetched, in-use, dirty, writing, or evictable; retain durable identity/version and explicit read/write ownership. Use separate capacity budgets for forward weights, saved activations, gradients, optimizer state, and prefetch. Never evict an activation before its last backward consumer or a dirty tensor before durable writeback. Store optimizer and master shards in host/disk tiers when necessary, implement activation checkpointing/recomputation, and make RNG and update order independent of prefetch timing. Measure read/write amplification, queue depth, cache hit rate, stalls, VRAM/RAM peaks, and throughput. Reuse existing checkpoint primitives only after validating the new training state schema and recovery guarantees.
 
-- Precompute a dependency-aware forward/backward/optimizer schedule. Use double-buffered asynchronous reads, host->device copies, compute, and writeback where the backend supports them; fall back to synchronous execution elsewhere.
-- Do not evict dirty tensors until writes are durable, or activations until the last backward consumer; support recomputation and activation checkpointing under a memory budget.
-- Keep master/error-feedback and optimizer shards in RAM or disk rather than requiring a full-device copy. Maintain deterministic update ordering and counters, not dependent on prefetch completion order.
-- Bound outstanding I/O and queue depth; use locality-aware layer/block ordering and grouped writes. Measure disk throughput, read/write amplification, cache hit rate, GPU idle time, stalls, and write endurance. Backpressure rather than unbounded prefetch.
-- Checkpoint atomically with the existing `llama-train-state` / `llama-train-checkpoint` primitives if their schemas meet new requirements. Include optimizer, RNG, schedule cursor, dataset cursor, latent states, ternary scales/codes, and hashes.
+## Verification gates
 
-## Bonsai 2 inference repair: investigation checklist
+- Build `llama-finetune` and the selected backends. Prove old training still works.
+- Test teacher startup/termination and error paths using fake and real server runs, and ensure no teacher resources remain when student load begins.
+- Verify tokenizer/chat template, tool-call transcripts, loss masks, dataset provenance, and safe parsing.
+- Check numerical gradient and finite/decreasing loss in F16 full, F16 LoRA, QLoRA, QAT, ternary full, and ternary LoRA modes on small models.
+- Verify checkpoint resume including tier placement, RNG, optimizer and quantization state.
+- Validate strict ternary export by reloading it and checking expected codebooks and correct logits.
+- Test CPU-only, constrained RAM, and GPU+RAM+disk paths; compare the offloaded implementation to in-memory numerical baselines.
+- Benchmark Bonsai 2 against the reference Prism fork: exact custom type layouts, required transforms, full-file loading, logits, and inference with constrained memory. Do not claim support based on parsing alone.
 
-1. Obtain the exact failing model variant, shard set, runtime command, platform, and error/log. Record the failing commit and compare against Prism's matching llama.cpp fork.
-2. Confirm custom GGML type IDs, block sizes, validation, row dequantization, quantized matmul kernels, GGUF loader type tables, tensor allocation, and serialization; do not alias custom types to stock names with different layouts.
-3. Confirm the model architecture, tensor naming and shapes, hybrid/recurrent attention operations, required Hadamard/sign metadata, and activation transform placement. Reject absent or incompatible rotation metadata rather than silently producing invalid logits.
-4. Add focused small-fixture tests: encode/decode round-trip against reference, one-layer numerical parity, deterministic short-token logits against the reference runtime, reload/unload, and small-memory/offloaded inference. Check errors, NaNs and OOM handling.
-5. Only label Bonsai 2 supported after full-file load and reference-logit/inference tests on an accessible real checkpoint. Custom GGML type parsing alone does not establish compatibility.
-
-## Delivery increments and acceptance gates
-
-1. **Compatibility audit:** document exact failing Bonsai configuration and reference expected outputs. No speculative fix before reproduction.
-2. **Training CLI baseline:** build `llama-finetune` for a small supported architecture, F16 full fine-tune and F16 LoRA with finite-loss, decreasing-loss, resume and export tests.
-3. **Teacher pipeline:** validate generation, dataset format, tool-call parsing, durable manifest, teacher unload and student load using explicit memory-resource tests.
-4. **Tiered training:** test CPU-only, RAM-constrained and GPU+RAM+disk runs; verify deterministic resume and numerical agreement with an in-memory baseline on a tiny model.
-5. **Quantized modes:** frozen quantized base + LoRA (QLoRA), then nonternary QAT; compare against float baselines and quantify quantization drift.
-6. **Ternary modes:** train using a ternary forward graph, implement train-only master/error feedback; export strict ternary full model and strict ternary adapter; reload and compare training/inference logits. State explicitly where scales/non-weight state remain higher precision.
-7. **Performance:** profile overlapping reads/transfers/computation and show throughput, peak VRAM/RAM, spill bytes, write amplification and correctness relative to synchronous mode.
-8. **Model coverage:** maintain a feature matrix for architecture, quantization type and backend. Teacher coverage may exceed student-training coverage until backward operators exist.
-
-## Suggested initial CLI contract (design, not implemented)
+## Current example: isolated teacher data generation
 
 ```sh
-llama-finetune generate --teacher teacher.gguf --output dataset.jsonl --tools tools.json --format openai --categories coding,tools,research,general --seed 42
-llama-finetune train --student student.gguf --dataset dataset.jsonl --mode ternary-full --vram-budget 8GiB --ram-budget 24GiB --disk-budget 300GiB --output checkpoint/
-llama-finetune train --student student.gguf --dataset dataset.jsonl --mode ternary-lora --rank 16 --output adapter/
-llama-finetune export --checkpoint checkpoint/ --format gguf --strict-ternary --output result.gguf
+python3 examples/training/teacher_dataset.py \
+  --server ./build/bin/llama-server \
+  --model /path/to/teacher.gguf \
+  --tasks /path/to/prompts.jsonl \
+  --tools /path/to/openai-tools.json \
+  --output /path/to/teacher-records.jsonl
+python3 -m unittest discover -s examples/training -p 'test_teacher_dataset.py' -v
 ```
 
-## Outstanding decisions to record during implementation
+`prompts.jsonl` contains one JSON object per line with `prompt`, optional `category`, and optional `tool_results` mapping tool names to trusted fixtures. This command only generates data; the resulting JSONL is **not** yet a valid drop-in input for the existing `llama-finetune` text training path.
 
-- Exact ternary codec and group-size support by architecture (PTQ1_0/PQ2_0 or a new backward-friendly internal representation).
-- Straight-through gradient, alternate estimator, or projection method; optimizer and scale training policy.
-- Whether a strict ternary adapter is permitted to retain FP16 group scales and non-weight tensors; define this unambiguously in format metadata.
-- Whether optional tool execution is offline/sandboxed or remote, and how data licensing and provenance are enforced.
-- Which GPUs, operating systems, disk types, and minimum working sets are in the supported tiered-training matrix.
+## References
 
-## Source pointers
-
-- [Fork README](https://github.com/twinlunarstarz-dev/llama.cpp-optium/blob/testing/README.md)
-- [Existing quantized training primitives](https://github.com/twinlunarstarz-dev/llama.cpp-optium/blob/testing/src/llama-train-quant.h)
-- [Sequential loading architecture](https://github.com/twinlunarstarz-dev/llama.cpp-optium/blob/testing/docs/architecture-sequential-loading-v2.md)
-- [Prism Bonsai 2 model](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf)
-- [Prism llama.cpp implementation](https://github.com/PrismML-Eng/llama.cpp/tree/prism)
+- [Existing fine-tune implementation](https://github.com/twinlunarstarz-dev/llama.cpp-optium/blob/testing/examples/training/finetune.cpp)
+- [Training CMake target](https://github.com/twinlunarstarz-dev/llama.cpp-optium/blob/testing/examples/training/CMakeLists.txt)
+- [Training quantization primitives](https://github.com/twinlunarstarz-dev/llama.cpp-optium/blob/testing/src/llama-train-quant.h)
+- [Sequential loading design](https://github.com/twinlunarstarz-dev/llama.cpp-optium/blob/testing/docs/architecture-sequential-loading-v2.md)
+- [Prism Bonsai model](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf)
+- [Prism llama.cpp fork](https://github.com/PrismML-Eng/llama.cpp/tree/prism)
