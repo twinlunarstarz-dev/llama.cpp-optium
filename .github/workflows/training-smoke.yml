@@ -25,7 +25,9 @@ jobs:
         run: python3 -m unittest discover -s examples/training -p 'test_teacher_*.py' -v
       - name: Configure CPU build
         run: cmake -S . -B build -DGGML_CUDA=OFF -DLLAMA_BUILD_EXAMPLES=ON -DLLAMA_BUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release
-      - name: Build existing fine-tune executable
-        run: cmake --build build --target llama-finetune -j 2
-      - name: Confirm executable
-        run: test -x build/bin/llama-finetune
+      - name: Build existing fine-tune executable and quantized-training tests
+        run: cmake --build build --target llama-finetune llama-train-quant-test -j 2
+      - name: Verify executable and run quantized-training reference tests
+        run: |
+          test -x build/bin/llama-finetune
+          ./build/bin/llama-train-quant-test
