@@ -72,36 +72,47 @@ def normalize_assistant(message):
     return result
 
 
-def generate_record(base_url, task, model, tools, max_tokens):
+def generate_record(base_url, task, model, tools, max_tokens, max_tool_rounds=4):
     messages = [{"role": "user", "content": task["prompt"]}]
-    body = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": 0}
-    if tools:
-        body["tools"] = tools
-        body["tool_choice"] = "auto"
-    result = request_json(base_url, "/v1/chat/completions", body, timeout=600)
-    assistant = normalize_assistant(result["choices"][0]["message"])
-    messages.append(assistant)
-    if assistant.get("tool_calls"):
-        fixtures = task.get("tool_results", {})
-        if not isinstance(fixtures, dict):
-            raise ValueError("tool_results must map tool names to fixture outputs")
-        for call in assistant["tool_calls"]:
-            name = call["function"]["name"]
-            if name not in fixtures:
-                raise ValueError(f"missing fixture for tool {name!r}; no tool was executed")
-            value = fixtures[name]
-            content = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
-            messages.append({"role": "tool", "tool_call_id": call["id"], "content": content})
-        follow_up = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": 0}
+    fixtures = task.get("tool_results", {})
+    if not isinstance(fixtures, dict):
+        raise ValueError("tool_results must map call IDs or tool names to fixture outputs")
+    used = {}
+
+    for round_index in range(max_tool_rounds + 1):
+        body = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": 0}
         if tools:
-            follow_up["tools"] = tools
-            follow_up["tool_choice"] = "none"
-        result = request_json(base_url, "/v1/chat/completions", follow_up, timeout=600)
-        messages.append(normalize_assistant(result["choices"][0]["message"]))
-    return {"category": task.get("category", "custom"), "messages": messages}
+            body["tools"] = tools
+            body["tool_choice"] = "none" if round_index == max_tool_rounds else "auto"
+        result = request_json(base_url, "/v1/chat/completions", body, timeout=600)
+        assistant = normalize_assistant(result["choices"][0]["message"])
+        messages.append(assistant)
+        calls = assistant.get("tool_calls", [])
+        if not calls:
+            return {"category": task.get("category", "custom"), "messages": messages}
+        if round_index == max_tool_rounds:
+            raise ValueError("teacher exceeded the configured maximum tool rounds")
+        for call in calls:
+            name = call["function"]["name"]
+            call_id = call["id"]
+            fixture_key = call_id if call_id in fixtures else name
+            if fixture_key not in fixtures:
+                raise ValueError(f"missing fixture for tool {name!r} ({call_id}); no tool was executed")
+            value = fixtures[fixture_key]
+            if isinstance(value, list):
+                next_index = used.get(fixture_key, 0)
+                if next_index >= len(value):
+                    raise ValueError(f"exhausted fixture list for tool {fixture_key!r}")
+                value = value[next_index]
+                used[fixture_key] = next_index + 1
+            content = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+            messages.append({"role": "tool", "tool_call_id": call_id, "content": content})
+    raise AssertionError("unreachable")
 
 
 def run(args):
+    if args.max_tool_rounds < 0:
+        raise ValueError("max-tool-rounds must be nonnegative")
     tasks = load_tasks(args.tasks)
     tools = json.loads(Path(args.tools).read_text(encoding="utf-8")) if args.tools else []
     if not isinstance(tools, list):
@@ -121,7 +132,7 @@ def run(args):
         temporary = output.with_name(output.name + ".partial")
         with open(temporary, "w", encoding="utf-8") as stream:
             for task in tasks:
-                record = generate_record(base_url, task, args.model, tools, args.max_tokens)
+                record = generate_record(base_url, task, args.model, tools, args.max_tokens, args.max_tool_rounds)
                 stream.write(json.dumps(record, ensure_ascii=False) + "\n")
             stream.flush()
             os.fsync(stream.fileno())
@@ -145,6 +156,7 @@ def main():
     parser.add_argument("--tools", help="optional OpenAI-compatible tool definitions JSON array")
     parser.add_argument("--port", type=int, default=18765)
     parser.add_argument("--max-tokens", type=int, default=1024)
+    parser.add_argument("--max-tool-rounds", type=int, default=4)
     parser.add_argument("--startup-timeout", type=float, default=120)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("server_args", nargs="*", help="extra server arguments after --")
