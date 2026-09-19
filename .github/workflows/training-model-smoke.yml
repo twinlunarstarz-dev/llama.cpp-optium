@@ -18,6 +18,25 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
+      - name: Instrument backward graph for precise diagnosis
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('ggml/src/ggml.c')
+          code = path.read_text()
+          needle = '''        // inplace operations are currently not supported
+        GGML_ASSERT(!node->view_src || node->op == GGML_OP_CPY || node->op == GGML_OP_VIEW ||'''
+          replacement = '''        // inplace operations are currently not supported
+        if (node->view_src && node->op != GGML_OP_CPY && node->op != GGML_OP_VIEW &&
+            node->op != GGML_OP_RESHAPE && node->op != GGML_OP_PERMUTE && node->op != GGML_OP_TRANSPOSE) {
+            fprintf(stderr, "TRAIN_GRAPH_INVALID_VIEW op=%s name=%s source=%s flags=%d\\n",
+                    ggml_op_name(node->op), node->name, node->view_src->name, (int) node->flags);
+        }
+        GGML_ASSERT(!node->view_src || node->op == GGML_OP_CPY || node->op == GGML_OP_VIEW ||'''
+          if code.count(needle) != 1:
+              raise RuntimeError('backward graph assertion changed; cannot instrument safely')
+          path.write_text(code.replace(needle, replacement, 1))
+          PY
       - name: Configure and build CPU finetune
         run: |
           cmake -S . -B build -DGGML_CUDA=OFF -DLLAMA_BUILD_EXAMPLES=ON -DLLAMA_BUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release
