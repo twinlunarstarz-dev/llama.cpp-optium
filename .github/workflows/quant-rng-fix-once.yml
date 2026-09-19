@@ -1,0 +1,45 @@
+name: Apply quantized-training RNG correction (one-off)
+
+on:
+  push:
+    branches: [testing]
+    paths:
+      - '.github/workflows/quant-rng-fix-once.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  fix-rng:
+    if: github.ref == 'refs/heads/testing'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Correct stochastic RNG range with exact-source guard
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('src/llama-train-quant.cpp')
+          source = path.read_text()
+          old = 'return (x >> 11) * (1.0 / (1ULL << 52));'
+          new = 'return (x >> 11) * (1.0 / (1ULL << 53));'
+          if source.count(old) != 1:
+              raise RuntimeError('expected a single unfixed RNG expression; refusing to modify source')
+          path.write_text(source.replace(old, new, 1))
+          assert (2**53 - 1) / 2**53 < 1
+          assert (2**53 - 1) / 2**52 > 1
+          PY
+      - name: Compile and run quantized-training numerical tests
+        run: |
+          cmake -S . -B build -DGGML_CUDA=OFF -DLLAMA_BUILD_EXAMPLES=ON -DLLAMA_BUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --target llama-train-quant-test -j 2
+          ./build/bin/llama-train-quant-test
+      - name: Commit only the tested source correction
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- src/llama-train-quant.cpp
+          test "$(git diff --cached --name-only)" = 'src/llama-train-quant.cpp'
+          git commit -m 'fix: bound quantized-training stochastic rounding to [0, 1)'
+          git push origin HEAD:testing
