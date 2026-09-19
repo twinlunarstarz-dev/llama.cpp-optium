@@ -1,0 +1,56 @@
+name: Differentiable no-cache Llama training prototype
+
+on:
+  push:
+    branches: [testing]
+    paths:
+      - '.github/workflows/training-no-cache-prototype.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  no-cache-prototype:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply isolated training graph prototype to runner only
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          def patch(path, old, new):
+              p = Path(path)
+              code = p.read_text()
+              if code.count(old) != 1:
+                  raise RuntimeError(f'{path}: expected one match, got {code.count(old)}')
+              p.write_text(code.replace(old, new, 1))
+          patch('src/llama-graph.h', '    LLM_GRAPH_TYPE_DECODER_MTP,\n};', '    LLM_GRAPH_TYPE_DECODER_MTP,\n    LLM_GRAPH_TYPE_TRAINING,\n};')
+          patch('src/models/llama.cpp', '    return std::make_unique<graph<false>>(*this, params);', '    if (params.gtype == LLM_GRAPH_TYPE_TRAINING) {\n        return std::make_unique<graph<true>>(*this, params);\n    }\n    return std::make_unique<graph<false>>(*this, params);')
+          patch('src/models/llama.cpp', '    if constexpr (!embed) {', '    if (!embed || params.gtype == LLM_GRAPH_TYPE_TRAINING) {')
+          path = Path('src/llama-context.cpp')
+          code = path.read_text()
+          before, separator, training = code.partition('void llama_context::opt_epoch_iter(')
+          if not separator:
+              raise RuntimeError('optimizer loop not found')
+          old = 'const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));'
+          if training.count(old) != 1:
+              raise RuntimeError('expected one graph build in optimizer loop')
+          path.write_text(before + separator + training.replace(old, 'const auto gparams = graph_params(res, ubatch, mctx.get(), LLM_GRAPH_TYPE_TRAINING);', 1))
+          PY
+      - name: Build CPU fine-tuner
+        run: |
+          cmake -S . -B build -DGGML_CUDA=OFF -DLLAMA_BUILD_EXAMPLES=ON -DLLAMA_BUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --target llama-finetune -j 2
+      - name: Download pinned test model
+        run: |
+          curl --fail --location --retry 3 --max-time 180 https://huggingface.co/ggml-org/tiny-llamas/resolve/6e091d8/stories260K.gguf --output tiny.gguf
+          echo '047bf46455a544931cff6fef14d7910154c56afbc23ab1c5e56a72e69912c04b  tiny.gguf' | sha256sum --check
+      - name: Train and verify a real GGUF output
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('tiny-train.txt').write_text(('Once upon a time there was a small dragon who learned to read.\n' * 128), encoding='utf-8')
+          PY
+          timeout 240 ./build/bin/llama-finetune --model tiny.gguf --file tiny-train.txt -c 64 -b 64 -ub 64 --epochs 1
+          test -s finetuned-model.gguf
