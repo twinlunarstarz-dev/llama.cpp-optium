@@ -34,7 +34,7 @@ inline double sr_hash(uint64_t seed, uint64_t key, int64_t counter) {
     x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
     x = x ^ (x >> 31);
     // Extract top 52 bits for uniform double in [0, 1)
-    return (x >> 11) * (1.0 / (1ULL << 52));
+    return (x >> 11) * (1.0 / (1ULL << 53));
 }
 
 // Stochastic rounding: round a normalized value to [0, max_code] using
