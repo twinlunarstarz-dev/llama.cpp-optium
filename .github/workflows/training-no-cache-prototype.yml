@@ -37,6 +37,7 @@ jobs:
           if training.count(old) != 1:
               raise RuntimeError('expected one graph build in optimizer loop')
           path.write_text(before + separator + training.replace(old, 'const auto gparams = graph_params(res, ubatch, mctx.get(), LLM_GRAPH_TYPE_TRAINING);', 1))
+          patch('examples/training/finetune.cpp', '    auto llama_init = common_init_from_params(params);', '    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;\n    auto llama_init = common_init_from_params(params);')
           PY
       - name: Build CPU fine-tuner
         run: |
