@@ -42,6 +42,21 @@ class TeacherDatasetTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "missing fixture"):
                 teacher.generate_record("http://localhost", {"prompt": "Search"}, "teacher", [], 64)
 
+    def test_multiple_tool_rounds_and_repeated_names(self):
+        def call(call_id):
+            return {"choices": [{"message": {"tool_calls": [
+                {"id": call_id, "type": "function", "function": {"name": "search", "arguments": "{}"}}
+            ]}}]}
+        final = {"choices": [{"message": {"content": "Combined both results."}}]}
+        with patch.object(teacher, "request_json", side_effect=[call("c1"), call("c2"), final]):
+            record = teacher.generate_record("http://localhost", {
+                "prompt": "Search twice", "tool_results": {"search": ["first result", "second result"]}
+            }, "teacher", [{"type":"function","function":{"name":"search","parameters":{"type":"object"}}}], 64)
+        self.assertEqual([m["role"] for m in record["messages"]],
+                         ["user", "assistant", "tool", "assistant", "tool", "assistant"])
+        self.assertEqual(record["messages"][2]["content"], "first result")
+        self.assertEqual(record["messages"][4]["content"], "second result")
+
     def test_server_lifecycle_and_atomic_output(self):
         fake_server = '''#!/usr/bin/env python3
 import json, os, sys
