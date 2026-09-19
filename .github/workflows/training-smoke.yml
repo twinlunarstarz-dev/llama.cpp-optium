@@ -1,0 +1,31 @@
+name: Training smoke (testing)
+
+on:
+  push:
+    branches: [testing]
+    paths:
+      - '.github/workflows/training-smoke.yml'
+      - 'examples/training/**'
+      - 'src/llama-train-**'
+      - 'common/**'
+      - 'ggml/**'
+      - '**/CMakeLists.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cpu-training:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Teacher corpus unit and lifecycle tests
+        run: python3 -m unittest discover -s examples/training -p 'test_teacher_dataset.py' -v
+      - name: Configure CPU build
+        run: cmake -S . -B build -DGGML_CUDA=OFF -DLLAMA_BUILD_EXAMPLES=ON -DLLAMA_BUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release
+      - name: Build existing fine-tune executable
+        run: cmake --build build --target llama-finetune -j 2
+      - name: Confirm executable
+        run: test -x build/bin/llama-finetune
