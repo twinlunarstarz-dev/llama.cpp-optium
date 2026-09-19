@@ -89,7 +89,10 @@ def generate_record(base_url, task, model, tools, max_tokens, max_tool_rounds=4)
         messages.append(assistant)
         calls = assistant.get("tool_calls", [])
         if not calls:
-            return {"category": task.get("category", "custom"), "messages": messages}
+            record = {"category": task.get("category", "custom"), "messages": messages}
+            if tools:
+                record["tools"] = tools
+            return record
         if round_index == max_tool_rounds:
             raise ValueError("teacher exceeded the configured maximum tool rounds")
         for call in calls:
