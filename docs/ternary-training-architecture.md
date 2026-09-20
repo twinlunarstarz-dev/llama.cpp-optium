@@ -1,5 +1,6 @@
 ---
 title: "llama.cpp-optium: Ternary Training, QLoRA, Tiered Memory, and Bonsai 2"
+type: note
 aliases:
   - "Optium ternary training architecture"
 date: 2026-09-19
@@ -18,7 +19,15 @@ tags:
 
 # llama.cpp-optium: Ternary training architecture
 
-> Status: partial implementation. The teacher dataset helper is committed and tested using a fake server. Full ternary training, tiered backward execution, and Bonsai 2 inference repair are NOT implemented or verified.
+> Status: production training-graph integration and CPU/reference Bonsai codec support are implemented on `testing`. CUDA compilation and real Bonsai inference remain in validation; assistant-only loss masking, QLoRA/QAT/ternary optimizer state, and tiered backward execution are still not implemented.
+
+## Current implementation status
+
+- `src/llama-graph.h`, `src/models/llama.cpp`, and `src/llama-context.cpp` now select a differentiable no-cache training graph, retain logits, and force `LLM_GRAPH_TYPE_TRAINING` during optimizer iterations.
+- `llama-finetune` disables FlashAttention for the current backward path and defaults to the explicit `finetuned-model.gguf` output name. The CI workflow builds production source and exercises train -> export -> bounded single-turn reload without runner-side source patching.
+- PQ2_0 (GGML type 142, 34-byte group-128 blocks) and PTQ1_0 (GGML type 143, 28-byte group-128 trit blocks) reference codecs, CPU Q8_0 dot paths, GGUF file-type mapping, and initial CUDA MMQ/MMVQ/dequant dispatch are in progress; real GPU logits parity is not yet a passing gate.
+- Prism Hadamard metadata is validated and persistent rotation/sign tensors are allocated; the shared dense-matmul and token-embedding paths apply the corresponding transforms. `gdn_v_grouped` is deliberately fail-closed until its permutation path is verified.
+- Assistant-only masking must still carry role boundaries into the dataset, zero ignored-label gradients in both CE forward and backward, and cover multi-turn/tool transcripts. Quantized primitives remain reference utilities, not a ternary optimizer.
 
 ## Existing implementation, verified from source
 
