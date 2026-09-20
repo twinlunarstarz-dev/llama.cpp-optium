@@ -118,6 +118,7 @@ int main(int argc, char ** argv) {
         params.cache_type_v = GGML_TYPE_F32;
     }
 
+    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     llama_backend_init();
     llama_numa_init(params.numa);
     auto llama_init = common_init_from_params(params);
@@ -179,6 +180,9 @@ int main(int argc, char ** argv) {
     ggml_opt_result_free(result_train);
     ggml_opt_result_free(result_eval);
 
+    if (params.out_file.empty()) {
+        params.out_file = "finetuned-model.gguf";
+    }
     llama_model_save_to_file(model, params.out_file.c_str());
 
     llama_backend_free();
