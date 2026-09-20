@@ -19,15 +19,22 @@ tags:
 
 # llama.cpp-optium: Ternary training architecture
 
-> Status: production training-graph integration and CPU/reference Bonsai codec support are implemented on `testing`. CUDA compilation and real Bonsai inference remain in validation; assistant-only loss masking, QLoRA/QAT/ternary optimizer state, and tiered backward execution are still not implemented.
+> Status: production training-graph integration and Bonsai codec/CUDA runtime bring-up are implemented on `testing`. The local Bonsai 2 PQ2 model now loads and serves a bounded request through the configured CUDA service; deterministic logits parity and output-quality validation against Prism remain open. Assistant-only loss masking, QLoRA/QAT/ternary optimizer state, and tiered backward execution are still not implemented.
 
 ## Current implementation status
 
 - `src/llama-graph.h`, `src/models/llama.cpp`, and `src/llama-context.cpp` now select a differentiable no-cache training graph, retain logits, and force `LLM_GRAPH_TYPE_TRAINING` during optimizer iterations.
 - `llama-finetune` disables FlashAttention for the current backward path and defaults to the explicit `finetuned-model.gguf` output name. The CI workflow builds production source and exercises train -> export -> bounded single-turn reload without runner-side source patching.
-- PQ2_0 (GGML type 142, 34-byte group-128 blocks) and PTQ1_0 (GGML type 143, 28-byte group-128 trit blocks) reference codecs, CPU Q8_0 dot paths, GGUF file-type mapping, and initial CUDA MMQ/MMVQ/dequant dispatch are in progress; real GPU logits parity is not yet a passing gate.
+- PQ2_0 (GGML type 142, 34-byte group-128 blocks) and PTQ1_0 (GGML type 143, 28-byte group-128 trit blocks) reference codecs, CPU Q8_0 dot paths, GGUF file-type mapping, CUDA MMQ/MMVQ/dequant dispatch, and the missing MMVQ top-level dispatch cases are implemented. Real GPU logits parity is not yet a passing gate.
 - Prism Hadamard metadata is validated and persistent rotation/sign tensors are allocated; the shared dense-matmul and token-embedding paths apply the corresponding transforms. `gdn_v_grouped` is deliberately fail-closed until its permutation path is verified.
 - Assistant-only masking must still carry role boundaries into the dataset, zero ignored-label gradients in both CE forward and backward, and cover multi-turn/tool transcripts. Quantized primitives remain reference utilities, not a ternary optimizer.
+
+## Runtime validation (2026-09-20)
+
+- The running `llama-cpp` service on `127.0.0.1:8025` loaded the unchanged `[Ternary-Bonsai-27B]` entry from `/models/models.ini` using `/models/Ternary-Bonsai-2-27B-PQ2_0.gguf`, CUDA0, `split-mode=none`, `tensor-split=23g`, `parallel=1`, `ctx-size=262144`, and the configured KV/cache settings.
+- The first real load exposed a missing `GGML_TYPE_PQ2_0`/`GGML_TYPE_PTQ1_0` branch in the CUDA MMVQ top-level switch (`ggml/src/ggml-cuda/mmvq.cu`). Both custom types now dispatch through the existing templated path.
+- The preset also requests `draft-mtp,ngram-mod`. The server now treats an unavailable implicit MTP context as optional and preserves the ngram fallback; an explicit draft-model failure remains fatal. No `models.ini` setting was changed.
+- A post-fix `POST /v1/chat/completions` request through port 8025 returned HTTP 200 in 1.31 seconds with 57 prompt tokens and 8 generated tokens. This verifies model load, CUDA graph execution, and router proxying. The short response was not semantically reliable, so deterministic output/logit parity and longer quality validation remain required.
 
 ## Existing implementation, verified from source
 

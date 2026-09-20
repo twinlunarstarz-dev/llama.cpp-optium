@@ -1100,7 +1100,7 @@ private:
         const bool spec_mtp = std::find(params_base.speculative.types.begin(),
                                         params_base.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
-        const bool has_spec = has_draft || spec_mtp;
+        bool has_spec = has_draft || spec_mtp;
 
         if (callback_state) {
             std::vector<std::string> stages = {"text_model"};
@@ -1241,12 +1241,28 @@ private:
                 }
 
                 if (ctx_dft == nullptr) {
-                    SRV_ERR("%s", "failed to create MTP context\n");
-                    return false;
+                    if (!has_draft && spec_mtp) {
+                        // An implicit MTP context is optional when another configured
+                        // speculator (for example ngram-mod) can still run.  Do not
+                        // make a target model unloadable because its MTP graph is not
+                        // supported; an explicit draft-model failure remains fatal.
+                        SRV_WRN("%s", "implicit MTP context unavailable; continuing without draft-mtp\n");
+                        params_base.speculative.types.erase(
+                                std::remove(params_base.speculative.types.begin(),
+                                            params_base.speculative.types.end(),
+                                            COMMON_SPECULATIVE_TYPE_DRAFT_MTP),
+                                params_base.speculative.types.end());
+                        has_spec = has_draft;
+                    } else {
+                        SRV_ERR("%s", "failed to create MTP context\n");
+                        return false;
+                    }
                 }
 
-                params_base.speculative.draft.ctx_tgt = ctx_tgt;
-                params_base.speculative.draft.ctx_dft = ctx_dft;
+                if (ctx_dft != nullptr) {
+                    params_base.speculative.draft.ctx_tgt = ctx_tgt;
+                    params_base.speculative.draft.ctx_dft = ctx_dft;
+                }
             }
 
             load_progress_callback(1.0f, &load_progress_spec);
