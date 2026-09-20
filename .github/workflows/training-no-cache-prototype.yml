@@ -62,5 +62,6 @@ jobs:
           assert data[:4] == b'GGUF'
           print('EXPORTED_GGUF_BYTES', len(data))
           PY
-          timeout 60 ./build/bin/llama-cli -m finetuned-model.gguf -p 'Once upon a time' -n 4 --no-warmup > reload.log 2>&1 || { cat reload.log; exit 1; }
+          # A predefined prompt still leaves llama-cli's prompt loop alive in CI; force one turn and basic pipe-safe I/O.
+          timeout 60 ./build/bin/llama-cli -m finetuned-model.gguf -p 'Once upon a time' -n 4 --no-warmup --single-turn --simple-io > reload.log 2>&1 || { cat reload.log; exit 1; }
           tail -n 20 reload.log
