@@ -1569,7 +1569,30 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
           ggml_tensor * w_s) const {
-    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
+    ggml_tensor * cur_mm = cur;
+    if (hadamard_rotations) {
+        const auto it = hadamard_rotations->find(w);
+        if (it != hadamard_rotations->end()) {
+            const auto & t = it->second;
+            const auto memo_key = std::make_pair((const ggml_tensor *) cur, (const ggml_tensor *) t.rot);
+            const auto memo_it = hadamard_memo.find(memo_key);
+            if (memo_it != hadamard_memo.end()) {
+                cur_mm = memo_it->second;
+            } else {
+                if (t.perm_rep > 1) {
+                    ggml_tensor * x = ggml_is_contiguous(cur_mm) ? cur_mm : ggml_cont(ctx0, cur_mm);
+                    const int64_t ne1 = x->ne[1], ne2 = x->ne[2], ne3 = x->ne[3];
+                    x = ggml_reshape_4d(ctx0, x, t.perm_hd, t.perm_nk, t.perm_rep, ne1*ne2*ne3);
+                    x = ggml_cont(ctx0, ggml_permute(ctx0, x, 0, 2, 1, 3));
+                    cur_mm = ggml_reshape_4d(ctx0, x, t.perm_hd*t.perm_nk*t.perm_rep, ne1, ne2, ne3);
+                }
+                if (t.signs) cur_mm = ggml_mul(ctx0, cur_mm, t.signs);
+                cur_mm = llama_mul_mat_hadamard(ctx0, cur_mm, t.rot);
+                hadamard_memo[memo_key] = cur_mm;
+            }
+        }
+    }
+    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur_mm, ids);
 
     if (w_s) {
         const int64_t n_expert = w_s->ne[0];
@@ -2360,10 +2383,10 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
         if (hadamard_inverses) {
             const auto it = hadamard_inverses->find(tok_embd);
             if (it != hadamard_inverses->end()) {
+                cur = llama_mul_mat_hadamard(ctx0, cur, it->second.rot);
                 if (it->second.signs) {
                     cur = ggml_mul(ctx0, cur, it->second.signs);
                 }
-                cur = llama_mul_mat_hadamard(ctx0, cur, it->second.rot);
             }
         }
 
