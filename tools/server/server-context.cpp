@@ -4,6 +4,7 @@
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
+#include "server-sched-policy.h"
 #include "server-schema.h"
 #include "server-stream.h"
 
@@ -297,6 +298,11 @@ struct server_slot {
     slot_state resume_state = SLOT_STATE_IDLE;
     int64_t t_suspended = -1;
 
+    // consecutive scheduler steps this slot was offered no prefill budget
+    // bounded by the shared token budget policy, see server-sched-policy.h
+    int32_t n_prompt_wait = 0;
+    int64_t t_prompt_queued = 0;
+
     server_prompt prompt;
 
     bool prompt_save(server_prompt_cache & prompt_cache, bool allow_gpu = true) const {
@@ -414,6 +420,9 @@ struct server_slot {
         spec_is_replay = false;
         resume_state   = SLOT_STATE_IDLE;
         t_suspended    = -1;
+
+        n_prompt_wait    = 0;
+        t_prompt_queued  = 0;
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -940,6 +949,9 @@ private:
     llama_context * ctx_tgt = nullptr;
 
     server_batch batch;
+
+    // shared per-step token budget for the scheduler, see server-sched-policy.h
+    llama_server_sched::token_budget sched_budget;
 
     llama_model   * model_dft = nullptr;
     llama_context * ctx_dft   = nullptr;
@@ -3551,7 +3563,94 @@ private:
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
 
-        // next, batch any pending prompts without exceeding n_batch
+        // [TAG_SCHED_TOKEN_BUDGET] the generating slots are already in the batch
+        // above; they are the running requests. Everything below competes for
+        // what is left of the same physical budget, so a long prompt can no
+        // longer be filled in slot order ahead of a decoder.
+        {
+            sched_budget.clear_grants();
+
+            std::vector<llama_server_sched::prefill_candidate> cands;
+            std::vector<server_slot *>                  cand_slots;
+
+            iterate(slots, [&](server_slot & slot) {
+                if (!slot.is_processing() || batch.size() >= n_batch) {
+                    return;
+                }
+
+                if (slot_batched && !slot_batched->can_batch_with(slot)) {
+                    return;
+                }
+
+                if (slot.state == SLOT_STATE_WAIT_OTHER) {
+                    return;
+                }
+
+                if (slot.state != SLOT_STATE_PROCESSING_PROMPT && slot.state != SLOT_STATE_STARTED) {
+                    return;
+                }
+
+                // A slot whose prompt is fully restored from the prompt cache
+                // can have more cached tokens than the task needs; it still has
+                // to evaluate at least one token for the logits, see
+                // [TAG_PROMPT_LOGITS]. Clamping to 1 keeps such a slot a
+                // candidate - dropping it here would leave the fill loop with
+                // no grant and stall the slot forever.
+                const int32_t n_pending = std::max<int32_t>(
+                    1, (int32_t) (slot.task->n_tokens() - slot.prompt.n_tokens()));
+
+                cands.push_back({ slot.id, n_pending, slot.can_split() });
+                cand_slots.push_back(&slot);
+            });
+
+            if (!cands.empty()) {
+                // reserve the running requests before offering any prefill
+                if (!sched_budget.begin_step(n_batch, /* n_running = */ batch.size())) {
+                    // The batch already holds more than the physical capacity.
+                    // Do not gate the fill on grants that will never exist -
+                    // fall back to the pre-budget behavior of filling up to
+                    // n_batch, and let decode() report the real failure.
+                    SRV_WRN("prefill budget reservation failed (n_batch = %d, running = %d); filling without budget\n",
+                            n_batch, batch.size());
+
+                    for (auto * slot : cand_slots) {
+                        sched_budget.mark_granted(slot->id, n_batch);
+                    }
+                } else {
+                    for (auto & slot : cand_slots) {
+                        sched_budget.mark_wait({
+                            slot->id, slot->t_prompt_queued, slot->n_prompt_wait });
+                    }
+
+                    const auto grants = sched_budget.run_prefill(cands);
+
+                    for (size_t i = 0; i < cand_slots.size(); ++i) {
+                        server_slot & slot = *cand_slots[i];
+
+                        sched_budget.mark_granted(slot.id, grants[i].n_tokens);
+
+                        if (grants[i].n_tokens > 0) {
+                            // this slot has budget; the wait clock stops here
+                            slot.n_prompt_wait = 0;
+                            continue;
+                        }
+
+                        // passed over this step - bounded by the policy so it is
+                        // served first once n_prompt_wait reaches the limit
+                        slot.n_prompt_wait++;
+
+                        if (slot.n_prompt_wait == 1) {
+                            slot.t_prompt_queued = ggml_time_us();
+                        }
+
+                        SLT_DBG(slot, "no prefill budget this step (n_wait = %d, pending = %d, budget = %d)\n",
+                                slot.n_prompt_wait, cands[i].n_pending, sched_budget.remaining());
+                    }
+                }
+            }
+        }
+
+        // next, batch any pending prompts without exceeding the shared budget
         if (params_base.cont_batching || batch.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
@@ -3577,6 +3676,11 @@ private:
 
                 // this slot still has a prompt to be processed
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
+                    // [TAG_SCHED_TOKEN_BUDGET] a slot the budget passed over this
+                    // step must not be filled, or the round above is a no-op
+                    if (!sched_budget.has_slot(slot.id)) {
+                        return;
+                    }
                     const auto & input_tokens = slot.task->tokens;
 
                     // used to determine the number of tokens added to the batch for the current slot
@@ -3974,8 +4078,15 @@ private:
                     const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
 
+                    // [TAG_SCHED_TOKEN_BUDGET] this slot may take only the share
+                    // the policy granted it, not the whole remaining batch
+                    const int32_t n_grant = sched_budget.grant_for(slot.id);
+                    int32_t n_taken     = 0;
+
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() &&
+                           batch.size() < n_batch &&
+                           n_taken < n_grant) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -3999,6 +4110,7 @@ private:
                             /* output    = */ slot.need_embd(),
                             /* is_prompt = */ true);
                         slot.prompt.tokens.push_back(cur_tok);
+                        n_taken++;
 
                         // break at the last user message, or at user messages at least min step past the last checkpoint
                         if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {

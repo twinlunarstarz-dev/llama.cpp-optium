@@ -187,6 +187,11 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build(test-recurrent-rows-runtime.cpp)
     llama_build(test-recurrent-rows-refusal.cpp)
 
+    # Shared token-budget scheduling policy for the server. Includes
+    # tools/server/server-sched-policy.h directly, so it needs no model and no
+    # GPU.
+    llama_build_and_test(test-server-sched-policy.cpp)
+
     if (NOT GGML_BACKEND_DL)
         llama_build(test-quantize-stats.cpp)
     endif()
