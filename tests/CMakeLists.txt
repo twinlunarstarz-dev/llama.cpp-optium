@@ -182,6 +182,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # GPU and must not be nested under `if (TARGET server-context)`.
     llama_build_and_test(test-recurrent-rows.cpp)
 
+    # Runtime counterpart: needs a model, so it is built here but not registered
+    # as a ctest test (it is driven with a generated synthetic fixture).
+    llama_build(test-recurrent-rows-runtime.cpp)
+
     if (NOT GGML_BACKEND_DL)
         llama_build(test-quantize-stats.cpp)
     endif()

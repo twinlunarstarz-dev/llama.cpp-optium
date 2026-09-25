@@ -202,6 +202,10 @@ public:
 private:
     const llama_memory_status status;
 
+    // set when find_slot() could not place the ubatch, so a capacity refusal
+    // surfaces as a failed decode instead of a silently mis-executed one
+    bool slot_failed = false;
+
     llama_memory_recurrent * mem;
 
     size_t i_next = 0;

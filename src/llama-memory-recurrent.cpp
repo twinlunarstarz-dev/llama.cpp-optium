@@ -1287,12 +1287,21 @@ bool llama_memory_recurrent_context::apply() {
         return true;
     }
 
-    mem->find_slot(ubatches[i_next]);
+    if (!mem->find_slot(ubatches[i_next])) {
+        // find_slot() already logged the reason (oversized seq_id, or the
+        // physical row pool could not admit the new sequences).  Recording it
+        // here is what turns a silent mis-execution into a failed decode.
+        slot_failed = true;
+        return false;
+    }
 
     return true;
 }
 
 llama_memory_status llama_memory_recurrent_context::get_status() const {
+    if (slot_failed) {
+        return LLAMA_MEMORY_STATUS_FAILED_PREPARE;
+    }
     return status;
 }
 
