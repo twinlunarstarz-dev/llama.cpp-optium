@@ -18,6 +18,7 @@ def create_server():
     server.n_ctx = 4096
     server.n_batch = 512
     server.n_ubatch = 256
+    server.server_port = 18080  # use a fixed port that won't conflict with load_all() fixture
     # needed by the slot-hygiene assertions below
     server.server_slots = True
     server.start()
