@@ -170,6 +170,13 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         target_include_directories(test-json-schema-to-grammar PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     endif()
 
+    # Filesystem-only regression tests for the KV prompt-cache disk tier. It
+    # includes server-kv-swap.h directly, so it needs no model and no GPU and
+    # must not be nested under `if (TARGET server-context)`: tests/ is
+    # configured before tools/, so that condition is never true here.
+    llama_build_and_test(test-kv-swap-safety.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+    target_include_directories(test-kv-swap-safety PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+
     if (NOT GGML_BACKEND_DL)
         llama_build(test-quantize-stats.cpp)
     endif()

@@ -1,4 +1,5 @@
 #include "server-task.h"
+#include "server-kv-swap.h"
 
 #include "build-info.h"
 #include "server-chat.h"
@@ -22,59 +23,6 @@
 
 namespace {
 
-constexpr size_t KV_SWAP_DEFAULT_MAX_MIB       = 48ull * 1024ull;
-constexpr size_t KV_SWAP_DEFAULT_MIN_FREE_MIB  = 8ull * 1024ull;
-constexpr size_t KV_SWAP_DEFAULT_MAX_FILES     = 128;
-
-size_t kv_swap_env_size(const char * name, size_t fallback) {
-    const char * value = std::getenv(name);
-    if (!value || !value[0]) {
-        return fallback;
-    }
-
-    errno = 0;
-    char * end = nullptr;
-    const unsigned long long parsed = std::strtoull(value, &end, 10);
-    if (errno != 0 || end == value || *end != '\0') {
-        SRV_WRN("invalid %s=%s; using default %zu\n", name, value, fallback);
-        return fallback;
-    }
-
-    return parsed > std::numeric_limits<size_t>::max() ? fallback : static_cast<size_t>(parsed);
-}
-
-size_t kv_swap_tree_bytes(const std::filesystem::path & root, size_t * file_count = nullptr) {
-    size_t bytes = 0;
-    size_t files = 0;
-    std::error_code ec;
-    if (!std::filesystem::exists(root, ec)) {
-        if (file_count) {
-            *file_count = 0;
-        }
-        return 0;
-    }
-
-    for (std::filesystem::recursive_directory_iterator it(root,
-            std::filesystem::directory_options::skip_permission_denied, ec), end;
-            it != end && !ec; it.increment(ec)) {
-        if (!it->is_regular_file(ec)) {
-            continue;
-        }
-        const uintmax_t size = it->file_size(ec);
-        if (ec || size > std::numeric_limits<size_t>::max() - bytes) {
-            bytes = std::numeric_limits<size_t>::max();
-            continue;
-        }
-        bytes += static_cast<size_t>(size);
-        ++files;
-    }
-
-    if (file_count) {
-        *file_count = files;
-    }
-    return bytes;
-}
-
 bool kv_swap_sync_file(const std::filesystem::path & path) {
     const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
@@ -93,44 +41,6 @@ bool kv_swap_sync_dir(const std::filesystem::path & path) {
     const bool ok = ::fsync(fd) == 0;
     ::close(fd);
     return ok;
-}
-
-bool kv_swap_admit(const std::filesystem::path & root,
-        size_t bytes_needed, size_t bytes_replaced, size_t files_replaced, size_t files_needed) {
-    const size_t max_mib = kv_swap_env_size("LLAMA_SERVER_KV_SWAP_MAX_MIB", KV_SWAP_DEFAULT_MAX_MIB);
-    const size_t min_free_mib = kv_swap_env_size("LLAMA_SERVER_KV_SWAP_MIN_FREE_MIB", KV_SWAP_DEFAULT_MIN_FREE_MIB);
-    const size_t max_files = kv_swap_env_size("LLAMA_SERVER_KV_SWAP_MAX_FILES", KV_SWAP_DEFAULT_MAX_FILES);
-    const size_t max_bytes = max_mib > std::numeric_limits<size_t>::max() / (1024ull * 1024ull)
-        ? std::numeric_limits<size_t>::max() : max_mib * 1024ull * 1024ull;
-    const size_t min_free_bytes = min_free_mib > std::numeric_limits<size_t>::max() / (1024ull * 1024ull)
-        ? std::numeric_limits<size_t>::max() : min_free_mib * 1024ull * 1024ull;
-
-    size_t file_count = 0;
-    const size_t used = kv_swap_tree_bytes(root, &file_count);
-    const size_t used_without_replaced = used >= bytes_replaced ? used - bytes_replaced : 0;
-    const size_t files_without_replaced = file_count >= files_replaced ? file_count - files_replaced : 0;
-
-    if (max_bytes > 0 && (bytes_needed > max_bytes || used_without_replaced > max_bytes - bytes_needed)) {
-        SRV_WRN("KV disk admission denied: need %.3f MiB, quota %.3f MiB, used %.3f MiB\n",
-                bytes_needed / (1024.0 * 1024.0), max_bytes / (1024.0 * 1024.0), used / (1024.0 * 1024.0));
-        return false;
-    }
-    if (max_files > 0 && (files_without_replaced > max_files || files_needed > max_files - files_without_replaced)) {
-        SRV_WRN("KV disk admission denied: need %zu files, quota %zu, used %zu files\n",
-                files_needed, max_files, file_count);
-        return false;
-    }
-
-    std::error_code ec;
-    const auto space = std::filesystem::space(root, ec);
-    if (ec || space.available < bytes_needed || space.available - bytes_needed < min_free_bytes) {
-        SRV_WRN("KV disk admission denied: need %.3f MiB plus %.3f MiB free headroom (available %.3f MiB)\n",
-                bytes_needed / (1024.0 * 1024.0), min_free_bytes / (1024.0 * 1024.0),
-                ec ? 0.0 : space.available / (1024.0 * 1024.0));
-        return false;
-    }
-
-    return true;
 }
 
 bool kv_swap_write_commit(const std::filesystem::path & stage, size_t target_bytes, size_t draft_bytes) {
@@ -2027,14 +1937,18 @@ bool server_prompt_cache::store_disk(
             const std::filesystem::path base = env && env[0]
                 ? std::filesystem::path(env)
                 : std::filesystem::path("/tmp/.kv-cache");
-            std::ostringstream name;
-            name << "llama-kv-swap-" << static_cast<const void *>(this);
-            active_disk_dir = (base / name.str()).string();
+            active_disk_dir = (base / server_kv_swap::instance_dir_name(
+                (int) ::getpid(), static_cast<const void *>(this))).string();
             std::filesystem::create_directories(active_disk_dir);
+            // reconcile orphans from previous runs before first use
+            server_kv_swap::reconcile(server_kv_swap::config::for_instance(
+                std::filesystem::path(active_disk_dir), (int) ::getpid()));
             SRV_INF("prompt cache disk tier: %s (quota %.3f GiB, min free %.3f GiB)\n",
                     active_disk_dir.c_str(),
-                    kv_swap_env_size("LLAMA_SERVER_KV_SWAP_MAX_MIB", KV_SWAP_DEFAULT_MAX_MIB) / 1024.0,
-                    kv_swap_env_size("LLAMA_SERVER_KV_SWAP_MIN_FREE_MIB", KV_SWAP_DEFAULT_MIN_FREE_MIB) / 1024.0);
+                    server_kv_swap::env_size("LLAMA_SERVER_KV_SWAP_MAX_MIB",
+                        server_kv_swap::default_max_mib) / 1024.0,
+                    server_kv_swap::env_size("LLAMA_SERVER_KV_SWAP_MIN_FREE_MIB",
+                        server_kv_swap::default_min_free_mib) / 1024.0);
         }
 
         auto exact = [&]() {
@@ -2048,14 +1962,30 @@ bool server_prompt_cache::store_disk(
         size_t old_disk_bytes = 0;
         size_t old_disk_files = 0;
         if (old != states.end() && old->on_disk && !old->disk_dir.empty()) {
-            old_disk_bytes = kv_swap_tree_bytes(old->disk_dir, &old_disk_files);
+            const server_kv_swap::usage old_usage = server_kv_swap::tree_usage(old->disk_dir);
+            old_disk_bytes = old_usage.bytes;
+            old_disk_files = old_usage.files;
         }
 
         const size_t disk_need = size_tgt + size_dft + spec.size() + 8192;
         // target + commit, plus draft when present.  Stage files are not
         // published and are removed on every failure path.
         const size_t disk_files = size_dft > 0 ? 4 : 3;
-        while (!kv_swap_admit(active_disk_dir, disk_need, old_disk_bytes, old_disk_files, disk_files)) {
+
+        server_kv_swap::config cfg =
+            server_kv_swap::config::for_instance(
+                std::filesystem::path(active_disk_dir), (int) ::getpid());
+
+        // The quota spans the shared root, so measure-and-reserve has to be
+        // exclusive against the other server instances writing to it.
+        server_kv_swap::root_lock lock(cfg);
+        if (!lock.held()) {
+            SRV_WRN(" - another instance holds the KV disk root lock; skipping cache publish for slot %d\n",
+                    id_slot);
+            return false;
+        }
+
+        while (!server_kv_swap::admit(cfg, disk_need, old_disk_bytes, old_disk_files, disk_files)) {
             // Disk state is a reusable cache, never the only copy of a live
             // request.  Evict the oldest committed disk entry and retry so a
             // 4 GiB quota cannot turn a new request into a context error.
@@ -2073,7 +2003,9 @@ bool server_prompt_cache::store_disk(
             old_disk_bytes = 0;
             old_disk_files = 0;
             if (old != states.end() && old->on_disk && !old->disk_dir.empty()) {
-                old_disk_bytes = kv_swap_tree_bytes(old->disk_dir, &old_disk_files);
+                const server_kv_swap::usage old_usage = server_kv_swap::tree_usage(old->disk_dir);
+                old_disk_bytes = old_usage.bytes;
+                old_disk_files = old_usage.files;
             }
         }
 
@@ -2085,6 +2017,9 @@ bool server_prompt_cache::store_disk(
                     std::to_string(static_cast<unsigned long long>(::getpid())));
             std::error_code ec;
             if (std::filesystem::create_directory(stage, ec)) {
+                // Make the new generation's directory entry durable so a crash
+                // cannot leave a committed generation unreachable.
+                server_kv_swap::sync_dir(root);
                 break;
             }
             if (generation == std::numeric_limits<uint64_t>::max()) {
@@ -2135,6 +2070,15 @@ bool server_prompt_cache::store_disk(
             SRV_ERR("prompt cache disk commit validation failed for slot %d\n", id_slot);
             ec.clear();
             std::filesystem::remove_all(stage, ec);
+            return false;
+        }
+
+        // Hard quota: re-check after the commit is durable. A rejected
+        // generation is removed and the previously committed state is left
+        // untouched.
+        if (!server_kv_swap::enforce_bound_after_commit(
+                cfg, stage, old_disk_bytes, old_disk_files)) {
+            SRV_WRN("%s", " - published prompt cache generation exceeds root quota; rolling back");
             return false;
         }
 
@@ -2305,7 +2249,9 @@ bool server_prompt_cache::active_store(
     size_t old_disk_bytes = 0;
     size_t old_disk_files = 0;
     if (old_active != active_states.end() && old_active->second.on_disk && !old_active->second.disk_dir.empty()) {
-        old_disk_bytes = kv_swap_tree_bytes(old_active->second.disk_dir, &old_disk_files);
+        const server_kv_swap::usage old_usage = server_kv_swap::tree_usage(old_active->second.disk_dir);
+        old_disk_bytes = old_usage.bytes;
+        old_disk_files = old_usage.files;
     }
 
     const size_t size_tgt = llama_state_seq_get_size_ext(ctx_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
@@ -2372,19 +2318,34 @@ bool server_prompt_cache::active_store(
             const std::filesystem::path base = env && env[0]
                 ? std::filesystem::path(env)
                 : std::filesystem::path("/tmp/.kv-cache");
-            std::ostringstream name;
-            name << "llama-kv-swap-" << static_cast<const void *>(this);
-            active_disk_dir = (base / name.str()).string();
+            active_disk_dir = (base / server_kv_swap::instance_dir_name(
+                (int) ::getpid(), static_cast<const void *>(this))).string();
             std::filesystem::create_directories(active_disk_dir);
+            // reconcile orphans from previous runs before first use
+            server_kv_swap::reconcile(server_kv_swap::config::for_instance(
+                std::filesystem::path(active_disk_dir), (int) ::getpid()));
             SRV_INF("active KV disk tier: %s (quota %.3f GiB, min free %.3f GiB)\n",
                     active_disk_dir.c_str(),
-                    kv_swap_env_size("LLAMA_SERVER_KV_SWAP_MAX_MIB", KV_SWAP_DEFAULT_MAX_MIB) / 1024.0,
-                    kv_swap_env_size("LLAMA_SERVER_KV_SWAP_MIN_FREE_MIB", KV_SWAP_DEFAULT_MIN_FREE_MIB) / 1024.0);
+                    server_kv_swap::env_size("LLAMA_SERVER_KV_SWAP_MAX_MIB",
+                        server_kv_swap::default_max_mib) / 1024.0,
+                    server_kv_swap::env_size("LLAMA_SERVER_KV_SWAP_MIN_FREE_MIB",
+                        server_kv_swap::default_min_free_mib) / 1024.0);
         }
 
         const size_t disk_need = size_tgt + size_dft + spec.size() + 8192;
         const size_t disk_files = size_dft > 0 ? 4 : 3;
-        if (!kv_swap_admit(active_disk_dir, disk_need, old_disk_bytes, old_disk_files, disk_files)) {
+
+        server_kv_swap::config cfg =
+            server_kv_swap::config::for_instance(
+                std::filesystem::path(active_disk_dir), (int) ::getpid());
+
+        server_kv_swap::root_lock lock(cfg);
+        if (!lock.held()) {
+            SRV_WRN("%s", " - another instance holds the KV disk root lock; retaining active state\n");
+            return false;
+        }
+
+        if (!server_kv_swap::admit(cfg, disk_need, old_disk_bytes, old_disk_files, disk_files)) {
             SRV_WRN("active KV disk admission denied for slot %d; retaining active state\n", id_slot);
             return false;
         }
@@ -2396,6 +2357,9 @@ bool server_prompt_cache::active_store(
                     "-" + std::to_string(static_cast<unsigned long long>(::getpid())));
             std::error_code ec;
             if (std::filesystem::create_directory(stage, ec)) {
+                // Make the new generation's directory entry durable so a crash
+                // cannot leave a committed generation unreachable.
+                server_kv_swap::sync_dir(root);
                 break;
             }
             if (generation == std::numeric_limits<uint64_t>::max()) {
@@ -2447,6 +2411,15 @@ bool server_prompt_cache::active_store(
             SRV_ERR("KV disk commit validation failed for slot %d\n", id_slot);
             ec.clear();
             std::filesystem::remove_all(stage, ec);
+            return false;
+        }
+
+        // Hard quota: re-check after the commit is durable. A rejected
+        // generation is removed and the previously committed state is left
+        // untouched.
+        if (!server_kv_swap::enforce_bound_after_commit(
+                cfg, stage, old_disk_bytes, old_disk_files)) {
+            SRV_WRN("%s", " - published active KV generation exceeds root quota; rolling back");
             return false;
         }
         state.on_disk = true;
