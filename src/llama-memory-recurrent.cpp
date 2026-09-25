@@ -39,6 +39,13 @@ llama_memory_recurrent::llama_memory_recurrent(
     cells.clear();
     cells.resize(mem_size);
 
+    // One physical R/S row per cell, at (n_embd_r + n_embd_s) F32 values per
+    // recurrent layer, times the (1 + n_rs_seq) rollback planes.
+    const size_t row_plane_bytes =
+        ((size_t) hparams.n_embd_r() + hparams.n_embd_s()) * sizeof(float);
+    rows_ = llama_recurrent_rows::row_pool(
+        mem_size, row_plane_bytes * (size_t) (1 + n_rs_seq));
+
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
         bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
@@ -125,7 +132,30 @@ llama_memory_recurrent::llama_memory_recurrent(
                 (float)(memory_size_r + memory_size_s) / (1024.0f * 1024.0f), mem_size, n_layer, n_seq_max, n_rs_seq,
                 ggml_type_name(type_r), (float)memory_size_r / (1024.0f * 1024.0f),
                 ggml_type_name(type_s), (float)memory_size_s / (1024.0f * 1024.0f));
+
+        // A logical sequence may be one of many server slots, but a recurrent
+        // state row is allocated per resident sequence.  Report the real
+        // ceiling so the advertised slot count is not mistaken for capacity.
+        LLAMA_LOG_INFO("%s: recurrent capacity: %u logical sequences, %u physical rows "
+                       "(%zu bytes per row, %zu bytes fully resident)\n", __func__,
+                n_seq_max, mem_size, (size_t) rows_.plane_bytes(),
+                (size_t) rows_.plane_bytes() * mem_size);
     }
+}
+
+void llama_memory_recurrent::rows_sync() {
+    // A cell with no seq_id owns no state; a cell shared by several logical
+    // sequences holds one state, so the lowest live seq_id is the row's owner
+    // for accounting purposes only - row identity itself stays cell-derived.
+    std::vector<int32_t> table(size, llama_recurrent_rows::row_pool::k_free);
+    for (uint32_t i = 0; i < size; ++i) {
+        if (cells[i].seq_id.empty()) {
+            continue;
+        }
+        const llama_seq_id seq_id = *cells[i].seq_id.begin();
+        table[i] = seq_id >= 0 ? seq_id : llama_recurrent_rows::row_pool::k_free;
+    }
+    rows_.reconcile(table);
 }
 
 void llama_memory_recurrent::clear(bool data) {
@@ -147,6 +177,8 @@ void llama_memory_recurrent::clear(bool data) {
 
     std::fill(rs_idx.begin(), rs_idx.end(), 0);
     std::fill(seq_tail.begin(), seq_tail.end(), -1);
+
+    rows_sync();
 }
 
 bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -216,6 +248,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 }
                 cells[i].pos = -1;
                 cells[i].src = -1;
+                rows_.release_row(i);
                 if (new_head == size) {
                     new_head = i;
                 }
@@ -259,6 +292,7 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
             if (cell_dst.seq_id.empty()) {
                 cell_dst.pos = -1;
                 cell_dst.src = -1;
+                rows_.release_row(tail_dst);
                 used -= 1;
             }
         }
@@ -302,6 +336,8 @@ void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
     if (new_head != size && new_head < head) {
         head = new_head;
     }
+
+    rows_sync();
 }
 
 void llama_memory_recurrent::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
@@ -490,6 +526,11 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
     used = org_used;
     head = org_head;
 
+    // find_slot() speculatively placed cells that are now being thrown away, so
+    // the row owners have to be re-derived from the restored cell table;
+    // otherwise a dry run would leave the pool looking occupied.
+    rows_sync();
+
     return success;
 }
 
@@ -514,6 +555,12 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
     int32_t max = 0;
 
     // everything should fit if all seq_ids are smaller than the max
+    //
+    // A sequence that already owns a cell does not need a second row, so the
+    // physical bound is on *newly resident* sequences, not on the batch width.
+    // Counting here also lets an over-subscribed context be refused as an
+    // admission decision, instead of failing later inside cell search.
+    std::vector<llama_seq_id> pending;
     for (uint32_t s = 0; s < n_seqs; ++s) {
         const uint32_t i = s*n_seq_tokens; // first token of sequence set s
         const uint32_t n_seq_id = ubatch.n_seq_id[i];
@@ -526,6 +573,14 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                 // TODO: would it be possible to resize the cache instead?
                 LLAMA_LOG_ERROR("%s: seq_id=%d >= n_seq_max=%u Try using a bigger --parallel value\n", __func__, seq_id, n_seq_max);
                 return false;
+            }
+            if (j == 0) {
+                const int32_t tail_id = seq_tail[seq_id];
+                const bool owns_cell  = tail_id >= 0 && cells[tail_id].seq_id.size() == 1 &&
+                                        cells[tail_id].has_seq_id(seq_id);
+                if (!owns_cell && std::find(pending.begin(), pending.end(), seq_id) == pending.end()) {
+                    pending.push_back(seq_id);
+                }
             }
             if (j > 0) {
                 int32_t & seq_tail_id = seq_tail[seq_id];
@@ -543,6 +598,12 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                 }
             }
         }
+    }
+
+    if (!pending.empty() && !rows_.can_admit((uint32_t) pending.size())) {
+        LLAMA_LOG_ERROR("%s: recurrent state pool is full (%u/%u rows resident, %u new sequence(s) requested)\n",
+                __func__, rows_.n_resident(), size, (uint32_t) pending.size());
+        return false;
     }
 
 #ifndef NDEBUG
@@ -703,6 +764,11 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
     n    = max - min + 1;
     used = std::count_if(cells.begin(), cells.end(),
         [](const mem_cell & cell){ return !cell.is_empty(); });
+
+    // Cells were moved around, so rebuild the row owners from the cell table.
+    // Placement is bounded by `size` by construction, so this cannot fail; a
+    // failure here would mean cells.size() != size.
+    rows_sync();
 
     // sanity check
     return n >= n_seqs;
@@ -1053,6 +1119,9 @@ bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell
         // make sure the recurrent states will keep their restored state
         cells[cell_id].src = cell_id;
     }
+
+    // The cell table was rebuilt directly, so re-derive the row owners.
+    rows_sync();
 
     return true;
 }

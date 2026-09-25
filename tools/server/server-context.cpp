@@ -1347,6 +1347,19 @@ private:
         SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
                 params_base.n_parallel, n_ctx_slot, params_base.kv_unified ? "true" : "false");
 
+        {
+            // A logical slot is not a recurrent-state row.  When the rows are
+            // scarcer than the slots, the surplus slots are only logical: the
+            // server suspends their state instead of keeping it resident, so
+            // say so at startup rather than letting it look like overcommit.
+            const uint32_t n_rows = llama_n_seq_max_resident(ctx_tgt);
+            if (n_rows < (uint32_t) params_base.n_parallel) {
+                SRV_INF("recurrent-state capacity: %u resident row(s) for %d slot(s); "
+                        "slots beyond the first %u suspend and restore their state\n",
+                        n_rows, params_base.n_parallel, n_rows);
+            }
+        }
+
         // initialize slots
         for (int i = 0; i < params_base.n_parallel; i++) {
             slots.emplace_back();
@@ -2603,6 +2616,51 @@ private:
         return victim;
     }
 
+    // The physical recurrent-state row count is a real capacity limit that is
+    // independent of the unified-KV and prompt-cache settings, so it is checked
+    // on its own rather than as a side effect of the shared-KV policy.  When
+    // rows are scarcer than slots, the surplus slots can never be resident at
+    // the same time, and the server must say so by suspending or deferring
+    // instead of failing later inside decode.
+    bool make_room_for_recurrent_rows(const server_task & task, bool & blocked) {
+        blocked = false;
+
+        if (task.is_parent() || task.is_child()) {
+            return true;
+        }
+
+        const uint32_t resident_limit = std::max<uint32_t>(1, llama_n_seq_max_resident(ctx_tgt));
+        if (resident_limit >= (uint32_t) params_base.n_parallel) {
+            // every logical slot can be resident; nothing to arbitrate
+            return true;
+        }
+
+        int n_resident = 0;
+        for (const auto & slot : slots) {
+            if (slot.is_resident_processing()) {
+                n_resident++;
+            }
+        }
+        if (n_resident < (int) resident_limit) {
+            return true;
+        }
+
+        // one more resident sequence would exceed the row pool
+        if (!prompt_cache) {
+            // cannot suspend without a store; defer rather than oversubscribe
+            blocked = true;
+            return false;
+        }
+
+        server_slot * victim = largest_suspendable_resident();
+        if (!victim || !suspend_active_slot(*victim, "admitting another request would exceed resident recurrent-state capacity")) {
+            blocked = true;
+            return false;
+        }
+
+        return true;
+    }
+
     bool make_room_for_incoming(const server_task & task) {
         if (!params_base.kv_unified || params_base.n_parallel <= 1 || !prompt_cache ||
                 !task.need_sampling() || task.is_parent() || task.is_child()) {
@@ -2750,6 +2808,17 @@ private:
                         SRV_DBG("unable to reach a safe active-KV suspension boundary; defer task, id_task = %d\n", id_task);
                         queue_tasks.defer(std::move(task));
                         break;
+                    }
+
+                    {
+                        bool rows_blocked = false;
+                        if (has_idle_candidate && !make_room_for_recurrent_rows(task, rows_blocked)) {
+                            if (rows_blocked) {
+                                SRV_DBG("resident recurrent-state rows exhausted; defer task, id_task = %d\n", id_task);
+                            }
+                            queue_tasks.defer(std::move(task));
+                            break;
+                        }
                     }
 
                     server_slot * slot = get_available_slot(task);
@@ -4591,6 +4660,7 @@ server_context_meta server_context::get_meta() const {
         /* has_inp_video          */ impl->chat_params.allow_video,
         /* json_ui_settings       */ impl->json_ui_settings,
         /* slot_n_ctx             */ impl->get_slot_n_ctx(),
+        /* n_resident_slots       */ llama_n_seq_max_resident(impl->ctx_tgt),
         /* pooling_type           */ llama_pooling_type(impl->ctx_tgt),
 
         /* chat_params            */ impl->chat_params,
@@ -5005,6 +5075,9 @@ static json get_res_props(const server_context_meta & meta, const common_params 
     json props = {
         { "default_generation_settings", default_generation_settings_for_props },
         { "total_slots",                 params.n_parallel },
+        { "resident_slots",              meta.n_resident_slots < params.n_parallel
+                                            ? (uint32_t) meta.n_resident_slots
+                                            : (uint32_t) params.n_parallel },
         { "model_alias",                 meta.model_name },
         { "model_ftype",                 meta.model_ftype },
         { "model_path",                  meta.model_path },

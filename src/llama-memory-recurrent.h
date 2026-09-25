@@ -3,6 +3,7 @@
 #include "llama-batch.h"
 #include "llama-graph.h"
 #include "llama-memory.h"
+#include "llama-recurrent-rows.h"
 
 #include <map>
 #include <set>
@@ -63,6 +64,16 @@ public:
 
     uint32_t max_resident_sequences() const override { return size; }
 
+    // Physical recurrent-state row accounting.  `size` cells and `size`
+    // rows are the same physical storage, so a resident sequence always holds
+    // exactly one row; the pool exists to make that occupancy explicit and to
+    // keep it reconcilable against `cells`.
+    const llama_recurrent_rows::row_pool & rows()   const { return rows_; }
+    uint32_t n_rows_resident()                     const { return rows_.n_resident(); }
+    uint64_t row_bytes()                           const { return rows_.plane_bytes(); }
+    uint64_t bytes_resident()                      const { return rows_.bytes_resident(); }
+    bool can_admit_resident(uint32_t n_extra) const { return rows_.can_admit(n_extra); }
+
     // state write/load
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
@@ -77,6 +88,14 @@ public:
 
     // per-seq rollback index
     std::vector<uint32_t> rs_idx;
+
+    // owner of each physical R/S row, reconcilable from `cells`
+    llama_recurrent_rows::row_pool rows_;
+
+    // Rebuild rows_ from `cells`.  Called wherever the cell table is changed
+    // wholesale rather than through seq_rm(), so the accounting can never
+    // describe a different state than the cells do.
+    void rows_sync();
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 

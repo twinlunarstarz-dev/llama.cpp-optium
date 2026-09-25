@@ -25,6 +25,9 @@ struct server_context_meta {
     bool has_inp_video;
     json json_ui_settings;
     int slot_n_ctx;
+    // Physical recurrent-state rows, which can be fewer than the logical slot
+    // count.  UINT32_MAX means the model keeps no separate recurrent state.
+    uint32_t n_resident_slots;
     enum llama_pooling_type pooling_type;
 
     // chat params

@@ -177,6 +177,11 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-kv-swap-safety.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     target_include_directories(test-kv-swap-safety PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
 
+    # Bookkeeping-only regression tests for the recurrent physical-row pool.
+    # Includes src/llama-recurrent-rows.h directly, so it needs no model and no
+    # GPU and must not be nested under `if (TARGET server-context)`.
+    llama_build_and_test(test-recurrent-rows.cpp)
+
     if (NOT GGML_BACKEND_DL)
         llama_build(test-quantize-stats.cpp)
     endif()
