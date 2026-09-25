@@ -185,6 +185,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # Runtime counterpart: needs a model, so it is built here but not registered
     # as a ctest test (it is driven with a generated synthetic fixture).
     llama_build(test-recurrent-rows-runtime.cpp)
+    llama_build(test-recurrent-rows-refusal.cpp)
 
     if (NOT GGML_BACKEND_DL)
         llama_build(test-quantize-stats.cpp)
