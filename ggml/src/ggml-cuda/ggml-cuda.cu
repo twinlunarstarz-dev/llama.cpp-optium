@@ -2587,7 +2587,36 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 }
 
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+    // Previously returned cgraph->nodes[0], which changes each rebuild,
+    // breaking CUDA graph reuse. Now builds a stable descriptor key based
+    // on node count and the first node's operation / shape. We return the
+    // same pointer for the same descriptor by using a fixed-size descriptor
+    // ring mapped by hash of the descriptor fields, so identical shapes reuse
+    // the captured CUDA graph.
+    static struct {
+        int         n_nodes;
+        int         op;
+        int         type;
+        int64_t     ne[GGML_MAX_DIMS];
+    } descriptors[16];
+
+    // Compute a hash/index from descriptor content for stability
+    int hash = 0;
+    int op_val = (cgraph->n_nodes > 0 && cgraph->nodes[0] != nullptr) ? (int)cgraph->nodes[0]->op : -1;
+    int type_val = (cgraph->n_nodes > 0 && cgraph->nodes[0] != nullptr) ? (int)cgraph->nodes[0]->type : -1;
+    hash = cgraph->n_nodes * 31 + op_val * 17 + type_val * 7;
+    for (int i = 0; i < GGML_MAX_DIMS && cgraph->n_nodes > 0 && cgraph->nodes[0] != nullptr; i++) {
+        hash = hash * 11 + (int)(cgraph->nodes[0]->ne[i] & 0xFFFFFFFF);
+    }
+
+    int idx = ((hash % 16) + 16) % 16;
+    descriptors[idx].n_nodes = cgraph->n_nodes;
+    descriptors[idx].op      = op_val;
+    descriptors[idx].type    = type_val;
+    for (int i = 0; i < GGML_MAX_DIMS; i++) {
+        descriptors[idx].ne[i] = (cgraph->n_nodes > 0 && cgraph->nodes[0] != nullptr) ? cgraph->nodes[0]->ne[i] : 0;
+    }
+    return &descriptors[idx];
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
