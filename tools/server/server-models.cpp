@@ -914,6 +914,19 @@ bool server_models::has_model(const std::string & name) {
     return false;
 }
 
+bool server_models::is_stopping(const std::string & name) {
+    std::lock_guard<std::mutex> lk(mutex);
+    if (stopping_models.count(name)) {
+        return true;
+    }
+    for (const auto & [key, inst] : mapping) {
+        if (inst.meta.aliases.count(name) && stopping_models.count(key)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 std::optional<server_model_meta> server_models::get_meta(const std::string & name) {
     std::unique_lock<std::mutex> lk(mutex);
     if (need_reload) {
@@ -1392,7 +1405,31 @@ bool server_models::ensure_model_ready(const std::string & name, const std::func
         throw std::runtime_error("model name=" + name + " is not found");
     }
     if (meta->is_ready()) {
-        return false; // ready for taking requests
+        // an unload already in flight leaves the status LOADED until the child
+        // exits, so a request arriving in that window would be proxied to a port
+        // that is about to disappear.  wait the stop out and fall through to the
+        // load path, else the client gets a proxy error instead of an answer.
+        if (is_stopping(name)) {
+            SRV_INF("model name=%s is unloading, waiting before serving the request\n", name.c_str());
+            {
+                std::unique_lock<std::mutex> lk(mutex);
+                cv.wait(lk, [&]() {
+                    auto it = mapping.find(name);
+                    return it == mapping.end() || !it->second.meta.is_running()
+                        || stopping_models.find(name) == stopping_models.end();
+                });
+            }
+            // the copy taken above predates the wait, so refresh before it is used
+            meta = get_meta(name);
+            if (!meta.has_value()) {
+                throw std::runtime_error("model name=" + name + " is not found");
+            }
+            if (meta->is_ready()) {
+                return false; // the stop was withdrawn, the child is still serving
+            }
+        } else {
+            return false; // ready for taking requests
+        }
     }
     if (meta->status == SERVER_MODEL_STATUS_SLEEPING) {
         return false; // child is sleeping but still running; new request will wake it up

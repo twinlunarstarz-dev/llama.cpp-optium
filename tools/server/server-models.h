@@ -245,6 +245,11 @@ public:
     // check if a model instance exists (thread-safe)
     bool has_model(const std::string & name);
 
+    // true while a stop/unload of this model is in flight.  the status stays
+    // LOADED until the child actually exits, so this is the only way to tell
+    // "serving" from "about to stop serving" (thread-safe)
+    bool is_stopping(const std::string & name);
+
     // return a copy of model metadata (thread-safe)
     std::optional<server_model_meta> get_meta(const std::string & name);
 

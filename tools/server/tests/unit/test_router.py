@@ -760,3 +760,80 @@ def test_router_sequential_multi_cuda_device_list_accepted(device: str, global_d
         assert args[args.index("--device") + 1] == device
     finally:
         os.remove(preset_path)
+
+
+#
+# switch safety: a request naming an alias that is unloading must be served by a
+# fresh instance, never proxied to the port of the child that is going away.
+#
+
+def test_router_request_during_unload_is_served():
+    global server
+    server.models_max = 2
+    server.start()
+    model_id = "ggml-org/tinygemma3-GGUF:Q8_0"
+
+    _load_model_and_wait(model_id, timeout=120)
+
+    # unload returns as soon as the stop is requested; the child is still
+    # shutting down, so its status is not yet "unloaded"
+    unload_res = server.make_request("POST", "/models/unload", data={"model": model_id})
+    assert unload_res.status_code == 200
+
+    # immediately ask for the same alias: the router must autoload a new
+    # instance rather than proxy to the dying child's port
+    res = server.make_request(
+        "POST", "/completion",
+        data={"model": model_id, "prompt": "hello", "n_predict": 1, "stream": False},
+        timeout=180,
+    )
+    assert res.status_code == 200, f"expected a served request, got {res.status_code}: {res.body}"
+    assert "content" in res.body
+
+    # and the model is healthy again afterwards
+    _wait_for_model_status(model_id, {"loaded"}, timeout=120)
+
+
+def test_router_concurrent_switch_two_models():
+    global server
+    server.models_max = 2
+    server.start()
+    a = "ggml-org/tinygemma3-GGUF:Q8_0"
+    b = "ggml-org/test-model-stories260K:F32"
+
+    _load_model_and_wait(a, timeout=120)
+    _load_model_and_wait(b, timeout=120)
+
+    results = {}
+    errors = []
+
+    def ask(model_id: str, key: str) -> None:
+        try:
+            res = server.make_request(
+                "POST", "/completion",
+                data={"model": model_id, "prompt": "hello", "n_predict": 1, "stream": False},
+                timeout=300,
+            )
+            results[key] = (res.status_code, res.body.get("content"))
+        except Exception as ex:  # noqa: BLE001
+            errors.append(f"{key}: {ex}")
+
+    # simultaneous requests naming two different aliases, while both are loaded
+    threads = [threading.Thread(target=ask, args=(a, "a1")),
+               threading.Thread(target=ask, args=(b, "b1")),
+               threading.Thread(target=ask, args=(a, "a2")),
+               threading.Thread(target=ask, args=(b, "b2"))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"concurrent switch raised: {errors}"
+    assert len(results) == 4
+    for key, (status, content) in results.items():
+        assert status == 200, f"{key} got {status}"
+        assert content is not None
+
+    # both models must still be loaded and uncorrupted afterwards
+    assert _get_model_status(a) == "loaded"
+    assert _get_model_status(b) == "loaded"
