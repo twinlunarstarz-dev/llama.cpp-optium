@@ -288,6 +288,9 @@ struct server_slot {
     bool has_next_token = true;
     bool has_new_line   = false;
     bool truncated      = false;
+    // set when this slot lost its own KV history to the shared unified pool, which
+    // is silent context corruption rather than a deliberate context shift
+    bool self_evicted   = false;
 
     stop_type stop;
 
@@ -428,6 +431,7 @@ struct server_slot {
         generated_text = "";
         has_new_line   = false;
         truncated      = false;
+        self_evicted   = false;
         stop           = STOP_TYPE_NONE;
         stopping_word  = "";
         n_sent_text    = 0;
@@ -2313,7 +2317,13 @@ private:
         res->prompt          = slot.task->tokens.detokenize(ctx_tgt, true);
         res->response_fields = std::move(slot.task->params.response_fields);
 
-        res->truncated             = slot.truncated;
+        res->truncated             = slot.truncated || slot.self_evicted;
+    // tell the client WHY it was truncated: a deliberate context shift is a
+    // normal limit, but losing history to pool eviction means the answer above
+    // was produced from a context that is no longer what the client sent.
+    if (slot.self_evicted) {
+        res->stopping_word = "kv_pool_evicted";
+    }
         res->n_decoded             = slot.stats.n_gen;
         res->n_prompt_tokens       = slot.task->n_tokens();
         res->n_prompt_tokens_cache = slot.stats.n_prompt_cached;
@@ -3452,6 +3462,28 @@ private:
                 }
 
                 slot.truncated = true;
+
+                // A slot can also lose its OWN history to the shared unified KV
+                // pool, not just to context shift.  With kv_unified = true every
+                // slot may claim the full n_ctx, but the pool is only n_ctx cells
+                // in total, so when several long sequences are live the pool
+                // evicts a sequence's own head to make room (memory_seq_rm
+                // [n_tokens, end)).  The shift above then looks like ordinary
+                // context shift and the client is told `truncated`, so the loss
+                // is invisible: the agent keeps answering over a history that is
+                // no longer there.  Measured 269 such events in one 2-agent run.
+                //
+                // Distinguish the two.  When the pool is shared (kv_unified) and
+                // the slot still believes it owns n_ctx, this is eviction, not a
+                // deliberate shift, and the caller must be told.
+                if (params_base.kv_unified) {
+                    slot.self_evicted = true;
+                    SLT_WRN(slot, "slot lost its own KV history to the shared unified pool "
+                                  "(n_discard = %d of n_left = %d); the pool is over-subscribed. "
+                                  "Set kv_unified = false and size ctx-size to parallel x the "
+                                  "per-agent context to give every slot a private pool.\n",
+                            n_discard, n_left);
+                }
             }
         });
 
