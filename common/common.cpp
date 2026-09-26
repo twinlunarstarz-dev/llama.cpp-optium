@@ -1913,11 +1913,11 @@ void common_batch_clear(struct llama_batch & batch) {
 }
 
 void common_batch_add(
-                 struct llama_batch & batch,
-                        llama_token   id,
-                          llama_pos   pos,
+                  struct llama_batch & batch,
+                         llama_token   id,
+                           llama_pos   pos,
     const std::vector<llama_seq_id> & seq_ids,
-                               bool   logits) {
+                                bool   logits) {
     GGML_ASSERT(batch.seq_id[batch.n_tokens] && "llama_batch size exceeded");
 
     batch.token   [batch.n_tokens] = id;

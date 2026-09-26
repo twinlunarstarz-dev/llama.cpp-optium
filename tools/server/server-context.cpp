@@ -1478,11 +1478,54 @@ private:
         }
 
         // the update_slots() logic will always submit a maximum of n_batch or n_parallel tokens
-        // note that n_batch can be > n_ctx (e.g. for non-causal attention models such as BERT where the KV cache is not used)
+        // note that n_batch can be > n_ctx (e.g. for non-causal attention models such as BERT where the KV cache is not u
         {
             const int32_t n_batch = llama_n_batch(ctx_tgt);
             const int32_t n_embd  = llama_model_n_embd_inp(model_tgt);
-            batch.init(std::max(n_batch, params_base.n_parallel), n_embd);
+
+            // Speculative decoding appends draft tokens onto this same batch
+            // (common/speculative.cpp calls common_batch_add for every drafted
+            // token). The scheduler already fills the batch to exactly n_batch,
+            // so the draft appends push past the allocation and used to abort the
+            // entire server:
+            //   GGML_ASSERT(batch.seq_id[batch.n_tokens] && "llama_batch size exceeded")
+            // Reserve headroom for the largest per-sequence draft any enabled
+            // speculative type can produce. This only reserves address space for
+            // the batch arrays; the extra rows are never submitted to the model,
+            // so the compute buffer and n_batch semantics are unchanged.
+            int32_t n_spec_headroom = 0;
+            for (const auto & spec_type : params_base.speculative.types) {
+                switch (spec_type) {
+                    case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
+                    case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
+                    case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
+                    case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
+                        n_spec_headroom = std::max(n_spec_headroom, params_base.speculative.draft.n_max + 1);
+                        break;
+                    case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:
+                        n_spec_headroom = std::max(n_spec_headroom, params_base.speculative.ngram_mod.n_max + 1);
+                        break;
+                    case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
+                        n_spec_headroom = std::max(n_spec_headroom, (int32_t) params_base.speculative.ngram_simple.size_m);
+                        break;
+                    case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:
+                        n_spec_headroom = std::max(n_spec_headroom, (int32_t) params_base.speculative.ngram_map_k.size_m);
+                        break;
+                    case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V:
+                        n_spec_headroom = std::max(n_spec_headroom, (int32_t) params_base.speculative.ngram_map_k4v.size_m);
+                        break;
+                    case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
+                        n_spec_headroom = std::max(n_spec_headroom, 8);
+                        break;
+                    default:
+                        break;
+                }
+            }
+            const int32_t n_spec_total = n_spec_headroom > 0
+                ? n_spec_headroom * std::max(1, params_base.n_parallel)
+                : 0;
+
+            batch.init(std::max(n_batch, params_base.n_parallel) + n_spec_total, n_embd);
         }
 
         const bool active_kv_swap = !utility_model && params_base.kv_unified && params_base.n_parallel > 1;

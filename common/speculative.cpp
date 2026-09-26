@@ -2587,6 +2587,58 @@ common_speculative_init_result::common_speculative_init_result(
     cparams.n_rs_seq  = 0;
     cparams.ctx_other = ctx_tgt;
 
+    // The draft context is a FULL llama_context and gets its own compute buffer
+    // sized from n_batch/n_ubatch. Drafting, however, only ever evaluates
+    // (1 + n_max) tokens per sequence: one token to extend plus the drafted
+    // window. Inheriting the target's n_ubatch therefore reserved a compute
+    // buffer orders of magnitude larger than the draft can use -- with
+    // n_ubatch=2048 that was 5617 MiB/device, and because the draft context is
+    // created AFTER the target has already claimed its VRAM, the allocation
+    // failed with cudaMalloc OOM and the server silently continued with
+    // draft-mtp disabled ("implicit MTP context unavailable").
+    //
+    // That made the target's own prefill budget hostage to a buffer nobody
+    // uses. Clamp the draft to what it can actually evaluate so the target can
+    // raise n_ubatch.
+    //
+    // IMPORTANT: only n_ubatch may be clamped. n_batch is the bound on the
+    // BATCHING ARRAYS, and the draft batch is filled with a copy of the entire
+    // target verify batch (common/speculative.cpp: `for k in 0..n_tokens:
+    // common_batch_add(batch, batch_in.token[k], ...)`) BEFORE the MTP rows are
+    // appended on top. Clamping n_batch therefore overflows the draft batch and
+    // aborts the server with
+    //   GGML_ASSERT(batch.seq_id[batch.n_tokens] && "llama_batch size exceeded")
+    // once a prefill batch exceeds the clamp. n_batch must stay at (or above)
+    // the target's, plus headroom for the draft's own rows.
+    {
+        // Per-sequence token ceiling the draft context can ever evaluate. The
+        // authoritative source is common_speculative_get_output_limits() in this
+        // same file: 1 + n_max for model drafts, n_max + 1 for DFlash/DSpark,
+        // and ngram-mod contributes its own (larger) window.
+        int32_t per_seq = 1 + std::max(0, params.speculative.draft.n_max);
+        for (const auto & spec : params.speculative.types) {
+            switch (spec) {
+                case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
+                case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
+                    per_seq = std::max(per_seq, params.speculative.draft.n_max + 1);
+                    break;
+                case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:
+                    per_seq = std::max(per_seq, params.speculative.ngram_mod.n_max);
+                    break;
+                default:
+                    break;
+            }
+        }
+        // The verify copy alone can be the target's full n_batch, and the draft
+        // appends per_seq rows per sequence on top of it. Note llama_cparams
+        // declares n_batch/n_ubatch as uint32_t while common_params uses int32_t.
+        const int32_t n_parallel = std::max(1, (int32_t) params.n_parallel);
+        const int32_t n_batch_min = std::max((int32_t) cparams.n_batch, params.n_batch) +
+            per_seq * n_parallel;
+        cparams.n_batch  = (uint32_t) n_batch_min;
+        cparams.n_ubatch = (uint32_t) std::min<int32_t>((int32_t) cparams.n_ubatch, per_seq * n_parallel);
+    }
+
     std::string model_path;
     if (has_draft) {
         model_path = params.speculative.draft.mparams.path;
