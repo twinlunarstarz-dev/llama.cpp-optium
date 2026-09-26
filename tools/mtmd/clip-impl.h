@@ -1057,3 +1057,7 @@ static void print_tensor_data(ggml_tensor * t, uint8_t * data, int64_t n) {
 
 projector_type clip_get_projector_type(const struct clip_ctx * ctx);
 void clip_set_debug_output_embeddings(struct clip_ctx * ctx, bool debug);
+
+// general.basename of the mmproj file, or "" when the key is absent.  Used to check
+// that the mmproj and the text model come from the same base model.
+std::string clip_get_basename(const struct clip_ctx * ctx);

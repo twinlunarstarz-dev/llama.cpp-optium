@@ -1157,6 +1157,9 @@ struct clip_model_loader {
 
     std::string fname;
 
+    // general.basename, read while ctx_gguf is alive
+    std::string model_basename;
+
     size_t model_size = 0; // in bytes
 
     bool has_vision    = false;
@@ -1187,6 +1190,16 @@ struct clip_model_loader {
         }
 
         ctx_meta.reset(meta);
+
+        // cache the identity before the gguf context goes away
+        {
+            std::string basename;
+            get_string("general.basename", basename, false);
+            if (!basename.empty()) {
+                LOG_INF("%s: basename:     %s\n", __func__, basename.c_str());
+            }
+            model_basename = basename;
+        }
 
         const int n_tensors = gguf_get_n_tensors(ctx_gguf.get());
 
@@ -3928,6 +3941,7 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
 
         if (loader.has_vision) {
             ctx_vision = new clip_ctx(ctx_params);
+            ctx_vision->model.basename = loader.model_basename;
             loader.load_hparams(ctx_vision->model, CLIP_MODALITY_VISION);
             loader.load_tensors(*ctx_vision);
             loader.init_ctx(*ctx_vision);
@@ -3942,6 +3956,7 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
 
         if (loader.has_audio && !skip_audio) {
             ctx_audio = new clip_ctx(ctx_params);
+            ctx_audio->model.basename = loader.model_basename;
             loader.load_hparams(ctx_audio->model, CLIP_MODALITY_AUDIO);
             loader.load_tensors(*ctx_audio);
             loader.init_ctx(*ctx_audio);
@@ -5939,6 +5954,10 @@ projector_type clip_get_projector_type(const struct clip_ctx * ctx) {
 
 const clip_hparams * clip_get_hparams(const struct clip_ctx * ctx) {
     return &ctx->model.hparams;
+}
+
+std::string clip_get_basename(const struct clip_ctx * ctx) {
+    return ctx->model.basename;
 }
 
 std::map<ggml_backend_dev_t, size_t> clip_get_mem_usage(const struct clip_ctx * ctx) {

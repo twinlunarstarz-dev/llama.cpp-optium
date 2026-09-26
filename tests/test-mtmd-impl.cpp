@@ -138,6 +138,49 @@ MAKE_TEST(test_temporal_merge_grouping) {
 }
 
 //
+// mmproj / text model identity
+//
+
+MAKE_TEST(test_mmproj_identity_check) {
+    // both sides present and equal -> ok
+    t.assert_equal(
+        "matching basename",
+        std::string("ok"),
+        std::string(mtmd_mmproj_identity_result("Qwen3.8-27B", "Qwen3.8-27B").status));
+
+    // both sides present and different -> mismatch
+    t.assert_equal(
+        "differing basename",
+        std::string("mismatch"),
+        std::string(mtmd_mmproj_identity_result("Qwen3.8-27B", "SmartCode-Fable-5-CoT-Reasoning-QKVO-Qwen-3.6").status));
+
+    // the real footgun: same embedding width, different model family
+    t.assert_equal(
+        "same width different model",
+        std::string("mismatch"),
+        std::string(mtmd_mmproj_identity_result("Qwen3.8-27B", "Gemma-4-31B").status));
+
+    // metadata absent on either side must NOT block a legitimate load
+    t.assert_equal(
+        "empty mmproj basename",
+        std::string("unknown"),
+        std::string(mtmd_mmproj_identity_result("Qwen3.8-27B", "").status));
+    t.assert_equal(
+        "empty text basename",
+        std::string("unknown"),
+        std::string(mtmd_mmproj_identity_result("", "Qwen3.8-27B").status));
+    t.assert_equal(
+        "both empty",
+        std::string("unknown"),
+        std::string(mtmd_mmproj_identity_result("", "").status));
+
+    // the reported basenames must survive so the failure message is actionable
+    const auto r = mtmd_mmproj_identity_result("Qwen3.8-27B", "Gemma-4-31B");
+    t.assert_equal("reported text basename", std::string("Qwen3.8-27B"), std::string(r.text_basename));
+    t.assert_equal("reported mmproj basename", std::string("Gemma-4-31B"), std::string(r.mmproj_basename));
+}
+
+//
 // main
 //
 

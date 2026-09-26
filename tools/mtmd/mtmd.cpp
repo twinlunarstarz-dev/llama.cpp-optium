@@ -491,6 +491,7 @@ struct mtmd_context {
     int n_threads;
     std::string media_marker;
     const int n_embd_text = -1; // -1 means llm context not provided, skip checking this
+    const llama_model * text_model = nullptr; // can be nullptr if text_model is not provided
     const llama_vocab * vocab = nullptr; // can be nullptr if text_model is not provided
     mtmd_pos_type pos_type;
 
@@ -533,6 +534,7 @@ struct mtmd_context {
         n_threads       (ctx_params.n_threads),
         media_marker    (ctx_params.media_marker),
         n_embd_text     (text_model ? llama_model_n_embd_inp(text_model) : -1),
+        text_model      (text_model),
         vocab           (text_model ? llama_model_get_vocab(text_model) : nullptr),
         batch_max_tokens(ctx_params.batch_max_tokens)
     {
@@ -619,6 +621,38 @@ struct mtmd_context {
         }
         if (ctx_a) {
             init_audio();
+        }
+        check_model_identity(mmproj_fname);
+    }
+
+    // The n_embd check above only catches a mismatch in embedding width.  Two different
+    // base models can share a width, so also compare the GGUF basename when both files
+    // carry one.  A missing key is not evidence of a mismatch and must not block a load.
+    void check_model_identity(const char * mmproj_fname) {
+        std::string text_basename;
+        if (text_model) {
+            char buf[256] = {0};
+            if (llama_model_meta_val_str(text_model, "general.basename", buf, sizeof(buf)) > 0) {
+                text_basename = buf;
+            }
+        }
+
+        const struct clip_ctx * ctx_any = ctx_v ? ctx_v : (ctx_a ? ctx_a : ctx_gen_a);
+        if (!ctx_any) {
+            return;
+        }
+
+        const auto identity = mtmd_mmproj_identity_result(text_basename, clip_get_basename(ctx_any));
+
+        if (strcmp(identity.status, "mismatch") == 0) {
+            throw std::runtime_error(string_format(
+                "text model (base model '%s') does not match mmproj (base model '%s') loaded from %s\n"
+                "hint: you may be using wrong mmproj\n",
+                identity.text_basename.c_str(), identity.mmproj_basename.c_str(), mmproj_fname));
+        }
+        if (strcmp(identity.status, "unknown") == 0) {
+            LOG_DBG("%s: cannot verify mmproj identity (text basename '%s', mmproj basename '%s')\n",
+                    __func__, text_basename.c_str(), identity.mmproj_basename.c_str());
         }
     }
 
@@ -1088,6 +1122,15 @@ mtmd_context * mtmd_init_from_file(const char * mmproj_fname,
 
 void mtmd_free(mtmd_context * ctx) {
     delete ctx;
+}
+
+mtmd_mmproj_identity mtmd_mmproj_identity_result(const std::string & text_basename, const std::string & mmproj_basename) {
+    // metadata is optional in GGUF, and several converters omit general.basename for the
+    // mmproj half.  An absent key is never proof of a mismatch, so it must not gate a load.
+    if (text_basename.empty() || mmproj_basename.empty()) {
+        return { "unknown", text_basename, mmproj_basename };
+    }
+    return { text_basename == mmproj_basename ? "ok" : "mismatch", text_basename, mmproj_basename };
 }
 
 std::vector<std::vector<const mtmd_bitmap *>> mtmd_group_mergeable_bitmaps(std::vector<mtmd_input_part> & parts, int n_merge) {

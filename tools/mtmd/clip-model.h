@@ -9,6 +9,7 @@
 #include <vector>
 #include <unordered_set>
 #include <cstdint>
+#include <string>
 #include <cmath>
 
 enum ffn_op_type {
@@ -552,6 +553,10 @@ struct clip_model {
     clip_modality modality = CLIP_MODALITY_VISION;
     projector_type proj_type = PROJECTOR_TYPE_MLP;
     clip_hparams hparams;
+
+    // general.basename of the GGUF, empty when the key is absent.  Read while the
+    // loader's gguf context is still alive; the context is released after load.
+    std::string basename;
 
     // embeddings
     ggml_tensor * class_embedding = nullptr;
