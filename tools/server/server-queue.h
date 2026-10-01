@@ -63,7 +63,10 @@ public:
 
     // Call when the state of one slot is changed, it will move one task from deferred to main queue
     // prioritize tasks that use the specified slot (otherwise, pop the first deferred task)
-    void pop_deferred_task(int id_slot);
+    // Re-offer one deferred task after a slot was released.
+    // free_tokens is the number of unified-KV tokens currently free. Pass
+    // SIZE_MAX when that is unknown, which preserves strict FIFO ordering.
+    void pop_deferred_task(int id_slot, size_t free_tokens = SIZE_MAX);
 
     // if sleeping, request exiting sleep state and wait until it is done
     // returns immediately if not sleeping

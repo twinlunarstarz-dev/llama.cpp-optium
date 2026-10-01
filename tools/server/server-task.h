@@ -145,6 +145,13 @@ struct server_task {
     int id_target = -1;
     int id_slot   = -1;
 
+    // Number of times this task has been held back because it did not fit in
+    // the shared unified-KV budget.  Owner requirement: the queue must stay
+    // stable over long runs, so a task that can never fit must eventually fail
+    // with a clear error instead of waiting forever.
+    int n_deferred = 0;
+    int64_t t_first_deferred = -1;
+
     // used by parallel sampling (multiple completions from same prompt)
     int id_parent  = -1;
     // temporary store of child tasks for scheduling

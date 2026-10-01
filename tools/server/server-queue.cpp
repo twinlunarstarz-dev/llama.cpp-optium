@@ -76,6 +76,10 @@ int server_queue::post(std::vector<server_task> && tasks, bool front) {
 void server_queue::defer(server_task && task) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     QUE_DBG("defer task, id = %d\n", task.id);
+    task.n_deferred++;
+    if (task.t_first_deferred < 0) {
+        task.t_first_deferred = ggml_time_ms();
+    }
     queue_tasks_deferred.push_back(std::move(task));
     time_last_task = ggml_time_ms();
     condition_tasks.notify_one();
@@ -87,7 +91,7 @@ int server_queue::get_new_id() {
     return new_id;
 }
 
-void server_queue::pop_deferred_task(int id_slot) {
+void server_queue::pop_deferred_task(int id_slot, size_t free_tokens) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     if (!queue_tasks_deferred.empty()) {
         // try to find a task that uses the specified slot
@@ -101,11 +105,31 @@ void server_queue::pop_deferred_task(int id_slot) {
                 break;
             }
         }
-        // if not tasks found using the slot, just pop the first deferred task (default behavior)
+        // if no task found using the slot, prefer the oldest task that actually
+        // fits the free budget.  Owner requirement: a small request that fits
+        // must not sit behind a large one that cannot, otherwise head-of-line
+        // blocking starves the small request for the whole run.  Strict FIFO is
+        // kept as the fallback when nothing fits yet, preserving the original
+        // ordering semantics for the case where no budget information is
+        // available (free_tokens == SIZE_MAX sentinel).
         if (!found) {
-            QUE_DBG("pop deferred task, id_task = %d\n", queue_tasks_deferred.front().id);
-            queue_tasks.emplace_front(std::move(queue_tasks_deferred.front()));
-            queue_tasks_deferred.pop_front();
+            auto chosen = queue_tasks_deferred.end();
+            if (free_tokens != SIZE_MAX) {
+                for (auto it = queue_tasks_deferred.begin(); it != queue_tasks_deferred.end(); ++it) {
+                    const size_t need = (size_t) it->n_tokens() + 1;
+                    if (need <= free_tokens) {
+                        chosen = it;
+                        break;
+                    }
+                }
+            }
+            if (chosen == queue_tasks_deferred.end()) {
+                chosen = queue_tasks_deferred.begin();
+            }
+            QUE_DBG("pop deferred task, id_task = %d, n_tokens = %d, free = %zu\n",
+                    chosen->id, chosen->n_tokens(), free_tokens);
+            queue_tasks.emplace_front(std::move(*chosen));
+            queue_tasks_deferred.erase(chosen);
         }
     }
     time_last_task = ggml_time_ms();

@@ -1441,7 +1441,23 @@ private:
                 if (prompt_cache) {
                     prompt_cache->active_erase(id_slot);
                 }
-                queue_tasks.pop_deferred_task(id_slot);
+                // Pass the real free unified-KV budget so the queue can admit a
+                // deferred request that actually fits instead of only ever
+                // offering the oldest one (owner requirement: a small request
+                // that fits must not sit behind a large one that cannot).
+                size_t free_tokens = SIZE_MAX;
+                if (params_base.kv_unified && n_ctx > 0) {
+                    const size_t headroom = active_kv_headroom();
+                    const size_t shared_limit = (size_t) n_ctx > headroom ? (size_t) n_ctx - headroom : (size_t) n_ctx;
+                    size_t used = 0;
+                    for (const auto & other : slots) {
+                        if (other.id != id_slot && other.is_resident_processing()) {
+                            used += slot_projected_kv_tokens(other);
+                        }
+                    }
+                    free_tokens = used < shared_limit ? shared_limit - used : 0;
+                }
+                queue_tasks.pop_deferred_task(id_slot, free_tokens);
             };
 
             slot.callback_on_reset = [this](const server_slot & slot) {
@@ -2710,22 +2726,46 @@ private:
             return true;
         }
 
-        // one more resident sequence would exceed the row pool
-        if (!prompt_cache) {
-            // cannot suspend without a store; defer rather than oversubscribe
-            blocked = true;
-            return false;
-        }
-
-        server_slot * victim = largest_suspendable_resident();
-        if (!victim || !suspend_active_slot(*victim, "admitting another request would exceed resident recurrent-state capacity")) {
-            blocked = true;
-            return false;
-        }
-
-        return true;
+        // one more resident sequence would exceed the row pool.  Same owner
+        // policy as make_room_for_incoming(): hold the incoming request rather
+        // than preempting a live one.
+        blocked = true;
+        return false;
     }
 
+    // Owner policy (2026-10-01): an incoming request that does not fit the shared
+    // unified-KV budget is HELD rather than preempting a running one.  After
+    // this long, a held request is failed with a clear error so a long-running
+    // server cannot accumulate requests that wait forever.
+    static constexpr int64_t max_defer_wait_s = 900;
+
+    // Starvation guard (owner requirement: stable over long runs).  A task that has
+    // been held this many times, or waited this long, can never fit alongside
+    // the live requests, so fail it with a clear error instead of leaving the
+    // client hanging on an open socket.  This is the backstop that the old
+    // preemption path lacked entirely.
+    bool deferred_task_is_starved(const server_task & task) const {
+        const bool too_often  = task.n_deferred >= 64;
+        const bool too_long   = task.t_first_deferred >= 0 &&
+                                (ggml_time_ms() - task.t_first_deferred) > (int64_t) max_defer_wait_s * 1000;
+        if (too_often || too_long) {
+            SRV_WRN("giving up on task id = %d after %d deferrals / %lld ms: it does not fit in the shared context\n",
+                    task.id, task.n_deferred,
+                    (long long) (task.t_first_deferred >= 0 ? ggml_time_ms() - task.t_first_deferred : 0));
+            return true;
+        }
+        return false;
+    }
+
+    // Owner policy (2026-10-01): the INCOMING request is held, never a running
+    // one.  Earlier revisions suspended the largest resident slot to free room
+    // for the newcomer; that preempted a live request mid-generation, and the
+    // resume path was gated behind n_resident == 0, which sustained load never
+    // satisfies.  The preempted request then held is_processing() == true
+    // forever, permanently consumed a slot, and emitted only 30 s SSE keepalive
+    // pings to its client, so no client timeout ever fired.  Queueing is both
+    // what the owner asked for and the only policy with bounded worst-case
+    // latency, so admission never preempts here.
     bool make_room_for_incoming(const server_task & task) {
         if (!params_base.kv_unified || params_base.n_parallel <= 1 || !prompt_cache ||
                 !task.need_sampling() || task.is_parent() || task.is_child()) {
@@ -2737,28 +2777,24 @@ private:
         const size_t shared_limit = (size_t) n_ctx > headroom ? (size_t) n_ctx - headroom : (size_t) n_ctx;
         const uint32_t resident_limit = std::max<uint32_t>(1, llama_n_seq_max_resident(ctx_tgt));
 
-        while (true) {
-            size_t projected = incoming;
-            int n_resident = 0;
-            for (const auto & slot : slots) {
-                if (slot.is_resident_processing()) {
-                    projected += slot_projected_kv_tokens(slot);
-                    n_resident++;
-                }
-            }
-
-            if (n_resident < (int) resident_limit && projected <= shared_limit) {
-                return true;
-            }
-
-            server_slot * victim = largest_suspendable_resident();
-            const char * reason = n_resident >= (int) resident_limit
-                ? "admitting another request would exceed resident recurrent-state capacity"
-                : "admitting another request would exceed unified KV capacity";
-            if (!victim || !suspend_active_slot(*victim, reason)) {
-                return false;
+        size_t projected = incoming;
+        int n_resident = 0;
+        for (const auto & slot : slots) {
+            if (slot.is_resident_processing()) {
+                projected += slot_projected_kv_tokens(slot);
+                n_resident++;
             }
         }
+
+        if (n_resident < (int) resident_limit && projected <= shared_limit) {
+            return true;
+        }
+
+        // Does not fit alongside the live requests: defer instead of preempting.
+        SRV_DBG("incoming request held (id_task = %d, needs %zu tokens, %zu resident tokens "
+                "projected against %zu): would exceed unified KV budget\n",
+                task.id, incoming, projected, shared_limit);
+        return false;
     }
 
     void rebalance_active_kv_residency() {
@@ -2771,62 +2807,61 @@ private:
             n_resident += slot.is_resident_processing() ? 1 : 0;
         }
 
-        if (n_resident == 0) {
-            for (auto & idle : slots) {
-                if (idle.is_processing() || idle.prompt.tokens.empty()) {
-                    continue;
-                }
-                if (idle.prompt_save(*prompt_cache, false)) {
-                    prompt_cache->update();
-                } else {
-                    SLT_WRN(idle, "%s", "failed to save idle KV state before suspended-state restore\n");
-                    return;
-                }
-                idle.prompt_clear();
+        // Owner policy (2026-10-01): never preempt a live request.  Admission now
+        // holds the incoming request instead (make_room_for_incoming), so the
+        // only thing left to do here is RESUME anything left suspended by an
+        // older build or by an explicit operator action.  The two preemption
+        // loops that used to live here were the second source of permanently
+        // hung slots: they suspended running requests on every update_slots()
+        // tick, and the resume branch above required n_resident == 0, which
+        // sustained load never reaches.
+        //
+        // Bounded and explicit: at most one resume per call, oldest first.
+        server_slot * oldest = nullptr;
+        for (auto & slot : slots) {
+            if (!slot.is_suspended()) {
+                continue;
             }
-
-            server_slot * oldest = nullptr;
-            for (auto & slot : slots) {
-                if (!slot.is_suspended()) {
-                    continue;
-                }
-                if (!oldest || slot.t_suspended < oldest->t_suspended) {
-                    oldest = &slot;
-                }
+            if (!oldest || slot.t_suspended < oldest->t_suspended) {
+                oldest = &slot;
             }
-            if (oldest && !resume_active_slot(*oldest)) {
-                send_error(*oldest, "failed to restore suspended KV state", ERROR_TYPE_SERVER);
-                oldest->release();
-            }
+        }
+        if (!oldest) {
             return;
         }
 
+        // Only resume when there is genuine room, i.e. this slot plus at most
+        // one other stays inside the shared budget.
         const size_t headroom = active_kv_headroom();
         const size_t shared_limit = (size_t) n_ctx > headroom ? (size_t) n_ctx - headroom : (size_t) n_ctx;
-        const uint32_t resident_limit = std::max<uint32_t>(1, llama_n_seq_max_resident(ctx_tgt));
-        while (n_resident > (int) resident_limit) {
-            server_slot * victim = largest_suspendable_resident();
-            if (!victim || !suspend_active_slot(*victim, "live contexts exceeded resident recurrent-state capacity")) {
-                break;
+        size_t projected = slot_projected_kv_tokens(*oldest);
+        int n_other_resident = 0;
+        for (auto & slot : slots) {
+            if (&slot != oldest && slot.is_resident_processing()) {
+                projected += slot_projected_kv_tokens(slot);
+                n_other_resident++;
             }
-            n_resident--;
+        }
+        if (n_other_resident > 1 || projected > shared_limit) {
+            return;
         }
 
-        while (n_resident > 1) {
-            size_t projected = 0;
-            for (const auto & slot : slots) {
-                if (slot.is_resident_processing()) {
-                    projected += slot_projected_kv_tokens(slot);
-                }
+        for (auto & idle : slots) {
+            if (idle.is_processing() || idle.prompt.tokens.empty()) {
+                continue;
             }
-            if (projected <= shared_limit) {
-                break;
+            if (!idle.prompt_save(*prompt_cache, false)) {
+                SLT_WRN(idle, "%s", "failed to save idle KV state before suspended-state restore\n");
+                return;
             }
-            server_slot * victim = largest_suspendable_resident();
-            if (!victim || !suspend_active_slot(*victim, "live contexts approached unified KV capacity")) {
-                break;
-            }
-            n_resident--;
+            idle.prompt_clear();
+        }
+        prompt_cache->update();
+
+        if (!resume_active_slot(*oldest)) {
+            // A resume that fails must not leave the client hanging forever.
+            send_error(*oldest, "failed to restore suspended KV state", ERROR_TYPE_SERVER);
+            oldest->release();
         }
     }
 
@@ -2870,7 +2905,14 @@ private:
                         break;
                     }
                     if (has_idle_candidate && !make_room_for_incoming(task)) {
-                        SRV_DBG("unable to reach a safe active-KV suspension boundary; defer task, id_task = %d\n", id_task);
+                        if (deferred_task_is_starved(task)) {
+                            send_error(id_task,
+                                    "request does not fit in the shared context alongside the "
+                                    "requests already running; it was held until it could not wait longer",
+                                    ERROR_TYPE_SERVER);
+                            break;
+                        }
+                        SRV_DBG("incoming request held; does not fit the shared KV budget, id_task = %d\n", id_task);
                         queue_tasks.defer(std::move(task));
                         break;
                     }
