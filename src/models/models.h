@@ -2340,17 +2340,9 @@ struct llama_model_qwen4exp : public llama_model_base {
 
         // QSA: the additive mask [n_kv, n_tokens] of the top blocks and the tail, kq_mask included
         ggml_tensor * build_qsa_sel(
+
   const llama_memory_hybrid_idx_context * mctx_hyb,
           llm_graph_input_kpool * inp_kpool,
-                    ggml_tensor * cur,
-                    ggml_tensor * inp_pos,
-                    ggml_tensor * kq_mask,
-                            int * sections,
-                            int   il);
-
-        // QSA mask for this layer, or nullptr for dense attention
-        ggml_tensor * build_qsa_mask(
-  const llama_memory_hybrid_idx_context * mctx_hyb,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                     ggml_tensor * kq_mask,
