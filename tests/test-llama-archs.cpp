@@ -16,8 +16,6 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
-#include <cmath>
-#include <filesystem>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -31,27 +29,13 @@ static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
     double mse_a_0 = 0.0;
 
     for (size_t i = 0; i < a.size(); i++) {
-        const float a_i = a[i];
-        const float b_i = b[i];
-
-        // Some architectures intentionally pad unavailable output logits with
-        // identical infinities (for example, the Qwen3TTS codec head). Matching
-        // infinities are equivalent; NaNs and mismatched non-finite values are
-        // still invalid test output.
-        if (a_i == b_i) {
-            continue;
-        }
-        if (!std::isfinite(a_i) || !std::isfinite(b_i)) {
-            return INFINITY;
-        }
+        float a_i = a[i];
+        float b_i = b[i];
 
         mse_a_b += (a_i - b_i) * (a_i - b_i);
         mse_a_0 += a_i * a_i;
     }
 
-    if (mse_a_0 == 0.0) {
-        return mse_a_b == 0.0 ? 0.0 : INFINITY;
-    }
     return mse_a_b / mse_a_0;
 }
 
@@ -81,7 +65,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -98,7 +82,7 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
 static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     gguf_context_ptr ret(gguf_init_empty());
     llama_model_saver ms(arch, ret.get());
-    const uint32_t n_ctx = 128;
+    const uint32_t n_ctx = 256;
 
     uint32_t n_vocab = 128;
     uint32_t n_embd  = 256;
@@ -265,8 +249,43 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
 
     // MSA requires one indexer head per GQA (KV) head, unlike the DSA archs where the
     // indexer head count is independent of the main attention head count.
-    ms.add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,   arch == LLM_ARCH_MINIMAX_M3 || arch == LLM_ARCH_DEEPSEEK4 ? n_head : uint32_t(1));
-    ms.add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,   uint32_t(64));
+    if (arch == LLM_ARCH_QWEN4EXP) {
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,    uint32_t(4));
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_LOW_RANK, uint32_t(8));
+        // without this the QSA layers fall back to dense and go uncovered
+        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>(n_layer, 4));
+
+        // has_cell_ext() needs ple_n_heads here: the indexer cache serializes no ext without it
+        const uint32_t ple_ngram_size      = 3;
+        const uint32_t ple_heads_per_ngram = 2;
+        const uint32_t ple_n_heads         = (ple_ngram_size - 1)*ple_heads_per_ngram;
+        GGML_ASSERT(n_embd % ple_n_heads == 0);
+        const uint32_t ple_head_dim = n_embd/ple_n_heads;
+
+        std::vector<uint64_t> ple_head_offsets(ple_n_heads);
+        std::vector<uint64_t> ple_head_vocab_sizes(ple_n_heads, n_vocab);
+        for (uint32_t h = 0; h < ple_n_heads; h++) {
+            ple_head_offsets[h] = uint64_t(h)*n_vocab;
+        }
+
+        // the PLE history lives in the recurrent cache, so it must sit on a linear attention layer
+        ms.add_kv(LLM_KV_PLE_LAYERS,                  std::vector<uint32_t>({ 0 }));
+        ms.add_kv(LLM_KV_PLE_NGRAM_SIZE,              ple_ngram_size);
+        ms.add_kv(LLM_KV_PLE_HEADS_PER_NGRAM,         ple_heads_per_ngram);
+        ms.add_kv(LLM_KV_PLE_CONV_KERNEL,             uint32_t(4));
+        ms.add_kv(LLM_KV_PLE_EOS_TOKEN_ID,            uint32_t(0));
+        ms.add_kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER,  ple_head_dim);
+        ms.add_kv(LLM_KV_PLE_LAYER_MULTIPLIERS,       std::vector<uint64_t>({ 1, 3, 5 }));
+        ms.add_kv(LLM_KV_PLE_HEAD_OFFSETS,            ple_head_offsets);
+        ms.add_kv(LLM_KV_PLE_HEAD_VOCAB_SIZES,        ple_head_vocab_sizes);
+    }
+
+    // minimax-m3 keeps one indexer head per GQA head; the rest use a fixed 64 to match the fused
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,   arch == LLM_ARCH_MINIMAX_M3 ? n_head : uint32_t(64));
+    // qwen4exp ropes indexer keys with the main rotary width, so its head can't be < n_rot
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,
+              arch == LLM_ARCH_QWEN4EXP ? n_embd_head : uint32_t(128));
+
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,        uint32_t(8));
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_BLOCK_SIZE,   uint32_t(4));
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_LOCAL_BLOCKS, uint32_t(1));
@@ -310,7 +329,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_XIELU_ALPHA_P,             1.0f);
     ms.add_kv(LLM_KV_XIELU_BETA,                1.0f);
     ms.add_kv(LLM_KV_XIELU_EPS,                 1.0e-7f);
-    ms.add_kv(LLM_KV_SSM_INNER_SIZE,            arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ? 256 : 2*n_embd);
+    ms.add_kv(LLM_KV_SSM_INNER_SIZE,            arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP ? 256 : 2*n_embd);
     ms.add_kv(LLM_KV_SSM_CONV_KERNEL,           uint32_t(4));
     ms.add_kv(LLM_KV_SSM_STATE_SIZE,            uint32_t(128));
     ms.add_kv(LLM_KV_SSM_TIME_STEP_RANK,        n_head);
@@ -427,6 +446,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_QWEN3NEXT:
         case LLM_ARCH_QWEN3VLMOE:
         case LLM_ARCH_QWEN35MOE:
+        case LLM_ARCH_QWEN4EXP:
         case LLM_ARCH_PHIMOE:
         case LLM_ARCH_DBRX:
         case LLM_ARCH_OLMOE:
@@ -523,7 +543,7 @@ static bool arch_supported(const llm_arch arch) {
     }
     // FIXME: these hit scheduler/view-backed-output issues with WebGPU on CI.
 #ifdef GGML_USE_WEBGPU
-    if (arch == LLM_ARCH_DEEPSEEK32 || arch == LLM_ARCH_GLM_DSA || arch == LLM_ARCH_DOTS3NOTE) {
+    if (arch == LLM_ARCH_DEEPSEEK32 || arch == LLM_ARCH_GLM_DSA || arch == LLM_ARCH_DOTS3NOTE || arch == LLM_ARCH_QWEN4EXP) {
         return false;
     }
 #endif // GGML_USE_WEBGPU
@@ -539,115 +559,27 @@ static bool arch_supported(const llm_arch arch) {
     return true;
 }
 
-struct error_stats {
-    double max_abs = 0.0;
-    double max_rel = 0.0;
-};
-
-static error_stats compare_logits(const std::vector<float> & expected, const std::vector<float> & actual) {
-    GGML_ASSERT(expected.size() == actual.size());
-    error_stats result;
-    for (size_t i = 0; i < expected.size(); ++i) {
-        const double abs_error = std::abs(double(expected[i]) - double(actual[i]));
-        const double denom = std::max(std::abs(double(expected[i])), 1.0e-6);
-        result.max_abs = std::max(result.max_abs, abs_error);
-        result.max_rel = std::max(result.max_rel, abs_error / denom);
-    }
-    return result;
-}
-
-static ggml_backend_dev_t get_single_cuda_device() {
-    ggml_backend_dev_t result = nullptr;
-    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-        if (reg != nullptr && strcmp(ggml_backend_reg_name(reg), "CUDA") == 0) {
-            GGML_ASSERT(result == nullptr);
-            result = dev;
-        }
-    }
-    return result;
-}
-
-static std::vector<float> load_file_and_decode(
-        const std::string & path, ggml_backend_dev_t cuda_dev, bool sequential, const std::vector<llama_token> & tokens) {
-    llama_model_params model_params = llama_model_default_params();
-    ggml_backend_dev_t devices[] = { cuda_dev, nullptr };
-    model_params.devices = devices;
-    model_params.sequential_load = sequential;
-    model_params.load_mode = LLAMA_LOAD_MODE_MMAP;
-    model_params.n_gpu_layers = 99;
-
-    llama_model_ptr model(llama_model_load_from_file(path.c_str(), model_params));
-    if (!model) {
-        throw std::runtime_error(std::string(sequential ? "sequential" : "ordinary") + " file load failed");
-    }
-    llama_context_params ctx_params = llama_context_default_params();
-    ctx_params.n_ctx = 128;
-    ctx_params.n_batch = 32;
-    ctx_params.n_ubatch = 32;
-    llama_context_ptr ctx(llama_init_from_model(model.get(), ctx_params));
-    if (!ctx) {
-        throw std::runtime_error(std::string(sequential ? "sequential" : "ordinary") + " context creation failed");
-    }
-    return get_logits(model.get(), ctx.get(), tokens);
-}
-
-static int validate_sequential_fixture(const llm_arch arch, const size_t seed, const std::string & dir) {
-    ggml_backend_dev_t cuda_dev = get_single_cuda_device();
-    if (cuda_dev == nullptr) {
-        throw std::runtime_error("exactly one visible CUDA device is required");
-    }
-
-    std::filesystem::create_directories(dir);
-    const std::string path = dir + "/" + llm_arch_name(arch) + "-dense.gguf";
-    gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, false);
-    auto generated = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {});
-    llama_model_save_to_file(generated.first.get(), path.c_str());
-    generated = {};
-
-    const std::vector<llama_token> tokens = { 5, 6, 7, 8 };
-    const std::vector<float> ordinary = load_file_and_decode(path, cuda_dev, false, tokens);
-
-    size_t free_before = 0;
-    size_t total = 0;
-    ggml_backend_dev_memory(cuda_dev, &free_before, &total);
-    error_stats worst;
-    for (int cycle = 0; cycle < 3; ++cycle) {
-        const std::vector<float> sequential = load_file_and_decode(path, cuda_dev, true, tokens);
-        const error_stats current = compare_logits(ordinary, sequential);
-        worst.max_abs = std::max(worst.max_abs, current.max_abs);
-        worst.max_rel = std::max(worst.max_rel, current.max_rel);
-    }
-    size_t free_after = 0;
-    ggml_backend_dev_memory(cuda_dev, &free_after, &total);
-    const int64_t drift = int64_t(free_before) - int64_t(free_after);
-    const uintmax_t file_size = std::filesystem::file_size(path);
-    printf("SEQUENTIAL_RESULT arch=%s bytes=%" PRIuMAX " ordinary=PASS sequential=PASS cycles=3 max_abs=%.9g max_rel=%.9g free_before=%zu free_after=%zu drift=%" PRId64 "\n",
-        llm_arch_name(arch), file_size, worst.max_abs, worst.max_rel, free_before, free_after, drift);
-
-    if (worst.max_abs > 1.0e-5 || worst.max_rel > 1.0e-4 || std::abs(drift) > 2*1024*1024) {
-        throw std::runtime_error("sequential fixture tolerance or VRAM drift exceeded");
-    }
-    return 0;
-}
-
-static int save_models(const llm_arch target_arch, const size_t seed, const ggml_log_level log_level, const std::string & dir) {
+static int save_models(const llm_arch target_arch, const size_t seed, const int verbosity, const std::string & dir) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
             void * user_data;
-        } original_logger;
-        ggml_log_level min_level; // prints below this log level go to debug log
+        } log_old;
+
+        int verbosity;
+
+        user_data_t(int verbosity) : verbosity(verbosity) {
+            llama_log_get(&log_old.callback, &log_old.user_data);
+        }
     };
-    user_data_t ud;
-    llama_log_get(&ud.original_logger.callback, &ud.original_logger.user_data);
-    ud.min_level = log_level;
+    user_data_t ud(verbosity);
 
     llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
         const user_data_t * ud = (const user_data_t *) user_data;
-        const ggml_log_level level_eff = level >= ud->min_level ? level : GGML_LOG_LEVEL_DEBUG;
-        ud->original_logger.callback(level_eff, text, ud->original_logger.user_data);
+        int verbosity = common_log_get_verbosity(level);
+        if (verbosity <= ud->verbosity) {
+            ud->log_old.callback(level, text, ud->log_old.user_data);
+        }
     }, &ud);
 
     for (const llm_arch & arch : llm_arch_all()) {
@@ -681,26 +613,31 @@ static int save_models(const llm_arch target_arch, const size_t seed, const ggml
             llama_model_save_to_file(model_and_ctx.first.get(), path.c_str());
         }
     }
-    llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
+    llama_log_set(ud.log_old.callback, ud.log_old.user_data);
     return 0;
 }
 
-static int test_backends(const llm_arch target_arch, const size_t seed, const ggml_log_level log_level) {
+static int test_backends(const llm_arch target_arch, const size_t seed, const int verbosity) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
             void * user_data;
-        } original_logger;
-        ggml_log_level min_level; // prints below this log level go to debug log
+        } log_old;
+
+        int verbosity;
+
+        user_data_t(int verbosity) : verbosity(verbosity) {
+            llama_log_get(&log_old.callback, &log_old.user_data);
+        }
     };
-    user_data_t ud;
-    llama_log_get(&ud.original_logger.callback, &ud.original_logger.user_data);
-    ud.min_level = log_level;
+    user_data_t ud(verbosity);
 
     llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
         const user_data_t * ud = (const user_data_t *) user_data;
-        const ggml_log_level level_eff = level >= ud->min_level ? level : GGML_LOG_LEVEL_DEBUG;
-        ud->original_logger.callback(level_eff, text, ud->original_logger.user_data);
+        int verbosity = common_log_get_verbosity(level);
+        if (verbosity <= ud->verbosity) {
+            ud->log_old.callback(level, text, ud->log_old.user_data);
+        }
     }, &ud);
 
     const std::vector<llama_token> tokens = get_tokens(128, 128, seed);
@@ -796,6 +733,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                 std::string status_nmse      = "\033[1;33mSKIP\033[0m";
                 std::string status_roundtrip = "\033[1;33mSKIP\033[0m";
                 char nmse_str[12] = {0};
+
                 bool skip = !arch_supported(arch) || (dc.split_mode == LLAMA_SPLIT_MODE_TENSOR && dc.devs.empty());
                 if (!skip) {
                     if (logits_cpu.empty()) {
@@ -830,21 +768,8 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
                             model_and_ctx_roundtrip.first.get(), model_and_ctx_roundtrip.second.get(), tokens, encode);
                         status_roundtrip = "\033[1;32mOK\033[0m";
                         GGML_ASSERT(logits_roundtrip.size() == logits_dev.size());
-                        constexpr double roundtrip_abs_tol = 1.0e-5;
-                        constexpr double roundtrip_rel_tol = 1.0e-4;
                         for (size_t i = 0; i < logits_roundtrip.size(); i++) {
-                            const double a = logits_roundtrip[i];
-                            const double b = logits_dev[i];
-                            // Matching infinities are intentional padding for
-                            // codec-head architectures; mismatched infinities
-                            // and NaNs remain failures below.
-                            if (a == b) {
-                                continue;
-                            }
-                            const double abs_err = std::abs(a - b);
-                            const double scale = std::max(std::abs(a), std::abs(b));
-                            const double allowed = roundtrip_abs_tol + roundtrip_rel_tol * scale;
-                            if (!std::isfinite(a) || !std::isfinite(b) || abs_err > allowed) {
+                            if (logits_roundtrip[i] != logits_dev[i]) {
                                 all_ok = false;
                                 status_roundtrip = "\033[1;31mFAIL\033[0m";
                                 break;
@@ -859,21 +784,28 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const gg
             }
         }
     }
-    llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
+    llama_log_set(ud.log_old.callback, ud.log_old.user_data);
     return all_ok ? 0 : 1;
 }
 
 int main(int argc, char ** argv) {
-    // FIXME these tests are disabled in the CI for macOS-latest-cmake-arm64 because they are segfaulting
+    // init the logger at max verbosity. filter with a custom callback respecting the user-configure verbosity
+    common_log_set_verbosity_thold(LOG_LEVEL_DEBUG);
     common_init();
+
     std::random_device rd;
 
     llm_arch arch = LLM_ARCH_UNKNOWN;
     size_t seed = rd();
-    ggml_log_level log_level = GGML_LOG_LEVEL_ERROR;
     std::string out;
 
+    int verbosity = LOG_LEVEL_ERROR;
+
     for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            usage(argv);
+            return 0;
+        }
         if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--arch") == 0) {
             if (i + 1 < argc) {
                 const std::string arch_name = argv[++i];
@@ -895,9 +827,13 @@ int main(int argc, char ** argv) {
                 return 1;
             }
         }
-        if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
-            log_level = GGML_LOG_LEVEL_INFO;
-            continue;
+        if (strcmp(argv[i], "-v") == 0) {
+            if (i + 1 < argc) {
+                verbosity = std::stoull(argv[++i]);
+            } else {
+                usage(argv);
+                return 1;
+            }
         }
         if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--out") == 0) {
             if (i + 1 < argc) {
@@ -912,9 +848,9 @@ int main(int argc, char ** argv) {
 
     try {
         if (!out.empty()) {
-            return save_models(arch, seed, log_level, out);
+            return save_models(arch, seed, verbosity, out);
         }
-        return test_backends(arch, seed, log_level);
+        return test_backends(arch, seed, verbosity);
     } catch (const std::exception & err) {
         fprintf(stderr, "encountered runtime error: %s\n", err.what());
         return -1;
