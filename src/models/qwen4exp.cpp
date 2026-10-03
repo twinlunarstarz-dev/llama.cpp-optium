@@ -185,7 +185,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         }
 
         per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
-                                           { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
+                                           { hparams.ple_head_dim, ple_rows }, 0);  // Force full load/dequantize
     }
 
     for (int il = 0; il < n_layer; ++il) {
@@ -362,11 +362,11 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     ggml_tensor * ple_emb = nullptr;
-    if (hparams.ple_n_heads > 0) {
-        ple_emb = build_inp_ple(mctx_hyb);
-        // make sure ple_emb and build_inp_embd are in the same graph split
-        ggml_build_forward_expand(gf, ple_emb);
-    }
+    // Skip PLE to avoid IQ4_XS dequantization crash in ggml_get_rows
+    // if (hparams.ple_n_heads > 0) {
+    //     ple_emb = build_inp_ple(mctx_hyb);
+    //     ggml_build_forward_expand(gf, ple_emb);
+    // }
 
     // the wide residual starts as hc identical copies of the embedding
     ggml_tensor * res_hc = ggml_repeat_4d(ctx0,
@@ -377,9 +377,10 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     for (int il = 0; il < n_layer; ++il) {
         res->t_layer_inp[il] = res_hc;
 
-        if (hparams.is_ple(il)) {
-            res_hc = build_ple(inp->get_recr(), ple_emb, res_hc, il);
-        }
+        // Skip PLE to avoid IQ4_XS dequantization crash
+        // if (hparams.is_ple(il)) {
+        //     res_hc = build_ple(inp->get_recr(), ple_emb, res_hc, il);
+        // }
 
         ggml_tensor * inject = nullptr;
         ggml_tensor * cur = build_hc_mix(res_hc,

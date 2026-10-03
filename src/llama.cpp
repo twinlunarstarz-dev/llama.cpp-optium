@@ -355,13 +355,13 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                 throw std::runtime_error(
                     "sequential MVP does not support architecture " + std::string(llm_arch_name(model->arch)));
             }
-            if (model->hparams.n_expert != 0 && model->arch != LLM_ARCH_DEEPSEEK4) {
+            if (model->hparams.n_expert != 0 && model->arch != LLM_ARCH_DEEPSEEK4 && model->arch != LLM_ARCH_QWEN4EXP) {
                 throw std::runtime_error("sequential MVP does not support expert models");
             }
-            if (llm_arch_is_recurrent(model->arch)) {
+            if (llm_arch_is_recurrent(model->arch) && model->arch != LLM_ARCH_QWEN4EXP) {
                 throw std::runtime_error("sequential MVP does not support recurrent models");
             }
-            if (llm_arch_is_hybrid(model->arch)) {
+            if (llm_arch_is_hybrid(model->arch) && model->arch != LLM_ARCH_QWEN4EXP) {
                 throw std::runtime_error("sequential MVP does not support hybrid models");
             }
             if (fname.empty() || metadata != nullptr || file != nullptr || (!ml.use_mmap && !ml.use_direct_io)) {
@@ -417,6 +417,7 @@ static bool llama_model_arch_supports_sequential_load(const llm_arch arch) {
         case LLM_ARCH_QWEN2:
         case LLM_ARCH_GEMMA:
         case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_QWEN4EXP:
             return true;
         default:
             return false;

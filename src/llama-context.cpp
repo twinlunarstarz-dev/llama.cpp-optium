@@ -257,6 +257,19 @@ llama_context::llama_context(
     cparams.fused_dsv4_hc_post = true;
     cparams.auto_fhc           = true;
 
+    // Disable all experimental fused ops for qwen4exp - they crash during graph execution
+    if (model.arch == LLM_ARCH_QWEN4EXP) {
+        cparams.fused_lid    = false;
+        cparams.auto_flid    = false;
+        cparams.fused_gdn_ar = false;
+        cparams.fused_gdn_ch = false;
+        cparams.auto_fgdn    = false;
+        cparams.fused_dsv4_hc_pre  = false;
+        cparams.fused_dsv4_hc_comb = false;
+        cparams.fused_dsv4_hc_post = false;
+        cparams.auto_fhc           = false;
+    }
+
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 

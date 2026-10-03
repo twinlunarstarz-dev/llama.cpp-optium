@@ -1146,7 +1146,7 @@ private:
             mparams.print_timings    = false;
             mparams.n_threads        = params_base.cpuparams.n_threads;
             mparams.flash_attn_type  = params_base.flash_attn_type;
-            mparams.warmup           = params_base.warmup;
+            mparams.warmup           = false;  // Force disable mmproj warmup (crashes on qwen4exp)
             mparams.image_min_tokens = params_base.image_min_tokens;
             mparams.image_max_tokens = params_base.image_max_tokens;
             mparams.batch_max_tokens = params_base.mtmd_batch_max_tokens;
