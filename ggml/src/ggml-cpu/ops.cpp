@@ -5020,11 +5020,88 @@ static void ggml_compute_forward_get_rows_f32(
     }
 }
 
+// fork: get_rows over a direct-I/O logical tensor. src0->data is a tagged file
+// locator (not memory), so each referenced row is gathered through the process-wide
+// logical-range reader and dequantized per row. Mirrors get_rows_q's addressing
+// (multi-slice strides included) but never dereferences src0->data.
+static void ggml_compute_forward_get_rows_lazy(
+        const ggml_compute_params * params,
+              ggml_tensor * dst,
+        size_t n_readers) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const int64_t nc = ne00;
+    const int64_t nr = ggml_nelements(src1);
+
+    const ggml_type type = src0->type;
+    ggml_to_float_t const dequantize_row_q = ggml_get_type_traits(type)->to_float;
+
+    GGML_ASSERT(nb00 == ggml_type_size(type));
+    const size_t row_bytes = ggml_row_size(type, nc);
+
+    static bool warned = false;
+    if (!warned) {
+        warned = true;
+        GGML_LOG_INFO("%s: lazy gather for logical tensor '%s' (type=%s, row_bytes=%zu)\n",
+                __func__, src0->name, ggml_type_name(type), row_bytes);
+    }
+
+    uint8_t * tmp = (uint8_t *) ggml_aligned_malloc(row_bytes);
+    GGML_ASSERT(tmp);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int dr = (int) ((nr + nth - 1)/nth);
+    const int ir0 = dr*ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t i = ir0; i < ir1; ++i) {
+        const int64_t i12 = i/(ne11*ne10);
+        const int64_t i11 = (i - i12*ne11*ne10)/ne10;
+        const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
+        const int64_t i01 = *(int32_t *) ((const char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
+
+        GGML_ASSERT(i01 >= 0 && i01 < ne01);
+
+        const size_t row_offset = (size_t) (i01*nb01 + i11*nb02 + i12*nb03);
+        bool ok = false;
+        for (size_t r = 0; r < n_readers && !ok; ++r) {
+            void * reader_ud = NULL;
+            ggml_backend_logical_range_reader_t reader = ggml_backend_logical_range_reader_at(r, &reader_ud);
+            if (reader == NULL) {
+                continue;
+            }
+            ok = reader(reader_ud, src0->data, row_offset, row_bytes, tmp);
+        }
+        if (!ok) {
+            GGML_LOG_WARN("%s: logical range read failed for '%s' offset=%zu\n", __func__, src0->name, row_offset);
+            memset(tmp, 0, row_bytes);
+        }
+        dequantize_row_q(tmp, (float *) ((char *) dst->data + i10*nb1 + i11*nb2 + i12*nb3), nc);
+    }
+
+    ggml_aligned_free(tmp, row_bytes);
+}
+
 void ggml_compute_forward_get_rows(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
 
     const ggml_tensor * src0 = dst->src[0];
+
+    // fork: direct-I/O logical tensor — gather referenced rows through the readers
+    if (src0->buffer != NULL && ggml_backend_buffer_get_size(src0->buffer) == 0) {
+        const size_t n_readers = ggml_backend_logical_range_reader_count();
+        if (n_readers > 0) {
+            ggml_compute_forward_get_rows_lazy(params, dst, n_readers);
+            return;
+        }
+        GGML_ABORT("get_rows on a direct-I/O logical tensor with no range reader");
+    }
 
     switch (src0->type) {
         case GGML_TYPE_Q1_0:
@@ -11130,10 +11207,19 @@ static void ggml_compute_forward_dsv4_hc_pre_f32(
     const int64_t hc       = x->ne[1];
     const int64_t n_tokens = x->ne[2];
 
+    const float scale = ggml_get_op_params_f32(dst, 0);
+    const bool  gated = ggml_get_op_params_i32(dst, 1) != 0;
+
     GGML_ASSERT(dst->ne[0] == n_embd);
     GGML_ASSERT(dst->ne[1] == n_tokens);
-    GGML_ASSERT(weights->ne[0] == hc);
-    GGML_ASSERT(weights->ne[1] == n_tokens);
+    if (gated) {
+        GGML_ASSERT(weights->ne[0] == n_embd);
+        GGML_ASSERT(weights->ne[1] == hc);
+        GGML_ASSERT(weights->ne[2] == n_tokens);
+    } else {
+        GGML_ASSERT(weights->ne[0] == hc);
+        GGML_ASSERT(weights->ne[1] == n_tokens);
+    }
 
     GGML_TENSOR_LOCALS(size_t, nbx, x,       nb);
     GGML_TENSOR_LOCALS(size_t, nbw, weights, nb);
@@ -11153,12 +11239,18 @@ static void ggml_compute_forward_dsv4_hc_pre_f32(
 
         float sum = 0.0f;
         for (int64_t ih = 0; ih < hc; ++ih) {
-            const float xv = *(const float *) ((const char *) x->data       + i0*nbx0 + ih*nbx1 + it*nbx2);
-            const float wv = *(const float *) ((const char *) weights->data + ih*nbw0 + it*nbw1);
+            const float xv = *(const float *) ((const char *) x->data + i0*nbx0 + ih*nbx1 + it*nbx2);
+            float wv;
+            if (gated) {
+                const float gv = *(const float *) ((const char *) weights->data + i0*nbw0 + ih*nbw1 + it*nbw2);
+                wv = 1.0f / (1.0f + expf(-gv));
+            } else {
+                wv = *(const float *) ((const char *) weights->data + ih*nbw0 + it*nbw1);
+            }
             sum += xv * wv;
         }
 
-        *(float *) ((char *) dst->data + i0*nbd0 + it*nbd1) = sum;
+        *(float *) ((char *) dst->data + i0*nbd0 + it*nbd1) = scale * sum;
     }
 }
 
@@ -11192,7 +11284,6 @@ static void ggml_compute_forward_dsv4_hc_post_f32(
     GGML_ASSERT(x->type == GGML_TYPE_F32);
     GGML_ASSERT(residual->type == GGML_TYPE_F32);
     GGML_ASSERT(post->type == GGML_TYPE_F32);
-    GGML_ASSERT(comb->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
 
     const int64_t n_embd   = x->ne[0];
@@ -11206,14 +11297,24 @@ static void ggml_compute_forward_dsv4_hc_post_f32(
     GGML_ASSERT(residual->ne[2] == n_tokens);
     GGML_ASSERT(post->ne[0] == hc);
     GGML_ASSERT(post->ne[1] == n_tokens);
-    GGML_ASSERT(comb->ne[0] == hc);
-    GGML_ASSERT(comb->ne[1] == hc);
-    GGML_ASSERT(comb->ne[2] == n_tokens);
+
+    // comb == NULL: identity mixing, each stream keeps its own residual
+    size_t nbc0 = 0;
+    size_t nbc1 = 0;
+    size_t nbc2 = 0;
+    if (comb) {
+        GGML_ASSERT(comb->type == GGML_TYPE_F32);
+        GGML_ASSERT(comb->ne[0] == hc);
+        GGML_ASSERT(comb->ne[1] == hc);
+        GGML_ASSERT(comb->ne[2] == n_tokens);
+        nbc0 = comb->nb[0];
+        nbc1 = comb->nb[1];
+        nbc2 = comb->nb[2];
+    }
 
     GGML_TENSOR_LOCALS(size_t, nbx, x,        nb);
     GGML_TENSOR_LOCALS(size_t, nbr, residual, nb);
     GGML_TENSOR_LOCALS(size_t, nbp, post,     nb);
-    GGML_TENSOR_LOCALS(size_t, nbc, comb,     nb);
     GGML_TENSOR_LOCALS(size_t, nbd, dst,      nb);
 
     const int ith = params->ith;
@@ -11233,10 +11334,14 @@ static void ggml_compute_forward_dsv4_hc_post_f32(
         const float pv = *(const float *) ((const char *) post->data + idst*nbp0 + it*nbp1);
 
         float sum = xv * pv;
-        for (int64_t isrc = 0; isrc < hc; ++isrc) {
-            const float rv = *(const float *) ((const char *) residual->data + i0*nbr0 + isrc*nbr1 + it*nbr2);
-            const float cv = *(const float *) ((const char *) comb->data     + idst*nbc0 + isrc*nbc1 + it*nbc2);
-            sum += rv * cv;
+        if (comb) {
+            for (int64_t isrc = 0; isrc < hc; ++isrc) {
+                const float rv = *(const float *) ((const char *) residual->data + i0*nbr0 + isrc*nbr1 + it*nbr2);
+                const float cv = *(const float *) ((const char *) comb->data     + idst*nbc0 + isrc*nbc1 + it*nbc2);
+                sum += rv * cv;
+            }
+        } else {
+            sum += *(const float *) ((const char *) residual->data + i0*nbr0 + idst*nbr1 + it*nbr2);
         }
 
         *(float *) ((char *) dst->data + i0*nbd0 + idst*nbd1 + it*nbd2) = sum;

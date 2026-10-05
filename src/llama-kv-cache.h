@@ -158,6 +158,14 @@ public:
     uint32_t get_size()     const;
     uint32_t get_n_stream() const;
 
+    // added for upstream qwen4exp kpool support (66e0c17ee): the fork keeps
+    // n_seq_max/n_stream as private constants, so expose read-only accessors
+    uint32_t get_n_seq_max() const { return n_seq_max; }
+    uint32_t get_stream(llama_seq_id seq_id) const { (void) seq_id; return 0; }
+
+    // drop all cells belonging to seq_id without touching the rest of the cache
+    void state_clear(llama_seq_id seq_id);
+
     bool get_has_shift() const;
 
     ggml_type type_k() const;

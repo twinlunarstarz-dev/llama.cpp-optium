@@ -467,7 +467,8 @@ static void common_params_fit_impl(
         if (!tensor_split) {
             throw common_params_fit_exception("did not provide a buffer to write the tensor_split to, abort");
         }
-        if (mparams->tensor_split) {
+        // For sequential load, user-provided tensor_split is expected and should be respected
+        if (mparams->tensor_split && !mparams->sequential_load) {
             for (size_t id = 0; id < nd; id++) {
                 if (mparams->tensor_split[id] != 0.0f) {
                     throw common_params_fit_exception("model_params::tensor_split already set by user, abort");

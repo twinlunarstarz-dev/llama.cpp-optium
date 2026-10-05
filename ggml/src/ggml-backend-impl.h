@@ -93,6 +93,7 @@ extern "C" {
         uint64_t compact_expert_miss_count;
         uint64_t compact_expert_eviction_count;
         uint64_t compact_fallback_count;
+        uint64_t compact_skipped_oob_copies;
         uint64_t compact_remap_stall_count;
         uint64_t compact_remap_stall_us;
         uint64_t drain_count[GGML_BACKEND_SCHED_TRANSIENT_DRAIN_REASON_COUNT];

@@ -17,6 +17,58 @@ struct llama_logger_state {
 
 static llama_logger_state g_logger_state;
 
+// Prefetch a set of rows out of an mmap'd host buffer (upstream 185103dcf, #29599).
+// No-op for non-host buffers — in particular under --load-mode dio there is no mapping
+// to advise on, so this safely does nothing.
+void llama_prefetch_rows(const struct ggml_tensor * tensor, const int32_t * rows, size_t n_rows) {
+    if (!tensor || !tensor->data || !tensor->buffer || !ggml_backend_buffer_is_host(tensor->buffer) || n_rows == 0) {
+        return;
+    }
+
+    GGML_ASSERT(ggml_is_matrix(tensor));
+
+#if defined(__linux__)
+    static const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) {
+        return;
+    }
+    const size_t page = (size_t) page_size;
+    const size_t row_bytes = ggml_row_size(tensor->type, tensor->ne[0]);
+    const char * base = (const char *) tensor->data;
+
+    std::vector<std::pair<uintptr_t, uintptr_t>> ranges; // [first_page, last_page)
+    ranges.reserve(n_rows);
+    for (size_t i = 0; i < n_rows; ++i) {
+        GGML_ASSERT(rows[i] >= 0 && rows[i] < tensor->ne[1]);
+        const uintptr_t pointer = (uintptr_t) (base + (size_t) rows[i] * tensor->nb[1]);
+        ranges.push_back({ pointer / page * page, (pointer + row_bytes + page - 1) / page * page });
+    }
+    std::sort(ranges.begin(), ranges.end());
+
+    uintptr_t begin = 0, end = 0;
+    for (const auto & [first, last] : ranges) {
+        if (!first || first == last) {
+            continue;
+        }
+        if (end && first > end) { // gap: flush the accumulated range
+            if (madvise((void *) begin, end - begin, MADV_WILLNEED) != 0) {
+                LLAMA_LOG_WARN("llama_prefetch_rows: madvise(MADV_WILLNEED) failed: %s\n", strerror(errno));
+            }
+            end = 0;
+        }
+        if (!end) {
+            begin = first;
+        }
+        end = std::max(end, last);
+    }
+    if (end && madvise((void *) begin, end - begin, MADV_WILLNEED) != 0) {
+        LLAMA_LOG_WARN("llama_prefetch_rows: madvise(MADV_WILLNEED) failed: %s\n", strerror(errno));
+    }
+#else
+    (void) tensor; (void) rows; (void) n_rows; // prefetch is a no-op on non-Linux platforms here
+#endif
+}
+
 time_meas::time_meas(int64_t & t_acc, bool disable) : t_start_us(disable ? -1 : ggml_time_us()), t_acc(t_acc) {}
 
 time_meas::~time_meas() {

@@ -227,6 +227,11 @@ struct llama_layer_nextn {
     struct ggml_tensor * shared_head_head_s    = nullptr;
     struct ggml_tensor * shared_head_head_in_s = nullptr;
     struct ggml_tensor * shared_head_norm      = nullptr;
+
+    // qwen4exp: the MTP block collapses its hyper-connection streams with its own mixer
+    struct ggml_tensor * hc_head_norm          = nullptr;
+    struct ggml_tensor * hc_head_down          = nullptr;
+    struct ggml_tensor * hc_head_up            = nullptr;
 };
 
 struct llama_layer_switch_lora {
@@ -664,6 +669,9 @@ struct llama_model {
     struct ggml_tensor * per_layer_model_proj = nullptr;
     struct ggml_tensor * per_layer_proj_norm  = nullptr;
 
+    // tensors that support row prefetch (mmap'd host buffers only — empty under --load-mode dio)
+    std::unordered_set<const struct ggml_tensor *> can_prefetch;
+
     // eagle3 / dflash feature fusion layer
     struct ggml_tensor * fc   = nullptr;
     struct ggml_tensor * fc_s = nullptr;
@@ -851,7 +859,7 @@ const char * llm_type_name(llm_type type);
     const int64_t n_token_types  = vocab.n_token_types();    GGML_UNUSED(n_token_types); \
     const int64_t n_rot          = hparams.n_rot();          GGML_UNUSED(n_rot); \
     const int64_t n_expert       = hparams.n_expert;         GGML_UNUSED(n_expert); \
-    const int64_t n_expert_used  = hparams.n_expert_used;    GGML_UNUSED(n_expert_used); \
+    const int64_t n_expert_used  = hparams.n_expert_used();    GGML_UNUSED(n_expert_used); \
     const int64_t n_ctx_train    = hparams.n_ctx_train;      GGML_UNUSED(n_ctx_train);
 
 // For internal test use

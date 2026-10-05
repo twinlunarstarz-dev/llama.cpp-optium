@@ -27,6 +27,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <mutex>
 
 #if defined(__linux__)
 #include <sys/mman.h>
@@ -1943,6 +1944,15 @@ static int ggml_backend_sched_op_layer(const struct ggml_tensor * op) {
 static int ggml_backend_sched_forced_weight_backend(
         ggml_backend_sched_t sched, const struct ggml_tensor * weight, const struct ggml_tensor * op, int cpu_backend_id) {
     int preferred = 0;
+    // fork: a get_rows consumer of a direct-I/O logical tensor (zero-size host
+    // WEIGHTS buffer) gathers rows lazily on the CPU backend. Forcing the op onto
+    // a GPU would stream the tensor's entire logical extent through chunk uploads
+    // (tens of GiB per split), so pin such ops to the CPU backend.
+    if (op->op == GGML_OP_GET_ROWS && weight->buffer != NULL &&
+            ggml_backend_buffer_is_host(weight->buffer) && weight->buffer->size == 0 &&
+            ggml_backend_buffer_get_usage(weight->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+        return cpu_backend_id;
+    }
     const int layer = ggml_backend_sched_tensor_layer(weight);
     // Keep attention and dense activation chains on the primary GPU. At large
     // contexts, moving a complete layer range duplicates the full prompt
@@ -3769,6 +3779,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         const auto & compact_experts = *split->compact_experts[input_id];
                         const auto & compact_slots = *split->compact_slots[input_id];
                         const auto & compact_misses = *split->compact_misses[input_id];
+                        // input_cpy was shrunk to the resident slab; never write past it
+                        const size_t dst_capacity = ggml_nbytes(input_cpy);
                         for (size_t compact_id = 0; compact_id < compact_experts.size();) {
                             if (!compact_misses[compact_id]) {
                                 ++compact_id;
@@ -3782,7 +3794,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             }
                             const size_t src_offset = (size_t) compact_experts[compact_id] * expert_size;
                             const size_t dst_offset = (size_t) compact_slots[compact_id] * expert_size;
-                            const size_t copy_size = (last - compact_id + 1) * expert_size;
+                            size_t copy_size = (last - compact_id + 1) * expert_size;
+                            if (dst_offset >= dst_capacity) {
+                                // slot lies outside the resident window; skip rather than overrun
+                                ggml_backend_sched_counter_add(sched, &metrics.compact_skipped_oob_copies, 1);
+                                compact_id = last + 1;
+                                continue;
+                            }
+                            copy_size = std::min(copy_size, dst_capacity - dst_offset);
                             ggml_backend_sched_weight_upload_chunked(sched, split_backend, split_backend_id,
                                 input_cpy, (const uint8_t *) input->data + src_offset, dst_offset,
                                 copy_size, split->input_transient[input_id]);
@@ -3795,24 +3814,42 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 full_alloc - split->transient_sizes[input_id]);
                         }
                     } else {
-                    // group consecutive experts and copy them together
+                    // group consecutive experts and copy them together.
+                    // The destination may have been shrunk by the compact-MoE tier, so clamp every
+                    // write to ggml_nbytes(input_cpy) instead of trusting the source-side expert count.
+                    const size_t dst_capacity = ggml_nbytes(input_cpy);
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
-                        const size_t expert_offset = first_id * expert_size;
-                        const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
+                        if (first_id < 0 || (size_t) first_id * expert_size >= dst_capacity) {
+                            // entirely outside the resident window - nothing to upload
+                            return;
+                        }
+                        size_t expert_offset = (size_t) first_id * expert_size;
+                        size_t expert_size_copy = ((size_t)(last_id - first_id) + 1) * expert_size;
                         const size_t padding = std::min<size_t>(expert_size, 512);
                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
+
+                        // copy a bit extra at the end to ensure there are no NaNs in the padding of the
+                        // last expert (necessary for MMQ in the CUDA backend), but never past the tensor
+                        const size_t wanted = expert_size_copy + padding_end;
+                        const size_t room = dst_capacity > expert_offset ? dst_capacity - expert_offset : 0;
+                        const size_t upload = std::min(wanted, room);
+
+                        if (upload == 0) {
+                            return;
+                        }
 
                         ggml_backend_sched_weight_upload_chunked(sched, split_backend, split_backend_id,
                             input_cpy,
                             (const uint8_t *) input->data + expert_offset, expert_offset,
-                            // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
-                            // this is necessary for MMQ in the CUDA backend
-                            expert_size_copy + padding_end, split->input_transient[input_id]);
+                            upload, split->input_transient[input_id]);
                     };
 
                     int id = 0;
-                    while (!ggml_bitset_get(used_ids.data(), id)) {
+                    while (id < n_expert && !ggml_bitset_get(used_ids.data(), id)) {
                         id++;
+                    }
+                    if (id >= n_expert) {
+                        id = n_expert - 1;
                     }
                     int32_t first_id = id;
                     int32_t last_id = first_id;
@@ -4455,6 +4492,32 @@ void ggml_backend_sched_set_persistent_weight_residency(ggml_backend_sched_t sch
 void ggml_backend_sched_set_async_weight_prefetch(ggml_backend_sched_t sched, bool prefetch) {
     GGML_ASSERT(sched);
     sched->async_weight_prefetch = prefetch;
+}
+
+// fork: process-wide logical-range readers (see ggml-backend.h). Each model with a
+// direct-I/O loader registers its own reader; ops try them in order. The mutex only
+// guards registration — lookups during compute take a snapshot copy under the lock.
+static std::mutex g_ggml_logical_readers_mutex;
+static std::vector<std::pair<ggml_backend_logical_range_reader_t, void *>> g_ggml_logical_readers;
+
+void ggml_backend_add_logical_range_reader(ggml_backend_logical_range_reader_t reader, void * user_data) {
+    std::lock_guard<std::mutex> lock(g_ggml_logical_readers_mutex);
+    g_ggml_logical_readers.emplace_back(reader, user_data);
+}
+
+size_t ggml_backend_logical_range_reader_count(void) {
+    std::lock_guard<std::mutex> lock(g_ggml_logical_readers_mutex);
+    return g_ggml_logical_readers.size();
+}
+
+ggml_backend_logical_range_reader_t ggml_backend_logical_range_reader_at(size_t index, void ** user_data) {
+    std::lock_guard<std::mutex> lock(g_ggml_logical_readers_mutex);
+    if (index >= g_ggml_logical_readers.size()) {
+        if (user_data) *user_data = NULL;
+        return NULL;
+    }
+    if (user_data) *user_data = g_ggml_logical_readers[index].second;
+    return g_ggml_logical_readers[index].first;
 }
 
 void ggml_backend_sched_set_weight_read_callback(

@@ -379,6 +379,22 @@ extern "C" {
     typedef bool (*ggml_backend_sched_weight_read_padded_callback)(
             void * user_data, const void * logical_src, void * dst, size_t capacity,
             size_t size, size_t * data_offset);
+
+    // fork: process-wide byte-range reader for direct-I/O logical tensors. A logical
+    // tensor's data pointer is a tagged file locator, not memory, so CPU ops that
+    // consume it row-wise (get_rows on a large CPU-forced embedding) gather rows
+    // through this hook instead of dereferencing the tag. The reader accepts the
+    // logical tag pointer plus a byte offset into the tensor's logical extent.
+    // Multiple readers may be registered (main + draft models in one process); ops
+    // try them in registration order until one succeeds.
+    typedef bool (*ggml_backend_logical_range_reader_t)(
+            void * user_data, const void * logical_src, size_t offset, size_t size, void * dst);
+    GGML_API void ggml_backend_add_logical_range_reader(
+            ggml_backend_logical_range_reader_t reader, void * user_data);
+    GGML_API size_t ggml_backend_logical_range_reader_count(void);
+    GGML_API ggml_backend_logical_range_reader_t ggml_backend_logical_range_reader_at(
+            size_t index, void ** user_data);
+
     GGML_API void                 ggml_backend_sched_set_weight_read_callback(
             ggml_backend_sched_t sched, ggml_backend_sched_weight_read_callback callback, void * user_data);
     GGML_API void                 ggml_backend_sched_set_weight_read_padded_callback(

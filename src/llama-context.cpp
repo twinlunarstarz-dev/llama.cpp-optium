@@ -745,6 +745,15 @@ void llama_context::sched_reserve() {
                     return static_cast<const llama_model *>(user_data)->read_sequential_weight_padded(
                         logical_src, dst, capacity, size, data_offset);
                 }, const_cast<llama_model *>(&model));
+            // fork: process-wide range reader for row-wise gathers of logical tensors
+            // (e.g. a CPU-forced per-layer token embedding consumed by get_rows).
+            // Each model registers its own reader; ops try all of them.
+            ggml_backend_add_logical_range_reader(
+                [](void * user_data, const void * logical_src, size_t offset, size_t size, void * dst) -> bool {
+                    size_t data_offset = 0;
+                    return static_cast<const llama_model *>(user_data)->read_sequential_weight_padded(
+                        (const uint8_t *) logical_src + offset, dst, size, size, &data_offset) && data_offset == 0;
+                }, const_cast<llama_model *>(&model));
         }
         if (sequential_weight_budget > 0) {
             for (ggml_backend_t backend : backend_ptrs) {
@@ -3809,6 +3818,12 @@ llama_context * llama_init_from_model(
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && model->arch == LLM_ARCH_GROK) {
         LLAMA_LOG_WARN("%s: flash_attn is not compatible with Grok - forcing off\n", __func__);
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    }
+
+    // qwen4exp delta-net conv state writes the rollback planes in build_conv_state_at;
+    // without the extra plane the recurrent rows are under-sized for the graph's view stride
+    if (params.n_rs_seq == 0 && model->arch == LLM_ARCH_QWEN4EXP) {
+        params.n_rs_seq = 1;
     }
 
     if (model->split_mode() == LLAMA_SPLIT_MODE_TENSOR) {

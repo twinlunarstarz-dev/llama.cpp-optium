@@ -481,7 +481,8 @@ void llama_file::read_at(void * ptr, size_t len, size_t offset) const {
             const ssize_t n = pread(pimpl->fd, static_cast<uint8_t *>(raw) + done,
                                     aligned_size - done, aligned_offset + done);
             if (n < 0 && errno == EINTR) continue;
-            if (n < 0) throw std::runtime_error(format("direct pread error: %s", strerror(errno)));
+            if (n < 0) throw std::runtime_error(format("direct pread error (len=%zu, aligned=%zu, offset=%zu, fd=%d): %s",
+                    len, aligned_size, aligned_offset + done, pimpl->fd, strerror(errno)));
             if (n == 0) { memset(static_cast<uint8_t *>(raw) + done, 0, aligned_size - done); break; }
             done += static_cast<size_t>(n);
         }

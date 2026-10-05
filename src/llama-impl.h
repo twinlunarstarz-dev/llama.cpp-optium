@@ -3,9 +3,19 @@
 #include "ggml.h" // for ggml_log_level
 #include "llama-arch.h"
 
+#include <algorithm>
+#include <cerrno>
 #include <string>
 #include <type_traits>
 #include <vector>
+#ifdef __linux__
+#    include <unistd.h>  // sysconf, madvise
+#    include <sys/mman.h> // MADV_WILLNEED
+#endif
+
+// prefetch a set of rows out of an mmap'd host buffer (no-op under --load-mode dio).
+// Declared here so model code can route through it without pulling in llama-mmap directly.
+void llama_prefetch_rows(const struct ggml_tensor * tensor, const int32_t * rows, size_t n_rows);
 
 #ifdef __GNUC__
 #    if defined(__MINGW32__) && !defined(__clang__)

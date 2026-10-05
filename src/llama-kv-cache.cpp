@@ -1208,6 +1208,11 @@ uint32_t llama_kv_cache::get_size() const {
     return cells.size();
 }
 
+void llama_kv_cache::state_clear(llama_seq_id seq_id) {
+    // added for upstream qwen4exp kpool support (66e0c17ee)
+    seq_rm(seq_id, -1, -1);
+}
+
 uint32_t llama_kv_cache::get_n_stream() const {
     return n_stream;
 }
