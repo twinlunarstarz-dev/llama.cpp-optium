@@ -2664,7 +2664,7 @@ ggml_cgraph * llama_context::graph_reserve(
 
     this->n_outputs = n_outputs;
 
-    llama_batch_allocr balloc(model.hparams.n_pos_per_embd());
+    llama_batch_allocr balloc(model.hparams.n_pos_per_embd(), false);
     llama_ubatch ubatch = balloc.ubatch_reserve(n_tokens/n_seqs, n_seqs);
 
     ubatch_prepare_reserve(ubatch, n_outputs, sampling.samplers, cparams.n_outputs_max_per_seq);

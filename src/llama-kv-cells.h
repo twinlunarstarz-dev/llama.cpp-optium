@@ -6,6 +6,7 @@
 #include <bitset>
 #include <cassert>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <set>
 #include <vector>
@@ -371,6 +372,24 @@ public:
         assert(seq_id >= 0);
         assert(seq_id < LLAMA_MAX_SEQ);
         return seq_pos[seq_id];
+    }
+
+    // the token of the cell of sequence seq_id at the largest position <= p
+    // when several cells share that position, the one with the highest index wins
+    // return LLAMA_TOKEN_NULL if the sequence has no cell at or before p
+    // note: used by n-gram input embeddings to recover the tokens preceding a ubatch
+    llama_token seq_pos_tok_le(llama_seq_id seq_id, llama_pos p) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        const auto & sp = seq_pos[seq_id];
+
+        auto it = sp.upper_bound({ p, std::numeric_limits<uint32_t>::max() });
+        if (it == sp.begin()) {
+            return LLAMA_TOKEN_NULL;
+        }
+
+        return ext[(--it)->second].tok;
     }
 
     // the minimum position of sequence seq_id currently present in any of the cells

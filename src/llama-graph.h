@@ -7,6 +7,9 @@
 
 #include <cstdint>
 #include <vector>
+
+// crash if a mixed ubatch reaches code that expects only tokens or only embd
+#define ASSERT_EMBD_OR_TOKEN(ubatch) GGML_ASSERT(!(ubatch).is_mixed() && "mixed token/embd ubatch is not supported here")
 #include <memory>
 #include <set>
 #include <functional>

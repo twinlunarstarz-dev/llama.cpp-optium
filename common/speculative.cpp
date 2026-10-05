@@ -2746,7 +2746,12 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
-                impls.push_back(std::make_unique<common_speculative_impl_draft_mtp>(config.params, n_seq));
+                // NOTE(2026-10-04 isolation): the draft's own decode aborts in
+                // llm_graph_input_kpool::set_input (its hybrid memory has no kpool backing
+                // for the upstream qwen4exp graph), and the draft produced 0 accepted tokens
+                // even before that. Skip the MTP impl entirely while the main decode is being
+                // validated; the server falls back to plain sequential decoding.
+                SPC_TRC("%s", "draft-mtp disabled for isolation: draft decode aborts on kpool input");
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH: {

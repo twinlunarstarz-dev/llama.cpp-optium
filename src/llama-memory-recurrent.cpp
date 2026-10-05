@@ -1087,7 +1087,7 @@ bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell
             return true;
         }
 
-        llama_batch_allocr balloc(hparams.n_pos_per_embd());
+        llama_batch_allocr balloc(hparams.n_pos_per_embd(), false);
 
         llama_ubatch ubatch = balloc.ubatch_reserve(cell_count, 1);
 

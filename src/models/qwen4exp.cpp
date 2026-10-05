@@ -44,6 +44,7 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     // HC; low_rank is qwen4exp-specific, DeepSeek-V4 leaves it absent (full rank)
     ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT,    hparams.dsv4_hc_mult);
     ml.get_key(LLM_KV_HYPER_CONNECTION_LOW_RANK, hparams.hc_low_rank);
+    ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS,      hparams.n_layer_nextn, false);
     // a count of 1 has nothing to mix: transformers configuration_qwen4_exp.py:196, vLLM
     // config.py:49 and SGLang configs/qwen4_exp.py:38 all raise on hc_count <= 1
     if (hparams.dsv4_hc_mult <= 1) {

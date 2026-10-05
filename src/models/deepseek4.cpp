@@ -17,13 +17,15 @@ static float dsv4_rope_attn_factor(float freq_scale, float ext_factor) {
 }
 
 void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
-    if (hparams.n_layer_nextn > 0) {
+    ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.n_layer_nextn, false);
+    if (hparams.n_layer_nextn > 0 && hparams.n_layer_nextn < hparams.n_layer_all) {
         const uint32_t n_layer_main = hparams.n_layer_all - hparams.n_layer_nextn;
         const std::string mtp_probe = "blk." + std::to_string(n_layer_main) + ".nextn.eh_proj.weight";
         if (ml.get_weight(mtp_probe.c_str()) == nullptr) {
             hparams.n_layer_nextn = 0;
         }
     }
+    GGML_ASSERT(hparams.n_layer_nextn < hparams.n_layer_all && "n_layer_nextn must be < block_count");
 
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,       hparams.n_lora_q);
@@ -66,9 +68,6 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
     }
     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
     hparams.set_swa_pattern(0);
-    // tokens of an image span attend bidirectionally to the whole span, the window only applies to older tokens
-    // ref: get_window_topk_idxs_visible in the reference impl
-    hparams.non_causal_type = LLAMA_NON_CAUSAL_TYPE_SWA_FULL;
     for (uint32_t il = hparams.n_layer(); il < hparams.n_layer_all; ++il) {
         hparams.is_swa_impl[il] = true;
     }
@@ -159,8 +158,6 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
         } else {
             layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, flags);
         }
-        // vision variant only: routing bias for image tokens
-        layer.ffn_exp_probs_b_vl = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B_VL, "bias", i), {n_expert}, flags | TENSOR_NOT_REQUIRED);
         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, flags);
 
         layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff_exp, n_expert}, flags);
@@ -266,14 +263,15 @@ static dsv4_state_tensors dsv4_build_state_snapshot(
 static constexpr int64_t DSV4_CSA_RATIO  = 4;
 static constexpr int64_t DSV4_HCA_RATIO  = 128;
 
-ggml_tensor * llama_model_deepseek4::graph::build_hc_mean(ggml_tensor * x) const {
+// mean over the hyper-connection streams: [n_embd, hc, n_tokens] -> [n_embd, n_tokens]
+static ggml_tensor * dsv4_hc_mean(ggml_context * ctx, ggml_tensor * x) {
     const int64_t hc = x->ne[1];
 
-    ggml_tensor * acc = ggml_view_2d(ctx0, x, x->ne[0], x->ne[2], x->nb[2], 0);
+    ggml_tensor * acc = ggml_view_2d(ctx, x, x->ne[0], x->ne[2], x->nb[2], 0);
     for (int64_t s = 1; s < hc; ++s) {
-        acc = ggml_add(ctx0, acc, ggml_view_2d(ctx0, x, x->ne[0], x->ne[2], x->nb[2], s*x->nb[1]));
+        acc = ggml_add(ctx, acc, ggml_view_2d(ctx, x, x->ne[0], x->ne[2], x->nb[2], s*x->nb[1]));
     }
-    return ggml_scale(ctx0, acc, 1.0f/hc);
+    return ggml_scale(ctx, acc, 1.0f/hc);
 }
 
 static ggml_tensor * dsv4_hc_affine(
@@ -756,8 +754,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask, csa_mask, 0);
     cb(kq_mask, "csa_lid_kq_mask", il);
 
-    const int64_t n_kv_max = std::min<int64_t>(raw_mask->ne[0], hparams.n_swa) + top_k->ne[0];
-    ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, sinks, nullptr, n_kv_max, kq_scale, il);
+    ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, sinks, nullptr, 0, kq_scale, il);
     if (k_rot) {
         out = llama_mul_mat_hadamard(ctx0, out, k_rot);
     }
@@ -1237,7 +1234,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
 
     for (int il = 0; il < n_layer; ++il) {
         if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
-            res->t_layer_inp[il] = build_hc_mean(inpL);
+            res->t_layer_inp[il] = dsv4_hc_mean(ctx0, inpL);
             cb(res->t_layer_inp[il], "layer_inp", il);
             ggml_build_forward_expand(gf, res->t_layer_inp[il]);
         }
@@ -1279,15 +1276,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         const auto & layer = model.layers[il];
         ggml_tensor * selected_experts = nullptr;
         ggml_tensor * exp_probs_b = layer.ffn_exp_probs_b;
-
-        // may apply exp_probs_b_vl is input is from mtmd
-        ASSERT_EMBD_OR_TOKEN(ubatch);
-        const bool is_media = ubatch.embd != nullptr;
-        if (is_media) {
-            if (layer.ffn_exp_probs_b_vl) {
-                exp_probs_b = layer.ffn_exp_probs_b_vl;
-            }
-        } else if ((uint32_t) il < hparams.dsv4_hash_layer_count) {
+        if ((uint32_t) il < hparams.dsv4_hash_layer_count) {
             selected_experts = ggml_get_rows(ctx0, layer.ffn_gate_tid2eid, res->t_inp_tokens);
             exp_probs_b = nullptr;
         }
@@ -1327,7 +1316,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     }
 
     if ((size_t) n_layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer]) {
-        res->t_layer_inp[n_layer] = build_hc_mean(inpL);
+        res->t_layer_inp[n_layer] = dsv4_hc_mean(ctx0, inpL);
         cb(res->t_layer_inp[n_layer], "layer_inp", n_layer);
         ggml_build_forward_expand(gf, res->t_layer_inp[n_layer]);
     }
@@ -1367,7 +1356,6 @@ llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm
     GGML_ASSERT(cparams.nextn_layer_offset >= 0 &&
             cparams.nextn_layer_offset < (int) hparams.n_layer_nextn &&
             "nextn_layer_offset out of range [0, n_layer_nextn)");
-    ASSERT_EMBD_OR_TOKEN(ubatch);
     GGML_ASSERT(ubatch.token && "DEEPSEEK4 MTP requires token input");
 
     const int64_t hc = hparams.dsv4_hc_mult;

@@ -1925,103 +1925,10 @@ void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, st
         return;
     }
 
-    // note: apply_ubatch() has already stored the current ubatch
-    //       the window below thus covers tokens of this very ubatch as well, which is what we want
-    llama_pos p_min = std::numeric_limits<llama_pos>::max();
-    llama_pos p_max = std::numeric_limits<llama_pos>::min();
-
-    std::bitset<LLAMA_MAX_SEQ> seqs;
-
-    for (uint32_t i = 0; i < n_tokens; ++i) {
-        p_min = std::min(p_min, ubatch.pos[i]);
-        p_max = std::max(p_max, ubatch.pos[i]);
-    }
-
-    for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
-        seqs.set(ubatch.seq_id_unq[s]);
-    }
-
-    const llama_pos w0 = std::max<llama_pos>(0, p_min - (llama_pos) n);
-    const uint64_t hist_span = (uint64_t) (p_max - w0) + 1;
-    constexpr uint64_t DENSE_HIST_MAX_ENTRIES = 1u << 20;
-
-    // ngram-mod uses a narrow predecessor window in the generation hot path. Direct indexing
-    // avoids hash-node allocation while retaining the same last-write-wins (seq_id, pos) lookup.
-    if (ubatch.n_seqs_unq > 0 && hist_span <= DENSE_HIST_MAX_ENTRIES / ubatch.n_seqs_unq) {
-        std::array<int32_t, LLAMA_MAX_SEQ> seq_to_local;
-        seq_to_local.fill(-1);
-
-        for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
-            const llama_seq_id seq_id = ubatch.seq_id_unq[s];
-            GGML_ASSERT(seq_id >= 0 && seq_id < LLAMA_MAX_SEQ);
-            seq_to_local[seq_id] = (int32_t) s;
-        }
-
-        std::vector<llama_token> hist((size_t) hist_span * ubatch.n_seqs_unq, LLAMA_TOKEN_NULL);
-
-        for (uint32_t s = 0; s < n_stream; ++s) {
-            v_cells[s].for_each_token_in(seqs, w0, p_max,
-                [&](llama_seq_id seq_id, llama_pos pos, llama_token tok) {
-                    const int32_t local = seq_to_local[seq_id];
-                    GGML_ASSERT(local >= 0);
-                    const uint64_t pos_off = (uint64_t) (pos - w0);
-                    GGML_ASSERT(pos_off < hist_span);
-                    hist[(size_t) local * hist_span + pos_off] = tok;
-                });
-        }
-
-        for (uint32_t i = 0; i < n_tokens; ++i) {
-            // TODO: a token that belongs to more than one sequence has an ambiguous history.
-            //       the n-gram architectures have to reject such batches
-            const llama_seq_id seq_id = ubatch.seq_id[i][0];
-            const int32_t local = seq_to_local[seq_id];
-            GGML_ASSERT(local >= 0);
-
-            for (uint32_t j = 0; j < n; ++j) {
-                const llama_pos p = ubatch.pos[i] - (llama_pos) (n - j);
-                if (p < w0 || p > p_max) {
-                    continue;
-                }
-                res[i*n + j] = hist[(size_t) local * hist_span + (uint64_t) (p - w0)];
-            }
-        }
-        return;
-    }
-
-    // Keep the original sparse path as a bounded-memory fallback for unusually wide batches.
-    std::unordered_map<uint64_t, llama_token> hist;
-
-    const auto key = [](llama_seq_id seq_id, llama_pos pos) {
-        return ((uint64_t) seq_id << 32) | (uint32_t) pos;
-    };
-
-    // handle M-RoPE gaps: multiple tokens share the same temporal pos
-    // TODO @ngxson : improve this in the future
-    std::array<std::pair<llama_pos, llama_token>, LLAMA_MAX_SEQ> below;
-    below.fill({ -1, LLAMA_TOKEN_NULL });
-
-    for (uint32_t s = 0; s < n_stream; ++s) {
-        // p_max inclusive: an embd token looks up cells at its own (shared) position
-        v_cells[s].for_each_token_in(seqs, 0, p_max + 1,
-            [&](llama_seq_id seq_id, llama_pos pos, llama_token tok) {
-                if (pos >= w0) {
-                    hist[key(seq_id, pos)] = tok;
-                } else if (pos > below[seq_id].first) {
-                    below[seq_id] = { pos, tok };
-                }
-            });
-    }
-
-    // the token at pos p, or the nearest earlier one when p falls in an M-RoPE gap
-    const auto lookup = [&](llama_seq_id seq_id, llama_pos p) -> llama_token {
-        for (llama_pos q = p; q >= w0; --q) {
-            const auto it = hist.find(key(seq_id, q));
-            if (it != hist.end()) {
-                return it->second;
-            }
-        }
-        return below[seq_id].second;
-    };
+    // note: apply_ubatch() has already stored the current ubatch, so the cells cover the tokens
+    //       of this very ubatch as well, which is what we want
+    // the nearest cell at or before a position also resolves M-RoPE gaps, where multiple tokens
+    // share the same temporal pos
 
     // an embd (multimodal) ubatch can repeat one position for a whole image, so positions
     // do not encode the token order; resolve its predecessors by ubatch order instead
@@ -2041,6 +1948,8 @@ void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, st
     }
 
     for (uint32_t i = 0; i < n_tokens; ++i) {
+        // TODO: a token that belongs to more than one sequence has an ambiguous history.
+        //       the n-gram architectures have to reject such batches
         const llama_seq_id seq_id = ubatch.seq_id[i][0];
 
         for (uint32_t j = 0; j < n; ++j) {
@@ -2060,7 +1969,7 @@ void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, st
                 continue;
             }
 
-            res[i*n + j] = lookup(seq_id, p);
+            res[i*n + j] = v_cells[seq_to_stream[seq_id]].seq_pos_tok_le(seq_id, p);
         }
     }
 }
@@ -2516,7 +2425,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
         // single sequence
         seq_rm(dest_seq_id, -1, -1);
 
-        llama_batch_allocr balloc(hparams.n_pos_per_embd());
+        llama_batch_allocr balloc(hparams.n_pos_per_embd(), false);
 
         llama_ubatch ubatch = balloc.ubatch_reserve(cell_count, 1);
 
