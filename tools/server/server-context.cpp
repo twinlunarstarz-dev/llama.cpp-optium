@@ -2612,29 +2612,52 @@ private:
         const size_t incoming = std::min<size_t>((size_t) task.n_tokens() + 1, (size_t) n_ctx);
         const size_t headroom = active_kv_headroom();
         const size_t shared_limit = (size_t) n_ctx > headroom ? (size_t) n_ctx - headroom : (size_t) n_ctx;
+        // Compare resident counts in unsigned space.  Attention-only memories
+        // report UINT32_MAX ("no recurrent limit"); the previous signed cast
+        // turned that into -1, making the admission check always fail and
+        // forcing the suspension path on every request.
         const uint32_t resident_limit = std::max<uint32_t>(1, llama_n_seq_max_resident(ctx_tgt));
 
         while (true) {
-            size_t projected = incoming;
             int n_resident = 0;
+            for (const auto & slot : slots) {
+                n_resident += slot.is_resident_processing() ? 1 : 0;
+            }
+
+            // Recurrent-state capacity is a hard correctness limit for hybrid
+            // models: a resident snapshot must leave the recurrent cache
+            // before the incoming request can become resident.  Suspend the
+            // least disruptive victim for this case only.
+            if ((uint32_t) n_resident >= resident_limit) {
+                server_slot * victim = largest_suspendable_resident();
+                if (!victim || !suspend_active_slot(*victim,
+                            "admitting another request would exceed resident recurrent-state capacity")) {
+                    return false;
+                }
+                continue;
+            }
+
+            // KV-capacity pressure: admit in parallel whenever the combined
+            // projected footprint fits the shared unified-KV budget.  A single
+            // request therefore always runs at full speed, and a second one
+            // joins only while memory is actually available.  Otherwise apply
+            // backpressure by deferring the incoming task - never suspend a
+            // live request and never spill its KV state to the disk swap tier
+            // merely to admit another request.  The deferred task is retried
+            // when a resident slot is released.
+            size_t projected = incoming;
             for (const auto & slot : slots) {
                 if (slot.is_resident_processing()) {
                     projected += slot_projected_kv_tokens(slot);
-                    n_resident++;
                 }
             }
-
-            if (n_resident < (int) resident_limit && projected <= shared_limit) {
+            if (projected <= shared_limit) {
                 return true;
             }
 
-            server_slot * victim = largest_suspendable_resident();
-            const char * reason = n_resident >= (int) resident_limit
-                ? "admitting another request would exceed resident recurrent-state capacity"
-                : "admitting another request would exceed unified KV capacity";
-            if (!victim || !suspend_active_slot(*victim, reason)) {
-                return false;
-            }
+            SRV_INF("deferring task id %d (%zu prompt tokens): %zu / %zu projected unified-KV tokens; waiting for capacity instead of suspending a live request\n",
+                    task.id, (size_t) task.n_tokens(), projected, shared_limit);
+            return false;
         }
     }
 
@@ -2681,7 +2704,10 @@ private:
         const size_t headroom = active_kv_headroom();
         const size_t shared_limit = (size_t) n_ctx > headroom ? (size_t) n_ctx - headroom : (size_t) n_ctx;
         const uint32_t resident_limit = std::max<uint32_t>(1, llama_n_seq_max_resident(ctx_tgt));
-        while (n_resident > (int) resident_limit) {
+        // Unsigned comparison: for attention-only memories resident_limit is
+        // UINT32_MAX; a signed cast made this loop suspend every resident
+        // request on every rebalance pass.
+        while ((uint32_t) n_resident > resident_limit) {
             server_slot * victim = largest_suspendable_resident();
             if (!victim || !suspend_active_slot(*victim, "live contexts exceeded resident recurrent-state capacity")) {
                 break;
