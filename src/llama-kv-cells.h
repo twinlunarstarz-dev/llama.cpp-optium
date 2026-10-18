@@ -482,6 +482,169 @@ public:
         has_shift = true;
     }
 
+
+    // Defragmentation support
+    // Move a cell from src to dst (used during defrag)
+    void mv(uint32_t isrc, uint32_t idst) {
+        assert(isrc < pos.size());
+        assert(idst < pos.size());
+
+        assert(pos[idst] == -1);
+        assert(pos[isrc] != -1);
+
+        pos  [idst] = pos  [isrc];
+        shift[idst] = shift[isrc];
+        seq  [idst] = seq  [isrc];
+        ext  [idst] = ext  [isrc];
+
+        pos  [isrc] = -1;
+        shift[isrc] =  0;
+        seq  [isrc].reset();
+        ext  [isrc].reset();
+
+        used.erase (isrc);
+        used.insert(idst);
+    }
+
+    // Defragment cells for a specific sequence to be contiguous from 0
+    bool defrag_sequence(llama_seq_id seq_id) {
+        // Find all cells belonging to this sequence
+        std::vector<uint32_t> seq_cells;
+        for (uint32_t i = 0; i < pos.size(); ++i) {
+            if (seq_has(i, seq_id)) {
+                seq_cells.push_back(i);
+            }
+        }
+
+        if (seq_cells.empty()) {
+            return false; // nothing to defrag
+        }
+
+        // Check if already contiguous starting from 0
+        bool already_contiguous = true;
+        for (size_t i = 0; i < seq_cells.size(); ++i) {
+            if (seq_cells[i] != i) {
+                already_contiguous = false;
+                break;
+            }
+        }
+        if (already_contiguous) {
+            return false;
+        }
+
+        // Move cells to be contiguous from the beginning
+        for (size_t i = 0; i < seq_cells.size(); ++i) {
+            uint32_t src = seq_cells[i];
+            uint32_t dst = i;
+            if (src == dst) continue;
+            mv(src, dst);
+        }
+
+        return true;
+    }
+
+    // Defragment all cells, grouping by sequence ID
+    size_t defrag_all() {
+        struct CellInfo {
+            uint32_t idx;
+            llama_seq_id seq_id;
+            llama_pos pos_val;
+            llama_kv_cell_ext ext_val;
+            llama_pos shift_val;
+            std::bitset<LLAMA_MAX_SEQ> seq_val;
+        };
+
+        std::vector<CellInfo> all_cells;
+        all_cells.reserve(used.size());
+
+        for (uint32_t i : used) {
+            if (pos[i] == -1) continue;
+            // Find the first sequence in this cell
+            llama_seq_id seq_id = -1;
+            for (llama_seq_id s_id = 0; s_id < LLAMA_MAX_SEQ; ++s_id) {
+                if (seq[i].test(s_id)) {
+                    seq_id = s_id;
+                    break;
+                }
+            }
+            if (seq_id >= 0) {
+                all_cells.push_back({i, seq_id, pos[i], ext[i], shift[i], seq[i]});
+            }
+        }
+
+        if (all_cells.empty()) {
+            return 0;
+        }
+
+        // Sort by sequence ID, then by position
+        std::sort(all_cells.begin(), all_cells.end(),
+            [](const CellInfo & a, const CellInfo & b) {
+                if (a.seq_id != b.seq_id) return a.seq_id < b.seq_id;
+                return a.pos_val < b.pos_val;
+            });
+
+        // Clear all cells
+        for (uint32_t i = 0; i < pos.size(); ++i) {
+            if (pos[i] != -1) {
+                pos[i] = -1;
+                ext[i].reset();
+                shift[i] = 0;
+                seq[i].reset();
+            }
+        }
+        used.clear();
+
+        // Re-insert cells contiguously grouped by sequence
+        uint32_t dst = 0;
+        for (const auto & cell : all_cells) {
+            pos[dst] = cell.pos_val;
+            ext[dst] = cell.ext_val;
+            seq[dst] = cell.seq_val;
+            shift[dst] = cell.shift_val;
+            used.insert(dst);
+            dst++;
+        }
+
+        return all_cells.size();
+    }
+
+    // Check if a sequence's cells are fragmented
+    bool is_sequence_fragmented(llama_seq_id seq_id) const {
+        uint32_t first = pos.size();
+        uint32_t last = 0;
+        uint32_t count = 0;
+
+        for (uint32_t i = 0; i < pos.size(); ++i) {
+            if (seq_has(i, seq_id)) {
+                first = std::min(first, i);
+                last = std::max(last, i);
+                count++;
+            }
+        }
+
+        if (count == 0) return false;
+        return (last - first + 1) != count;
+    }
+
+    // Get fragmentation ratio for a sequence
+    float get_sequence_fragmentation(llama_seq_id seq_id) const {
+        uint32_t first = pos.size();
+        uint32_t last = 0;
+        uint32_t count = 0;
+
+        for (uint32_t i = 0; i < pos.size(); ++i) {
+            if (seq_has(i, seq_id)) {
+                first = std::min(first, i);
+                last = std::max(last, i);
+                count++;
+            }
+        }
+
+        if (count <= 1) return 0.0f;
+        return 1.0f - (float)count / (float)(last - first + 1);
+    }
+
+
 private:
     bool has_shift = false;
 

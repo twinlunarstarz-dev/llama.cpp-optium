@@ -166,6 +166,19 @@ public:
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
 
+    // KV cache compaction/defragmentation
+    // Defragment a specific sequence's KV cells to be contiguous
+    bool defrag_sequence(llama_seq_id seq_id);
+
+    // Defragment all sequences in the cache, grouping by sequence ID
+    size_t defrag_all();
+
+    // Check if a sequence's KV cells are fragmented
+    bool is_sequence_fragmented(llama_seq_id seq_id) const;
+
+    // Get fragmentation ratio for a sequence (0.0 = perfectly contiguous, 1.0 = maximally fragmented)
+    float get_sequence_fragmentation(llama_seq_id seq_id) const;
+
     //
     // graph_build API
     //

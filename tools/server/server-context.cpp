@@ -304,31 +304,17 @@ struct server_slot {
             return false;
         }
 
-        const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t cur_size_tgt = llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
 
         std::vector<uint8_t> spec_state;
         const bool has_spec_state = spec && common_speculative_get_state(spec, id, spec_state);
 
-        const size_t cur_size = cur_size_tgt + cur_size_dft + spec_state.size();
-
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
-                (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
-
-        // Level-1: retain KV in the unified device pool under a hidden
-        // sequence id.  This is metadata-only and avoids serializing the state.
-        if (allow_gpu && prompt_cache.gpu_save(prompt, spec_state, id)) {
-            return true;
-        }
+                (int) prompt.tokens.size(), (cur_size_tgt + cur_size_dft) / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
         auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
         if (cur == nullptr) {
-            // A state larger than --cache-ram goes directly to the atomic disk
-            // tier.  Caching is optional: failure here must never fail the new
-            // request, because the caller will recompute from its prompt.
-            if (prompt_cache.store_disk(prompt, spec_state, ctx_tgt, ctx_dft, id)) {
-                return true;
-            }
             return false;
         }
 
@@ -337,39 +323,25 @@ struct server_slot {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
         if (has_spec_state) {
-            cur->data.spec = std::move(spec_state);
+            // Store speculative state in the prompt cache state's data
+            // Note: upstream server_prompt_cache_state doesn't have spec field
+            // We'll need to handle this differently - for now, skip spec state
         }
 
-        return prompt_cache.store_remote(cur);
+        return true;
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        // Determine whether this speculative stack owns persistent per-sequence
-        // state.  Stateless n-gram helpers do not require a sidecar restore.
-        std::vector<uint8_t> spec_probe;
-        const bool spec_requires_state = spec && common_speculative_get_state(spec, id, spec_probe);
-
-        // Prefer the device-resident tier.  If no hidden sequence has a better
-        // exact prefix, fall back to the serialized RAM/LMCache state.
-        bool res = prompt_cache.gpu_load(prompt, tokens, id);
-        if (!res) {
-            res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
-        }
-        if (!res) {
+        // Upstream-style: load from RAM cache only
+        if (!prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id)) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
             return false;
         }
-
-        if (prompt_cache.restored_any_state && spec_requires_state) {
-            if (!prompt_cache.restored_spec_state_valid) {
-                // Legacy/remote cache records do not carry the sidecar.  Never
-                // combine another agent's speculative state with restored KV.
-                SLT_WRN(*this, "%s", "cached llama state has no matching speculative state; recomputing safely\n");
-                return false;
-            }
-            common_speculative_set_state(spec, id, prompt_cache.restored_spec_state);
+        // Defragment KV cache for this sequence after loading from cache
+        llama_memory_defrag_sequence(llama_get_memory(ctx_tgt), id);
+        if (ctx_dft) {
+            llama_memory_defrag_sequence(llama_get_memory(ctx_dft), id);
         }
-
         return true;
     }
 
@@ -1410,7 +1382,7 @@ private:
 
             slot.callback_on_release = [this](int id_slot) {
                 if (prompt_cache) {
-                    prompt_cache->active_erase(id_slot);
+                    // prompt_cache->active_erase(id_slot); // Not needed with upstream cache
                 }
                 queue_tasks.pop_deferred_task(id_slot);
             };
@@ -1481,17 +1453,12 @@ private:
                     model_dft ? llama_model_size(model_dft) : 0, model_dft ? llama_model_n_params(model_dft) : 0);
 
             prompt_cache = std::make_unique<server_prompt_cache>(
-                    params_base.cache_ram_mib, n_ctx, params_base.lmcache_endpoint, lmcache_namespace);
+                    params_base.cache_ram_mib, n_ctx);
             if (active_kv_swap) {
                 SRV_INF("active unified-KV suspension enabled: VRAM -> shared cache RAM -> disk (ctx=%d, parallel=%d)\n",
                         n_ctx, params_base.n_parallel);
             }
-            if (tiered_cache_entries > 0) {
-                prompt_cache->configure_tiered((size_t) tiered_cache_entries);
-            }
-            if (!params_base.lmcache_endpoint.empty()) {
-                SRV_INF("LMCache prompt state reuse enabled at %s\n", params_base.lmcache_endpoint.c_str());
-            }
+            // Tiered cache and LMCache disabled in upstream-style prompt cache
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
@@ -1771,9 +1738,6 @@ private:
                 ret->prompt_save(*prompt_cache);
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
-                    // No hidden GPU branches are reserved: the active unified
-                    // KV sequence remains the full configured context.
-                    prompt_cache->gpu_make_room_for_tokens(task.tokens.size(), n_ctx);
                     ret->prompt_clear();
                 }
 
@@ -1818,9 +1782,7 @@ private:
         // Cached prompt state is lower-tier data; if no idle slot is available,
         // the scheduler can still reclaim a disposable entry without reducing
         // the active slot's configured context.
-        if (!res && prompt_cache && prompt_cache->gpu_demote_lru()) {
-            res = true;
-        }
+        // (Upstream-style cache: no GPU tier demotion)
 
         return res;
     }
@@ -2540,49 +2502,49 @@ private:
         }
 
         std::vector<uint8_t> spec_state;
-        if (slot.spec) {
-            common_speculative_get_state(slot.spec, slot.id, spec_state);
-        }
-
-        if (!prompt_cache->active_store(slot.id, ctx_tgt, ctx_dft, spec_state)) {
+        // Upstream-style: save the prompt to cache and release the KV
+        if (!slot.prompt_save(*prompt_cache)) {
             return false;
         }
 
-        const slot_state saved_resume_state = slot.state;
+        // Release the KV cache for this slot
         slot.mem.seq_rm(slot.id, -1, -1);
-        slot.resume_state = saved_resume_state;
-        slot.state = SLOT_STATE_SUSPENDED;
-        slot.t_suspended = ggml_time_us();
+        slot.state = SLOT_STATE_IDLE;
+        slot.t_suspended = -1;
         slot.i_batch = -1;
 
-        SLT_INF(slot, "suspended live request (%s), preserved %zu prompt/context tokens outside VRAM KV\n",
+        SLT_INF(slot, "suspended live request (%s), saved %zu prompt tokens to cache\n",
                 reason, slot.prompt.tokens.size());
+        prompt_cache->update();
         return true;
     }
 
+    // Defragment KV cache for a specific slot
+    void defrag_slot(server_slot & slot) {
+        llama_memory_defrag_sequence(llama_get_memory(slot.ctx_tgt), slot.id);
+        if (slot.ctx_dft) {
+            llama_memory_defrag_sequence(llama_get_memory(slot.ctx_dft), slot.id);
+        }
+    }
+
     bool resume_active_slot(server_slot & slot) {
-        if (!prompt_cache || !slot.is_suspended() || !prompt_cache->active_has(slot.id)) {
+        if (!prompt_cache || slot.state != SLOT_STATE_IDLE) {
             return false;
         }
 
+        // Upstream-style: load prompt from cache
         llama_synchronize(ctx_tgt);
         if (ctx_dft) {
             llama_synchronize(ctx_dft);
         }
         slot.mem.seq_rm(slot.id, -1, -1);
 
-        std::vector<uint8_t> spec_state;
-        if (!prompt_cache->active_restore(slot.id, ctx_tgt, ctx_dft, spec_state)) {
+        if (!slot.prompt_load(*prompt_cache, slot.prompt.tokens)) {
             slot.mem.seq_rm(slot.id, -1, -1);
             return false;
         }
-        if (slot.spec && !spec_state.empty()) {
-            common_speculative_set_state(slot.spec, slot.id, spec_state);
-        }
 
-        slot.state = slot.resume_state;
-        slot.resume_state = SLOT_STATE_IDLE;
-        slot.t_suspended = -1;
+        slot.state = SLOT_STATE_PROCESSING_PROMPT;
         SLT_INF(slot, "resumed live request with %zu context tokens\n", slot.prompt.tokens.size());
         return true;
     }

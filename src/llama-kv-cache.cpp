@@ -657,6 +657,56 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
     }
 }
 
+
+
+// Defragment the KV cache by moving all cells for a sequence to be contiguous
+// starting from the beginning of the cache. Returns true if any cells were moved.
+bool llama_kv_cache::defrag_sequence(llama_seq_id seq_id) {
+    // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+    if (other) {
+        return false;
+    }
+
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    auto & cells = v_cells[seq_to_stream[seq_id]];
+    return cells.defrag_sequence(seq_id);
+}
+
+// Defragment all sequences in the cache
+size_t llama_kv_cache::defrag_all() {
+    if (other) {
+        return 0;
+    }
+
+    size_t total_moved = 0;
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        total_moved += v_cells[s].defrag_all();
+        v_heads[s] = 0;
+    }
+    return total_moved;
+}
+
+// Check if a sequence's KV cells are fragmented
+bool llama_kv_cache::is_sequence_fragmented(llama_seq_id seq_id) const {
+    if (other) return false;
+
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    const auto & cells = v_cells[seq_to_stream[seq_id]];
+    return cells.is_sequence_fragmented(seq_id);
+}
+
+// Get fragmentation ratio for a sequence (0.0 = perfectly contiguous, 1.0 = maximally fragmented)
+float llama_kv_cache::get_sequence_fragmentation(llama_seq_id seq_id) const {
+    if (other) return 0.0f;
+
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    const auto & cells = v_cells[seq_to_stream[seq_id]];
+    return cells.get_sequence_fragmentation(seq_id);
+}
+
 llama_pos llama_kv_cache::seq_pos_min(llama_seq_id seq_id) const {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {

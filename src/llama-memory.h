@@ -124,6 +124,12 @@ struct llama_memory_i {
     virtual llama_pos seq_pos_min(llama_seq_id seq_id) const = 0;
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 
+    // KV cache compaction/defragmentation
+    virtual bool defrag_sequence(llama_seq_id seq_id) { return false; }
+    virtual size_t defrag_all() { return 0; }
+    virtual bool is_sequence_fragmented(llama_seq_id seq_id) const { return false; }
+    virtual float get_sequence_fragmentation(llama_seq_id seq_id) const { return 0.0f; }
+
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
 
     //

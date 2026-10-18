@@ -4224,6 +4224,34 @@ bool llama_memory_can_shift(llama_memory_t mem) {
     return mem->get_can_shift();
 }
 
+
+
+// KV cache compaction/defragmentation
+bool llama_memory_defrag(llama_memory_t mem) {
+    if (!mem) return false;
+    return mem->defrag_all() > 0;
+}
+
+bool llama_memory_defrag_sequence(llama_memory_t mem, llama_seq_id seq_id) {
+    if (!mem) return false;
+    return mem->defrag_sequence(seq_id);
+}
+
+size_t llama_memory_defrag_all(llama_memory_t mem) {
+    if (!mem) return 0;
+    return mem->defrag_all();
+}
+
+bool llama_memory_is_sequence_fragmented(llama_memory_t mem, llama_seq_id seq_id) {
+    if (!mem) return false;
+    return mem->is_sequence_fragmented(seq_id);
+}
+
+float llama_memory_get_sequence_fragmentation(llama_memory_t mem, llama_seq_id seq_id) {
+    if (!mem) return 0.0f;
+    return mem->get_sequence_fragmentation(seq_id);
+}
+
 // llama state API
 
 // deprecated

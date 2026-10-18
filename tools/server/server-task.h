@@ -591,26 +591,16 @@ struct server_prompt_data {
     std::vector<uint8_t> main;
     std::vector<uint8_t> drft;
 
-    // State owned by speculative implementations (for example MTP's pending
-    // target hidden row).  Target/draft llama state alone is not sufficient to
-    // resume a speculative agent exactly after another agent used the slot.
-    std::vector<uint8_t> spec;
-
     size_t size() const {
-        return main.size() + drft.size() + spec.size();
+        return main.size() + drft.size();
     }
 };
 
 struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
-    bool on_disk = false;
-    std::string disk_dir;
-    std::string file_tgt;
-    std::string file_dft;
 
     size_t size() const {
-        // Disk-backed state bytes are not charged against the RAM cache quota.
         size_t res = data.size();
 
         for (const auto & ckpt : prompt.checkpoints) {
@@ -621,52 +611,13 @@ struct server_prompt_cache_state {
     }
 };
 
-// Lower-tier agent cache entry. Target/draft KV bytes live in RAM or committed
-// disk files; the active request remains the sole live sequence in the unified
-// KV pool, so its configured context is never divided by cache entries.
-struct server_gpu_prompt_cache_state {
-    server_prompt prompt;
-    std::vector<uint8_t> spec;
-    llama_seq_id seq_id = -1;
-};
-
-// Exact state for a live request that has been temporarily removed from the
-// unified KV pool. RAM-resident target/draft bytes share --cache-ram with the
-// ordinary prompt cache; when they cannot fit, target/draft state spills to
-// files and only the small speculative sidecar remains in host memory.
-struct server_active_prompt_cache_state {
-    server_prompt_data data;
-    bool on_disk = false;
-    std::string disk_dir;
-    std::string file_tgt;
-    std::string file_dft;
-
-    size_t size() const { return data.size(); }
-};
-
 struct server_prompt_cache {
-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens, const std::string & lmcache_endpoint, const std::string & lmcache_namespace) {
-        this->local_enabled = limit_size_mib != 0;
+    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
-        if (!lmcache_endpoint.empty()) {
-            this->lmcache = std::make_unique<common_lmcache_client>(lmcache_endpoint);
-            this->lmcache_namespace = lmcache_namespace;
-        }
     }
 
-    ~server_prompt_cache();
-
     std::list<server_prompt_cache_state> states;
-    std::list<server_gpu_prompt_cache_state> gpu_states;
-    std::map<int32_t, server_active_prompt_cache_state> active_states;
-    std::string active_disk_dir;
-    size_t tiered_cache_entries = 0;
-
-    llama_context * gpu_ctx_tgt = nullptr;
-    llama_context * gpu_ctx_dft = nullptr;
-    llama_seq_id gpu_seq_first = 0;
-    int32_t gpu_seq_count = 0;
 
     // in bytes, 0 = no limit
     size_t limit_size = 0;
@@ -674,57 +625,13 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
-    bool local_enabled = true;
-
-    std::unique_ptr<common_lmcache_client> lmcache;
-    std::string lmcache_namespace;
-
-    // Result metadata for the most recent load().  This avoids changing the
-    // public load signature while allowing server_slot to restore the matching
-    // speculative-driver state after the llama target/draft state is restored.
-    bool restored_any_state = false;
-    bool restored_spec_state_valid = false;
-    std::vector<uint8_t> restored_spec_state;
-
     size_t size() const;
 
     size_t n_tokens() const;
 
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
-    // Store an active sequence directly on the disk tier when it cannot fit in
-    // the RAM prompt cache.  The state is published atomically and remains
-    // disposable cache data if admission or serialization fails.
-    bool store_disk(const server_prompt & prompt, const std::vector<uint8_t> & spec,
-                    llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
-    void configure_tiered(size_t max_entries);
-    void erase_state(std::list<server_prompt_cache_state>::iterator it);
-
-    bool store_remote(server_prompt_cache_state * state);
-
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
-
-    // Active request residency. These methods preserve an exact sequence while
-    // the request object/sampler remains live, allowing another request to use
-    // the fixed-size unified KV pool without truncating either context.
-    bool active_store(int32_t id_slot, llama_context * ctx_tgt, llama_context * ctx_dft, const std::vector<uint8_t> & spec);
-    bool active_restore(int32_t id_slot, llama_context * ctx_tgt, llama_context * ctx_dft, std::vector<uint8_t> & spec);
-    bool active_has(int32_t id_slot) const;
-    void active_erase(int32_t id_slot);
-
-    // Configure hidden sequence ids [seq_first, seq_first + seq_count) for a
-    // unified-KV, GPU-resident inactive-agent tier.
-    void configure_gpu(llama_context * ctx_tgt, llama_context * ctx_dft, llama_seq_id seq_first, int32_t seq_count);
-    bool gpu_enabled() const { return gpu_ctx_tgt != nullptr && gpu_seq_count > 0; }
-    bool gpu_save(const server_prompt & prompt, const std::vector<uint8_t> & spec, llama_seq_id active_seq);
-    bool gpu_load(server_prompt & prompt, const server_tokens & tokens_new, llama_seq_id active_seq);
-    bool gpu_demote_lru();
-
-    // Reclaim hidden sequences until an incoming prompt can fit in the
-    // unified KV pool.  This is intentionally conservative: shared prefixes
-    // may reduce the actual footprint, but overestimating is safer than
-    // allowing a hidden branch to turn a later request into an OOM.
-    void gpu_make_room_for_tokens(size_t incoming_tokens, size_t kv_capacity_tokens);
 
     void update();
 };

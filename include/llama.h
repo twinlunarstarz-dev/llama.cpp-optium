@@ -805,6 +805,26 @@ extern "C" {
     LLAMA_API llama_pos llama_memory_seq_pos_max(
             llama_memory_t mem,
               llama_seq_id seq_id);
+// KV cache compaction/defragmentation
+LLAMA_API bool llama_memory_defrag(
+        llama_memory_t mem);
+
+LLAMA_API bool llama_memory_defrag_sequence(
+        llama_memory_t mem,
+        llama_seq_id seq_id);
+
+LLAMA_API size_t llama_memory_defrag_all(
+        llama_memory_t mem);
+
+LLAMA_API bool llama_memory_is_sequence_fragmented(
+        llama_memory_t mem,
+        llama_seq_id seq_id);
+
+LLAMA_API float llama_memory_get_sequence_fragmentation(
+        llama_memory_t mem,
+        llama_seq_id seq_id);
+
+
 
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
