@@ -92,9 +92,6 @@ void llama_model_llama::load_arch_tensors(llama_model_loader &) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_llama::build_arch_graph(const llm_graph_params & params) const {
-    if (params.gtype == LLM_GRAPH_TYPE_TRAINING) {
-        return std::make_unique<graph<true>>(*this, params);
-    }
     return std::make_unique<graph<false>>(*this, params);
 }
 
@@ -238,15 +235,13 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    if (!embed || params.gtype == LLM_GRAPH_TYPE_TRAINING) {
+    if constexpr (!embed) {
         // lm_head
         cur = build_lora_mm(model.output, cur, model.output_s);
 
         cb(cur, "result_output", -1);
         res->t_logits = cur;
     }
-
-    ggml_build_forward_expand(gf, cur);
 }
 
 template struct llama_model_llama::graph<false>;

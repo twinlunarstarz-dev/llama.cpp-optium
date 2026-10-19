@@ -570,11 +570,19 @@ void ggml_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event)
     backend->iface.event_wait(backend, event);
 }
 
-static void ggml_backend_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+static void ggml_backend_graph_optimize(
+        ggml_backend_t backend, struct ggml_cgraph * cgraph,
+        struct ggml_backend_graph_optimize_params * params) {
     GGML_ASSERT(backend);
     if (backend->iface.graph_optimize != NULL) {
-        backend->iface.graph_optimize(backend, cgraph);
+        backend->iface.graph_optimize(backend, cgraph, params);
     }
+}
+
+// The sequential scheduler allocates every split up front and releases the
+// buffers only when the whole graph completes, so it does not need the
+// backend's out-of-order allocation dependencies.
+static void ggml_backend_sched_ignore_alloc_dep(void * /*user_data*/, struct ggml_tensor * /*tensor*/, struct ggml_tensor * /*until*/) {
 }
 
 // Backend device
@@ -3137,7 +3145,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
         // Optimize this split of the graph. This needs to happen before we make graph_copy,
         // so they are in sync.
-        ggml_backend_graph_optimize(sched->backends[split->backend_id], &split->graph);
+        struct ggml_backend_graph_optimize_params opt_params = {
+            /* .add_alloc_dep = */ ggml_backend_sched_ignore_alloc_dep,
+            /* .user_data     = */ NULL,
+        };
+        ggml_backend_graph_optimize(sched->backends[split->backend_id], &split->graph, &opt_params);
     }
 
     struct ggml_cgraph * graph_copy = &sched->graph;
@@ -4922,9 +4934,11 @@ ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void) {
         /* .iface   = */ {
             /* .get_name         = */ ggml_backend_cpu_buffer_type_get_name,
             /* .alloc_buffer     = */ ggml_backend_cpu_buffer_type_alloc_buffer,
+            /* .alloc_buffer_n   = */ NULL,
             /* .get_alignment    = */ ggml_backend_cpu_buffer_type_get_alignment,
             /* .get_max_size     = */ NULL, // defaults to SIZE_MAX
             /* .get_alloc_size   = */ NULL, // defaults to ggml_nbytes
+            /* .get_alloc_size_n = */ NULL, // defaults to per-tensor get_alloc_size
             /* .is_host          = */ ggml_backend_cpu_buffer_type_is_host,
         },
         /* .device  = */ NULL, // FIXME ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0),
@@ -4945,9 +4959,11 @@ static ggml_backend_buffer_type_t ggml_backend_cpu_buffer_from_ptr_type(void) {
         /* .iface   = */ {
             /* .get_name         = */ ggml_backend_cpu_buffer_from_ptr_type_get_name,
             /* .alloc_buffer     = */ ggml_backend_cpu_buffer_type_alloc_buffer,
+            /* .alloc_buffer_n   = */ NULL,
             /* .get_alignment    = */ ggml_backend_cpu_buffer_type_get_alignment,
             /* .get_max_size     = */ NULL, // defaults to SIZE_MAX
             /* .get_alloc_size   = */ NULL, // defaults to ggml_nbytes
+            /* .get_alloc_size_n = */ NULL, // defaults to per-tensor get_alloc_size
             /* .is_host          = */ ggml_backend_cpu_buffer_type_is_host,
         },
         /* .device  = */ NULL, // FIXME ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0),
