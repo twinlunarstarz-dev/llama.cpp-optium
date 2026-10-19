@@ -1167,6 +1167,15 @@ private:
         llama_init = common_init_from_params(params_ctx);
         params_base.sampling = params_ctx.sampling;
 
+        // common_init_from_params assigns the loaded LoRA adapter pointers on params_ctx.
+        // params_base is the copy used by the scheduler/slots, so propagate the pointers
+        // or per-slot adapter application would use stale (uninitialized) pointers.
+        if (params_base.lora_adapters.size() == params_ctx.lora_adapters.size()) {
+            for (size_t i = 0; i < params_base.lora_adapters.size(); ++i) {
+                params_base.lora_adapters[i].ptr = params_ctx.lora_adapters[i].ptr;
+            }
+        }
+
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
 

@@ -1490,7 +1490,9 @@ void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_a
     loras.reset(new llama_adapter_loras());
 
     for (size_t i = 0; i < n_adapters; i ++) {
-        if (scales[i] != 0.0f) {
+        // a null adapter pointer must never enter the map: the graph would call
+        // get_weight() on it and crash
+        if (adapters[i] != nullptr && scales[i] != 0.0f) {
             loras->insert({adapters[i], scales[i]});
         }
     }
@@ -1505,7 +1507,7 @@ bool llama_context::adapters_lora_are_same(llama_adapter_lora ** adapters, size_
     size_t n_non_zero = 0;
 
     for (size_t i = 0; i < n_adapters; i ++) {
-        if (scales[i] == 0.0f) {
+        if (scales[i] == 0.0f || adapters[i] == nullptr) {
             continue;
         }
         n_non_zero++;
