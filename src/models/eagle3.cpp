@@ -32,6 +32,22 @@ void llama_model_eagle3::load_arch_hparams(llama_model_loader & ml) {
     // compatible with eagle3.1 (e.g. nvidia/gpt-oss-120b-Eagle3-v3)
     ml.get_key(LLM_KV_NORM_BEFORE_FC, hparams.norm_before_fc, false);
 
+    // sliding-window attention (optional): drafters are often trained with a
+    // limited attention window and must not attend over the whole context.
+    ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false);
+    if (hparams.n_swa > 0) {
+        hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
+        hparams.rope_freq_base_train_swa  = hparams.rope_freq_base_train;
+        hparams.rope_freq_scale_train_swa = hparams.rope_freq_scale_train;
+        ml.get_key(LLM_KV_ROPE_FREQ_BASE_SWA, hparams.rope_freq_base_train_swa, false);
+        if (!ml.get_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl, false)) {
+            for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+                hparams.is_swa_impl[il] = 1;
+            }
+        }
+        LLAMA_LOG_INFO("%s: EAGLE3 n_swa = %u, is_swa_any = %d\n", __func__, hparams.n_swa, (int) hparams.is_swa_any());
+    }
+
     type = LLM_TYPE_UNKNOWN;
 }
 
@@ -191,7 +207,14 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
     // inp_pos - contains the positions
     ggml_tensor * inp_pos = build_inp_pos();
 
-    auto * inp_attn = build_attn_inp_kv();
+    // SWA drafters need the iswa attention input (windowed KV cache)
+    llm_graph_input_attn_kv      * inp_attn      = nullptr;
+    llm_graph_input_attn_kv_iswa * inp_attn_iswa = nullptr;
+    if (hparams.is_swa_any()) {
+        inp_attn_iswa = build_attn_inp_kv_iswa();
+    } else {
+        inp_attn = build_attn_inp_kv();
+    }
 
     const float kq_scale = 1.0f/sqrtf(float(n_embd_head));
 
@@ -252,7 +275,11 @@ llama_model_eagle3::graph<false>::graph(const llama_model & model, const llm_gra
         cb(Qcur, "Qcur_rope", il);
         cb(Kcur, "Kcur_rope", il);
 
-        cur = build_attn(inp_attn,
+        cur = inp_attn
+            ? build_attn(inp_attn,
+                model.layers[il].wo, NULL, nullptr,
+                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il)
+            : build_attn(inp_attn_iswa,
                 model.layers[il].wo, NULL, nullptr,
                 Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
 

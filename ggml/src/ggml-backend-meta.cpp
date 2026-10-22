@@ -1115,7 +1115,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                         split_state.ne[j] *= tensor->ne[split_state.axis];
                         if (split_state.ne[j] != 0 || tensor->src[i]->ne[src_ss[i].axis] != 0) {
                             const int64_t div = tensor->src[i]->ne[src_ss[i].axis] * split_state.nr[0];
-                            GGML_ASSERT(split_state.ne[j] % div == 0);
+                            if (split_state.ne[j] % div != 0) {
+                                GGML_ABORT("tensor split: %s ne[%d]=%lld cannot be split into %d segments "
+                                           "(src %s ne[%d]=%lld, nr0=%lld, segment=%lld)",
+                                           tensor->name, (int) split_state.axis,
+                                           (long long) tensor->ne[split_state.axis], (int) n_bufs,
+                                           tensor->src[i]->name, (int) src_ss[i].axis,
+                                           (long long) tensor->src[i]->ne[src_ss[i].axis],
+                                           (long long) split_state.nr[0], (long long) split_state.ne[j]);
+                            }
                             split_state.ne[j] /= div;
                         }
                     }

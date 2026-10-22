@@ -14,6 +14,12 @@
 #include <map>
 #include <set>
 #include <stdexcept>
+#include <vector>
+#include <mutex>
+#include <atomic>
+#include <thread>
+#include <memory>
+#include <condition_variable>
 #include <unordered_map>
 
 // lists of buffer types used for each layer
@@ -26,6 +32,10 @@ enum llama_fver {
 };
 
 const char * llama_file_version_name(llama_fver version);
+
+// Forward declarations for MoE tiered placement
+struct moe_placement_plan;
+struct moe_ram_arena;
 
 struct llama_model_loader {
     // Holds information on a model weight
@@ -125,6 +135,10 @@ struct llama_model_loader {
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
     const llama_model_tensor_buft_override * tensor_buft_overrides;
+    std::vector<llama_model_tensor_buft_override> moe_overrides_owned;
+    std::vector<std::string> moe_pattern_strings;
+    std::unique_ptr<moe_placement_plan> moe_plan;
+    std::unique_ptr<moe_ram_arena> moe_arena;
 
     gguf_context_ptr metadata_ptr;
     struct gguf_context * metadata; // either metadata_ptr.get() or externally set
@@ -170,6 +184,9 @@ struct llama_model_loader {
     ggml_backend_buffer_type_t first_moved_from_buft = nullptr;
     ggml_backend_buffer_type_t first_moved_to_buft = nullptr;
 
+    // Capture file offset for RAM-tier expert tensor
+    void capture_expert_file_offset(const char * tensor_name, size_t file_offset, size_t tensor_size, struct ggml_tensor * cur);
+
     llama_model_loader(
         struct gguf_context * metadata,
         llama_model_set_tensor_data_t set_tensor_data,
@@ -182,7 +199,14 @@ struct llama_model_loader {
         bool no_alloc,
         bool load_mtp,
         const llama_model_kv_override * param_overrides_p,
-        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
+        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
+        // MoE tiered placement parameters
+        size_t moe_ram_mib,
+        const char * moe_placement,
+        bool moe_pin_decode,
+        const float * tensor_split,
+        int n_devices,
+        const char * moe_hot);
 
     template<typename T>
     typename std::enable_if<std::is_integral<T>::value, bool>::type
@@ -271,3 +295,165 @@ struct llama_model_loader {
 
     void print_info() const;
 };
+
+// MoE Tiered Placement Budget Solver (Phase 1)
+// Expert tier: 0=VRAM, 1=RAM, 2=DISK
+enum moe_expert_tier { MOE_TIER_VRAM = 0, MOE_TIER_RAM = 1, MOE_TIER_DISK = 2 };
+
+struct moe_placement_plan {
+    // Phase 1: layer-granular budgets
+    std::vector<size_t> vram_expert_budget;
+    size_t ram_expert_budget = 0;
+    int n_layers_vram = 0;
+    int n_layers_ram = 0;
+    int n_layers_disk = 0;
+    size_t expert_bytes_per_layer = 0;
+    size_t total_expert_bytes = 0;
+    size_t pinned_decode_bytes = 0;
+    std::vector<size_t> kv_compute_reserve;
+    std::vector<std::string> report_lines;
+    bool fits = false;
+    std::string error;
+
+    // Phase 2: expert-granular placement
+    // expert_tier[layer * n_expert + expert] = tier (0=VRAM, 1=RAM, 2=DISK)
+    std::vector<uint8_t> expert_tier;
+    // expert_slot[layer * n_expert + expert] = slot index within tier (for VRAM/RAM buffer indexing)
+    std::vector<int32_t> expert_slot;
+    // Per-tier expert counts
+    std::vector<size_t> tier_expert_counts; // size 3: VRAM, RAM, DISK
+    // Per-tier bytes per layer
+    std::vector<size_t> tier_bytes_per_layer; // size 3
+    // Profile used for ranking (activation counts per expert)
+    std::vector<uint32_t> profile_counts; // [n_layer * n_expert]
+    int n_expert = 0;
+    int n_layer = 0;
+};
+
+// Solve MoE expert placement from metadata and params (Phase 1: layer-granular)
+moe_placement_plan moe_solve_placement(
+        struct gguf_context * metadata,
+        const float * tensor_split,
+        int n_devices,
+        size_t moe_ram_mib,
+        const char * /*moe_placement_mode*/,
+        bool moe_pin_decode,
+        int n_layer,
+        int n_expert,
+        int n_expert_used);
+
+// Phase 2: expert-granular solver with profile
+moe_placement_plan moe_solve_placement_expert_granular(
+        struct gguf_context * metadata,
+        const float * tensor_split,
+        int n_devices,
+        size_t moe_ram_mib,
+        const char * moe_placement_mode,
+        bool moe_pin_decode,
+        int n_layer,
+        int n_expert,
+        int n_expert_used,
+        const char * moe_profile_path);
+
+// Note: loader is used to store pattern strings for lifetime management
+std::vector<llama_model_tensor_buft_override> moe_plan_to_overrides(
+        llama_model_loader * loader,
+        const moe_placement_plan & plan,
+        int n_layer);
+
+// Convert expert-granular plan to tensor buffer type overrides
+std::vector<llama_model_tensor_buft_override> moe_plan_to_overrides_expert_granular(
+        llama_model_loader * loader,
+        const moe_placement_plan & plan,
+        int n_layer,
+        int n_expert);
+
+// ============================================================================
+// Phase 3: Bounded RAM Arena for MoE experts
+// ============================================================================
+
+// Per-expert slot in the RAM arena
+struct moe_ram_slot {
+    int layer = -1;
+    int expert = -1;
+    size_t file_offset = 0;      // Offset in GGUF file for this expert's tensor data
+    size_t size = 0;             // Size of expert tensor data in bytes
+    // data pointer now points into the combined buffer (set when resident)
+    void * data = nullptr;       // Pointer to data in arena (when resident)
+    uint64_t last_access = 0;    // For LRU eviction
+    bool resident = false;       // Whether data is currently in arena
+};
+
+// Combined buffer for a layer's expert tensor (gate, up, down, or gate_up)
+// Holds all experts contiguously with the same stride as the original tensor
+struct moe_combined_buffer {
+    int layer = -1;
+    std::string tensor_type;     // "gate", "up", "down", "gate_up"
+    std::vector<uint8_t> buffer; // Combined buffer for all experts
+    size_t expert_size = 0;      // Size of one expert in bytes
+    size_t stride = 0;           // Stride between experts (nb[2])
+    std::vector<bool> resident;  // Per-expert resident flags
+    uint64_t last_access = 0;    // For LRU (whole buffer)
+};
+
+// Bounded RAM arena for MoE experts on disk tier
+// Fixed size (--moe-ram-mib), holds expert tensors loaded on-demand via pread
+struct moe_ram_arena {
+    size_t capacity_bytes = 0;           // Total arena capacity (--moe-ram-mib)
+    size_t used_bytes = 0;               // Currently used bytes
+    std::vector<moe_ram_slot> slots;     // All slots (one per RAM-tier expert)
+    std::vector<size_t> lru_list;        // LRU order (indices into slots)
+    std::mutex mutex;                    // Thread safety for async prefetch
+    std::atomic<bool> shutdown = false;  // Signal worker to stop
+    std::thread prefetch_thread;         // Async prefetch worker
+    int model_fd = -1;                  // File descriptor for model file (for pread)
+
+    // Combined buffers: key = (layer, tensor_type), value = buffer
+    // tensor_type: "gate", "up", "down", "gate_up"
+    std::map<std::pair<int, std::string>, moe_combined_buffer> combined_buffers;
+
+    // Initialize arena with given capacity and expert metadata
+    bool init(size_t capacity_mib, const moe_placement_plan & plan, int n_layer, int n_expert, const char * model_path);
+
+    // Load expert into arena (blocking, for synchronous access)
+    // Returns pointer to expert data in combined buffer, or nullptr if not in RAM tier
+    void * load_expert(int layer, int expert, const char * tensor_type = nullptr);
+
+    // Ensure all selected experts for a layer and tensor type are loaded
+    // Called before moe_cache uploads experts to GPU
+    bool ensure_experts_loaded(int layer, const char * tensor_type, const int * expert_ids, int n_experts);
+
+    // Get combined buffer pointer for a layer and tensor type
+    // Returns nullptr if not a RAM-tier tensor
+    void * get_combined_buffer(int layer, const char * tensor_type);
+
+    // Prefetch expert asynchronously (non-blocking)
+    void prefetch_expert(int layer, int expert, const char * tensor_type = nullptr);
+
+    // Evict least recently used expert(s) to make room for new data
+    void evict_lru(size_t need_bytes);
+
+    // Shutdown prefetch worker
+    void shutdown_worker();
+
+    // Destructor
+    ~moe_ram_arena();
+};
+
+// Global arena instance (owned by llama_model_loader)
+extern std::unique_ptr<moe_ram_arena> g_moe_ram_arena;
+
+// Early MoE solver - called from common.cpp before standard parameter fitting
+// Returns true on success, false on failure (error in plan.error)
+bool llama_moe_solve_early(
+        const char * model_path,
+        const float * tensor_split,
+        int n_devices,
+        size_t moe_ram_mib,
+        const char * moe_placement_mode,
+        bool moe_pin_decode,
+        const char * moe_profile_path,
+        int & n_layer_out,
+        int & n_expert_out,
+        int & n_expert_used_out,
+        std::vector<llama_model_tensor_buft_override> & overrides_out);

@@ -4281,12 +4281,25 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        const int64_t t_dec0 = ggml_time_us();
         queue_tasks.yield_to_queue([&]() {
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
         });
+        {
+            static int64_t s_dec_calls = 0, s_dec_us = 0, s_dec_tokens = 0;
+            s_dec_us += ggml_time_us() - t_dec0;
+            s_dec_calls++;
+            s_dec_tokens += (int64_t) batch.view.size();
+            if (s_dec_calls % 8 == 0 && getenv("SPC_STATS")) {
+                SRV_INF("decode stats: calls=%lld avg_ms=%.2f tokens=%lld tok_per_call=%.2f ms_per_tok=%.2f\n",
+                        (long long) s_dec_calls, s_dec_us / 1000.0 / s_dec_calls,
+                        (long long) s_dec_tokens, (double) s_dec_tokens / s_dec_calls,
+                        s_dec_us / 1000.0 / s_dec_tokens);
+            }
+        }
 
         if (ret != 0) {
             {

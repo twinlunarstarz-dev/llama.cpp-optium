@@ -344,6 +344,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_mistral3(params);
         case LLM_ARCH_EAGLE3:
             return new llama_model_eagle3(params);
+        case LLM_ARCH_EAGLE4:
+            return new llama_model_eagle4(params);
         case LLM_ARCH_DFLASH:
             return new llama_model_dflash(params);
         case LLM_ARCH_MIMO2:
@@ -1277,6 +1279,7 @@ struct llama_model::impl {
     layer_dev dev_input = {};
     layer_dev dev_output = {};
     std::vector<layer_dev> dev_layer;
+    std::vector<layer_dev> dev_kv_layer; // KV cache placement; equals dev_layer without layer streaming
 
     bool has_tensor_overrides;
 
@@ -1684,8 +1687,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer_all);
+    pimpl->dev_kv_layer.resize(n_layer_all);
     for (int il = 0; il < n_layer_all; ++il) {
-        pimpl->dev_layer[il] = get_layer_buft_list(il);
+        pimpl->dev_layer[il]    = get_layer_buft_list(il);
+        pimpl->dev_kv_layer[il] = pimpl->dev_layer[il];
     }
 
     // assign the output layer
@@ -2043,6 +2048,56 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
 // read and check the prism.hadamard metadata, and record the folded weights (load_tensors_hadamard makes the tensors)
 void llama_model_base::load_hparams_hadamard(llama_model_loader & ml) {
+    // TAARDIS/Forge: the same folded-Hadamard scheme under its own metadata
+    // namespace (forge.rotation.block[.<basename>] = <size>). Parsed here so the
+    // rotation table below is filled from whatever the converter emitted.
+    {
+        const gguf_context * fctx = ml.metadata;
+        const std::string prefix = "forge.rotation.block.";
+        const int64_t n_kv = gguf_get_n_kv(fctx);
+        for (int64_t i = 0; i < n_kv; i++) {
+            const char * key = gguf_get_key(fctx, i);
+            if (strcmp(key, "forge.rotation.count") == 0) {
+                if (gguf_get_kv_type(fctx, i) != GGUF_TYPE_UINT32) {
+                    throw std::runtime_error("forge.rotation.count must be uint32");
+                }
+                hparams.forge_rot_count = gguf_get_val_u32(fctx, i);
+                continue;
+            }
+            if (strcmp(key, "forge.rotation.block") == 0) {
+                if (gguf_get_kv_type(fctx, i) != GGUF_TYPE_UINT32) {
+                    throw std::runtime_error("forge.rotation.block must be uint32");
+                }
+                hparams.forge_rot_block_default = gguf_get_val_u32(fctx, i);
+                continue;
+            }
+            if (strncmp(key, prefix.c_str(), prefix.size()) != 0) {
+                continue;
+            }
+            const char * base = key + prefix.size();
+            if (gguf_get_kv_type(fctx, i) != GGUF_TYPE_UINT32) {
+                throw std::runtime_error(format("forge rotation block for '%s' must be uint32", base));
+            }
+            const uint32_t block = gguf_get_val_u32(fctx, i);
+            if (block < 2 || (block & (block - 1)) != 0) {
+                throw std::runtime_error(format("forge rotation block for '%s' must be a power of two, got %u", base, block));
+            }
+            if (strlen(base) > llama_hparams::FORGE_ROT_MAX_BASE) {
+                throw std::runtime_error(format("forge rotation basename too long: %s", base));
+            }
+            if (hparams.forge_rot_n >= llama_hparams::FORGE_ROT_MAX_ENTRIES) {
+                throw std::runtime_error("forge rotation table is full");
+            }
+            if (hparams.forge_rot_block_for_base(base) != 0) {
+                throw std::runtime_error(format("duplicate forge rotation basename: %s", base));
+            }
+            auto & entry = hparams.forge_rot_entries[hparams.forge_rot_n++];
+            memset(entry.base, 0, sizeof(entry.base));
+            strncpy(entry.base, base, llama_hparams::FORGE_ROT_MAX_BASE);
+            entry.block = block;
+        }
+    }
+
     uint32_t hadamard_version = 0;
     ml.get_key(LLM_KV_PRISM_HADAMARD_TIED_OUTPUT, hdmd.tied_output, false);
     if (ml.get_key(LLM_KV_PRISM_HADAMARD_VERSION, hadamard_version, false)) {
@@ -2189,6 +2244,42 @@ void llama_model_base::load_hparams_hadamard(llama_model_loader & ml) {
                 throw std::runtime_error(format("duplicate prism.hadamard inverse weight: %s", name.c_str()));
             }
         }
+    }
+
+    if (hparams.forge_rot_active()) {
+        if (hadamard_version != 0) {
+            throw std::runtime_error("a model cannot carry both forge.rotation and prism.hadamard metadata");
+        }
+        if (hdmd.tied_output) {
+            throw std::runtime_error("forge.rotation does not support a tied output");
+        }
+        // map every weight whose GGUF basename is in the table; the count in the
+        // file is a checksum against a converter/runtime disagreement
+        size_t n_rot = 0;
+        for (const auto & entry : ml.weights_map) {
+            const std::string & name = entry.first;
+            if (name.size() <= 7 || name.compare(name.size() - 7, 7, ".weight") != 0) {
+                continue;
+            }
+            std::string base = name.substr(0, name.size() - 7);
+            const size_t dot = base.rfind('.');
+            if (dot != std::string::npos) {
+                base = base.substr(dot + 1);
+            }
+            const uint32_t block = hparams.forge_rot_block_for_base(base.c_str());
+            if (block == 0) {
+                continue;
+            }
+            hdmd.weight_blocks.emplace(name, block);
+            n_rot++;
+        }
+        if (hparams.forge_rot_count != 0 && n_rot != hparams.forge_rot_count) {
+            throw std::runtime_error(format(
+                "forge.rotation.count says %u rotated tensors but the file has %zu; refusing to run a partly rotated model",
+                hparams.forge_rot_count, n_rot));
+        }
+        LLAMA_LOG_INFO("%s: forge rotation: %u basenames, default block %u, %zu rotated weights\n",
+                __func__, hparams.forge_rot_n, hparams.forge_rot_block_default, n_rot);
     }
 
     if (hdmd.tied_output) {
@@ -2673,6 +2764,10 @@ void llama_model::print_info() const {
 
 ggml_backend_dev_t llama_model::dev_layer(int il) const {
     return pimpl->dev_layer.at(il).dev;
+}
+
+ggml_backend_dev_t llama_model::dev_kv_layer(int il) const {
+    return pimpl->dev_kv_layer.at(il).dev;
 }
 
 ggml_backend_dev_t llama_model::dev_output() const {
@@ -3363,6 +3458,11 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.sequential_load             =*/ false,
+        /*.moe_ram_mib                 =*/ 0,
+        /*.moe_placement               =*/ nullptr,
+        /*.moe_pin_decode              =*/ true,
+        /*.moe_hot                       =*/ nullptr,
     };
 
     return result;
@@ -3524,6 +3624,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_ERNIE4_5_MOE:
         case LLM_ARCH_MISTRAL3:
         case LLM_ARCH_EAGLE3:
+        case LLM_ARCH_EAGLE4:
         case LLM_ARCH_MISTRAL4:
         case LLM_ARCH_LLAMA_EMBED:
         case LLM_ARCH_MAINCODER:
@@ -3758,6 +3859,7 @@ bool llama_model_has_encoder(const llama_model * model) {
         case LLM_ARCH_T5:
         case LLM_ARCH_T5ENCODER:
         case LLM_ARCH_EAGLE3:
+        case LLM_ARCH_EAGLE4:
         case LLM_ARCH_DFLASH:    return true;
         default:                 return false;
     }

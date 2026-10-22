@@ -429,6 +429,13 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
 
 typedef void (* fattn_vec_case_t)(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
+// TAARDIS: the generated FA_QUANTS list only covers built-in types, so the ternary
+// KV pair is enabled by hand; its template instance lives in
+// template-instances/fattn-vec-instance-q1_t_g128-q1_t_g128.cu.
+#ifndef GGML_CUDA_FA_Q1_T_g128_Q1_T_g128
+#define GGML_CUDA_FA_Q1_T_g128_Q1_T_g128 1
+#endif
+
 // Vector kernel for the given head size and K/V types, nullptr if its template instance was not compiled:
 static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, const ggml_type type_K_in, const ggml_type type_V_in) {
     const ggml_type type_K = type_K_in == GGML_TYPE_F32 ? GGML_TYPE_F16 : type_K_in;
@@ -489,6 +496,9 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
     FATTN_VEC_CASES_ALL_D(Q8_0, BF16)
     FATTN_VEC_CASES_ALL_D(BF16, BF16)
 
+    // TAARDIS: ternary KV (hand-added instance file; the generator does not know custom types)
+    FATTN_VEC_CASES_ALL_D(Q1_T_g128, Q1_T_g128)
+
     return nullptr;
 }
 
@@ -531,6 +541,7 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q1_T_g128: // ternary KV: vec instance exists, other kernels convert to f16
             return true;
         default:
             return false;
@@ -655,6 +666,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                         return BEST_FATTN_KERNEL_VEC;
                     }
                 }
+                // Quantized KV: the MMA path dequantizes the entire K/V cache to f16 on
+                // every call (see to_fp16() in ggml_cuda_flash_attn_ext_f16_extra_setup).
+                // At decode batch sizes that pass dominates long contexts, and it costs
+                // the same for q4_0 and q1_t because both land in the same f16 buffer.
+                // Keep small decode batches on the vec kernel, which reads the quantized
+                // cache in place.
+                if (Q->ne[1] <= 8 && K->ne[1] >= 8192) {
+                    return BEST_FATTN_KERNEL_VEC;
+                }
             }
             if (!gqa_opt_applies && Q->ne[1] == 1) {
                 return BEST_FATTN_KERNEL_VEC;
@@ -756,7 +776,20 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+    const best_fattn_kernel best = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+    if (std::getenv("GGML_CUDA_FATTN_DEBUG") != nullptr) {
+        static int64_t last_log = 0;
+        const int64_t now = ggml_time_us();
+        if (now - last_log > 2000000) {
+            const ggml_tensor * K = dst->src[1];
+            const ggml_tensor * V = dst->src[2];
+            GGML_LOG_INFO("%s: kernel=%d batch=%lld n_kv=%lld K=%s V=%s\n",
+                __func__, (int) best, (long long) dst->src[0]->ne[1], (long long) K->ne[1],
+                ggml_type_name(K->type), ggml_type_name(V->type));
+            last_log = now;
+        }
+    }
+    switch (best) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:

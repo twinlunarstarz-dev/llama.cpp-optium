@@ -10,6 +10,7 @@
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
+#include "../src/llama-model-loader.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "unicode.h"
@@ -1239,10 +1240,55 @@ common_gguf_info common_get_gguf_info(const std::string & fname) {
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
+    // Run MoE early solver BEFORE creating mparams so fit_params sees the correct n_gpu_layers
+    int moe_n_layers_vram = 0;
+    llama_model_tensor_buft_override * moe_overrides = nullptr;
+    size_t moe_overrides_count = 0;
+    bool moe_solver_ran = false;
+
+    if (params.fit_params && params.moe_ram_mib > 0 && (params.moe_placement.empty() || params.moe_placement == "auto")) {
+        COM_TRC("%s", "running MoE early solver for tensor placement ...\n");
+        int moe_n_layer = 0, moe_n_expert = 0, moe_n_expert_used = 0;
+        std::vector<llama_model_tensor_buft_override> moe_overrides_vec;
+        bool moe_ok = llama_moe_solve_early(
+            params.model.path.c_str(),  // model path for GGUF metadata
+            params.tensor_split,
+            0,  // n_devices - will be queried inside
+            params.moe_ram_mib,
+            params.moe_placement.empty() ? nullptr : params.moe_placement.c_str(),
+            params.moe_pin_decode,
+            params.moe_hot.empty() ? nullptr : params.moe_hot.c_str(),
+            moe_n_layer,
+            moe_n_expert,
+            moe_n_expert_used,
+            moe_overrides_vec
+        );
+        size_t moe_overrides_count = moe_overrides_vec.size();
+        if (moe_ok && moe_overrides_count > 0) {
+            params.tensor_buft_overrides.clear();
+            for (size_t i = 0; i < moe_overrides_count; ++i) {
+                params.tensor_buft_overrides.push_back(moe_overrides_vec[i]);
+            }
+            if (params.tensor_buft_overrides.empty() || params.tensor_buft_overrides.back().pattern != nullptr) {
+                params.tensor_buft_overrides.push_back({nullptr, nullptr});
+            }
+            if (moe_n_layers_vram > 0) {
+                params.n_gpu_layers = moe_n_layers_vram;
+                COM_TRC("%s", "MoE placement: setting n_gpu_layers=%d\n", moe_n_layers_vram);
+            }
+            COM_TRC("%s", "MoE early solver generated %zu overrides\n", moe_overrides_count);
+            moe_solver_ran = true;
+        } else {
+            COM_TRC("%s", "MoE early solver failed, continuing without MoE overrides\n");
+        }
+            }
+
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
     if (params.fit_params) {
+        fprintf(stderr, "DEBUG: entered fit_params block\n");
+        COM_TRC("%s", "DEBUG: entered fit_params block\n");
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
 
@@ -1705,6 +1751,11 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.no_alloc                    = params.no_alloc;
     mparams.load_mtp                    = params.load_mtp || std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
 
+    mparams.moe_ram_mib    = params.moe_ram_mib;
+    mparams.moe_placement  = params.moe_placement.empty() ? nullptr : params.moe_placement.c_str();
+    mparams.moe_pin_decode = params.moe_pin_decode;
+    mparams.moe_hot = params.moe_hot.empty() ? nullptr : params.moe_hot.c_str();
+
     return mparams;
 }
 
@@ -1745,6 +1796,12 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_v = params.cache_type_v;
 
     cparams.moe_cache_size = params.moe_cache_size;
+    cparams.moe_profile    = params.moe_hot.empty() ? nullptr : params.moe_hot.c_str();
+    cparams.moe_hot        = params.moe_hot.empty()     ? nullptr : params.moe_hot.c_str();
+
+    cparams.moe_ram_mib    = params.moe_ram_mib;
+    cparams.moe_placement  = params.moe_placement.empty() ? nullptr : params.moe_placement.c_str();
+    cparams.moe_pin_decode = params.moe_pin_decode;
 
     return cparams;
 }

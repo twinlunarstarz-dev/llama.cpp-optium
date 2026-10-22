@@ -239,7 +239,7 @@ llama_context::llama_context(
         cparams.ctx_other = params.ctx_other;
     }
 
-    if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH) {
+    if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_EAGLE4 || model.arch == LLM_ARCH_DFLASH) {
         if (model.tok_embd == nullptr || model.output == nullptr) {
             if (params.ctx_other == nullptr) {
                 throw std::runtime_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
@@ -359,6 +359,8 @@ llama_context::llama_context(
     cparams.op_offload     = params.op_offload;
     cparams.kv_unified     = params.kv_unified;
     cparams.moe_cache_size = params.moe_cache_size;
+    cparams.moe_profile   = params.moe_profile;
+    cparams.moe_hot       = params.moe_hot;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -549,7 +551,10 @@ llama_context::llama_context(
         }
 
         if (cparams.moe_cache_size > 0) {
-            moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size);
+            moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size,
+                cparams.moe_profile, cparams.moe_hot);
+        } else if (cparams.moe_profile != nullptr || cparams.moe_hot != nullptr) {
+            LLAMA_LOG_WARN("%s: --moe-profile/--moe-hot ignored: --moe-cache-mib is 0\n", __func__);
         }
 
         sched_reserve();
@@ -4002,6 +4007,11 @@ llama_context_params llama_context_default_params() {
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.moe_cache_size              =*/ 0,
+        /*.moe_profile                 =*/ nullptr,
+        /*.moe_hot                     =*/ nullptr,
+        /*.moe_ram_mib                 =*/ 0,
+        /*.moe_placement               =*/ nullptr,
+        /*.moe_pin_decode              =*/ true,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

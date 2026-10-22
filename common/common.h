@@ -175,6 +175,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NONE,          // no speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,  // standalone draft model speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,  // Eagle3 speculative decoding
+    COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE4,  // Eagle4 speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_MTP,     // Multi-token prediction
     COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,  // DFlash speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK,  // DSpark speculative decoding (DFlash + Markov head)
@@ -400,7 +401,7 @@ struct common_params_speculative {
 
     uint32_t need_n_rs_seq() const {
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE4 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
         return needs_rs_seq ? draft.n_max : 0u;
@@ -454,6 +455,7 @@ struct ggml_opt_optimizer_params common_opt_lr_pars(void * userdata);
 
 struct common_params {
     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
+    int32_t passes                =     1; // best-of-N hidden candidates selected by a same-model judge
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
     int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_ubatch              =   512; // physical batch size for prompt processing (must be >=32 to use BLAS)
@@ -476,6 +478,7 @@ struct common_params {
 
     // offload params
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
+    std::string device_raw;                  // deferred raw --device value for server router dispatch
 
     int32_t n_gpu_layers       = -1;    // number of layers to store in VRAM, -1 is auto, <= -2 is all
     int32_t main_gpu           = 0;     // the GPU that is used for scratch and small tensors
@@ -483,6 +486,10 @@ struct common_params {
     bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
     bool    fit_params_print   = false; // print the estimated required memory to run the model
     int32_t fit_params_min_ctx = 4096;  // minimum context size to set when trying to reduce memory use
+
+    // router admission: keep the sum of the children inside the device memory the driver reports
+    bool    vram_admission    = true;  // refuse or evict instead of letting a child run out of device memory
+    int32_t vram_reserve_mib  = 512;   // per-device headroom added to an estimated footprint (CUDA context, allocator slack)
 
     // margin per device in bytes for fitting parameters to free memory:
     std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);
@@ -588,6 +595,7 @@ struct common_params {
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
+    bool sequential_load   = false; // stream layers from disk, auto-fit GPU VRAM, layer-by-layer paging
     bool load_mtp          = false; // load MTP/NextN layers
 
     bool single_turn       = false; // single turn chat conversation
@@ -596,6 +604,13 @@ struct common_params {
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
     size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
+    std::string moe_profile;   // record per-expert activation counts to this JSON file (requires --moe-cache-mib)
+    std::string moe_hot;       // seed and pin the MoE cache from this JSON profile (requires --moe-cache-mib)
+
+    // MoE tiered placement (EXPERIMENTAL)
+    size_t moe_ram_mib = 4096;      // hard RAM cap in MiB for the MoE CPU arena (default: 4096)
+    std::string moe_placement;      // "auto" (solver) | "plan:<json>" (explicit plan)
+    bool moe_pin_decode = true;     // keep decode/attention layers in VRAM
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
@@ -641,6 +656,7 @@ struct common_params {
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
+    std::string lmcache_endpoint;         // optional LMCache bundled-daemon endpoint (host:port)
 
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT

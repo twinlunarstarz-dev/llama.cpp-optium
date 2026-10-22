@@ -342,10 +342,14 @@ static void llama_adapter_lora_init_impl(llama_model & model, FILE * file, llama
         if (!model_tensor) {
             throw std::runtime_error("LoRA tensor '" + name + "' does not exist in base model (hint: maybe wrong base model?)");
         }
-        // the LoRA delta of a Hadamard-folded weight reads the transformed input, so the result is wrong
-        if (model.hdmd.weight_blocks.count(name) || model.hdmd.inverse_blocks.count(name)) {
-            throw std::runtime_error("LoRA tensor '" + name + "' targets a prism.hadamard folded weight, which is not supported");
+        // the LoRA delta of a folded weight reads the transformed input, so it is only
+        // correct when the adapter was trained in the same rotated basis. Inverse-lookup
+        // tables are never safe: their transform happens after the lookup, not on the input.
+        if (model.hdmd.inverse_blocks.count(name)) {
+            throw std::runtime_error("LoRA tensor '" + name + "' targets an inverse-Hadamard lookup table, which is not supported");
         }
+        // a natural-basis adapter reads the raw activation (build_lora_mm keeps it),
+        // a rotated-basis adapter reads the transformed one: both are supported
 
         auto * buft = ggml_backend_buffer_get_type(model_tensor->buffer);
 

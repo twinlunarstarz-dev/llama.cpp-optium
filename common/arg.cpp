@@ -2818,6 +2818,48 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
     add_opt(common_arg(
+        {"--moe-profile"}, "PATH",
+        "record per-expert activation counts of the MoE cache to PATH (JSON, merged with any existing file; 'auto' = <cache dir>/moe-profiles/<model>.json)",
+        [](common_params & params, const std::string & value) {
+            params.moe_profile = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_PROFILE"));
+    add_opt(common_arg(
+        {"--moe-hot"}, "PATH",
+        "seed and pin the MoE cache from a profile written by --moe-profile ('auto' resolves like --moe-profile)",
+        [](common_params & params, const std::string & value) {
+            params.moe_hot = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_HOT"));
+
+    add_opt(common_arg(
+        {"--moe-ram-mib"}, "N",
+        "hard RAM cap in MiB for the MoE CPU arena (default: 4096)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_ram_mib = (size_t) value;
+        }
+    ).set_env("LLAMA_ARG_MOE_RAM_MIB"));
+
+    add_opt(common_arg(
+        {"--moe-placement"}, "MODE",
+        "expert placement mode: 'auto' (solver) or 'plan:<json>' (explicit plan) (default: auto)",
+        [](common_params & params, const std::string & value) {
+            params.moe_placement = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_PLACEMENT"));
+
+    add_opt(common_arg(
+        {"--moe-pin-decode"}, "BOOL",
+        "keep decode/attention layers in VRAM (default: true)",
+        [](common_params & params, const std::string & value) {
+            params.moe_pin_decode = (value == "1" or value == "true" or value == "yes" or value == "on");
+        }
+    ).set_env("LLAMA_ARG_MOE_PIN_DECODE"));
+
+    add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"
         "(dense models; for MoE expert weights use --n-cpu-moe)",
@@ -2968,6 +3010,29 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.fit_params_min_ctx = value;
         }
     ).set_env("LLAMA_ARG_FIT_CTX"));
+    add_opt(common_arg(
+        { "-vram", "--vram-admission" }, "[on|off]",
+        string_format("router only: refuse or evict a model instead of letting it run out of device memory (default: '%s')", params.vram_admission ? "on" : "off"),
+        [](common_params & params, const std::string & value) {
+            if (is_truthy(value)) {
+                params.vram_admission = true;
+            } else if (is_falsey(value)) {
+                params.vram_admission = false;
+            } else {
+                throw std::runtime_error(string_format("error: unknown value for --vram-admission: '%s'\n", value.c_str()));
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_VRAM_ADMISSION"));
+    add_opt(common_arg(
+        { "-vramr", "--vram-reserve-mib" }, "N",
+        string_format("router only: per-device headroom in MiB added to an estimated model footprint (default: %d)", params.vram_reserve_mib),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::runtime_error("error: --vram-reserve-mib must be >= 0\n");
+            }
+            params.vram_reserve_mib = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_VRAM_RESERVE_MIB"));
     add_opt(common_arg(
         {"--check-tensors"},
         string_format("check model tensor data for invalid values (default: %s)", params.check_tensors ? "true" : "false"),

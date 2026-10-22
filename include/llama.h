@@ -360,6 +360,12 @@ extern "C" {
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
         bool sequential_load; // stream layers from disk, auto-fit GPU VRAM, layer-by-layer paging
+
+        // MoE tiered placement (EXPERIMENTAL)
+        size_t moe_ram_mib;       // hard RAM cap in MiB for the MoE CPU arena, 0 = disabled [EXPERIMENTAL]
+        const char * moe_placement; // expert placement mode: "auto" (solver) | "plan:<json>" [EXPERIMENTAL]
+        bool moe_pin_decode;      // keep decode/attention layers in VRAM [EXPERIMENTAL]
+        const char * moe_hot;         // seed expert activation profile for tiered placement [EXPERIMENTAL]
     };
 
     struct llama_sampler_seq_config {
@@ -403,6 +409,13 @@ extern "C" {
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
         size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
+        const char * moe_profile; // record per-expert activation counts to this JSON path, NULL = off [EXPERIMENTAL]
+        const char * moe_hot;     // seed and pin the MoE cache from this JSON profile, NULL = off [EXPERIMENTAL]
+
+        // MoE tiered placement (EXPERIMENTAL)
+        size_t moe_ram_mib;       // hard RAM cap in MiB for the MoE CPU arena, 0 = disabled [EXPERIMENTAL]
+        const char * moe_placement; // expert placement mode: "auto" (solver) | "plan:<json>" [EXPERIMENTAL]
+        bool moe_pin_decode;      // keep decode/attention layers in VRAM [EXPERIMENTAL]
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
@@ -1765,6 +1778,21 @@ LLAMA_API float llama_memory_get_sequence_fragmentation(
             int64_t                   idata_split,
             ggml_opt_epoch_callback   callback_train,
             ggml_opt_epoch_callback   callback_eval);
+
+// MoE Tiered Placement - Early Solver
+// Runs the MoE placement solver before model loading to generate tensor_buft_overrides
+// for use in common_fit_params. Reads all model shards to inventory tensors.
+LLAMA_API bool llama_moe_solve_early(
+        const char * path_model,
+        const float * tensor_split,
+        int n_devices,
+        size_t moe_ram_mib,
+        const char * moe_placement_mode,
+        bool moe_pin_decode,
+        const char * moe_profile_path,  // NEW: path to expert activation profile
+        struct llama_model_tensor_buft_override ** out_overrides,
+        size_t * out_overrides_count,
+        int * out_n_layers_vram);
 
 #ifdef __cplusplus
 }

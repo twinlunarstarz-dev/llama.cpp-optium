@@ -147,6 +147,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_PANGU_EMBED,      "pangu-embedded"   },
     { LLM_ARCH_MISTRAL3,         "mistral3"         },
     { LLM_ARCH_EAGLE3,           "eagle3"           },
+    { LLM_ARCH_EAGLE4,           "eagle4"           },
     { LLM_ARCH_DFLASH,           "dflash"           },
     { LLM_ARCH_MISTRAL4,         "mistral4"         },
     { LLM_ARCH_PADDLEOCR,        "paddleocr"        },
@@ -388,6 +389,8 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_TARGET_HIDDEN_SIZE,    "%s.target_hidden_size"   },
     { LLM_KV_NORM_BEFORE_RESIDUAL,  "%s.norm_before_residual" },
     { LLM_KV_NORM_BEFORE_FC,        "%s.norm_before_fc"       },
+    { LLM_KV_FC_NORM,               "%s.fc_norm"              },
+    { LLM_KV_NORM_OUTPUT,           "%s.norm_output"          },
 
     { LLM_KV_DFLASH_BLOCK_SIZE,       "%s.block_size"       },
     { LLM_KV_DFLASH_CONV_KERNEL_SIZE, "%s.conv_kernel_size" },
@@ -555,6 +558,9 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_DECISION_OPTION_MLP,                    "decision.option_mlp" },
     { LLM_TENSOR_DECISION_QUERY_MLP,                     "decision.query_mlp" },
     { LLM_TENSOR_ENC_OUTPUT_NORM,                        "enc.output_norm" },
+    { LLM_TENSOR_FC_NORM_0,                              "fc_norm.0" },
+    { LLM_TENSOR_FC_NORM_1,                              "fc_norm.1" },
+    { LLM_TENSOR_FC_NORM_2,                              "fc_norm.2" },
     { LLM_TENSOR_FFN_GATE_INP_SHEXP,                     "blk.%d.ffn_gate_inp_shexp" },
     { LLM_TENSOR_SSM_A_NOSCAN,                           "blk.%d.ssm_a" },
     { LLM_TENSOR_SSM_CONV1D,                             "blk.%d.ssm_conv1d" },
@@ -843,6 +849,9 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_OUTPUT_NORM_LFM2,           {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
     {LLM_TENSOR_DEC_OUTPUT_NORM,            {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
     {LLM_TENSOR_ENC_OUTPUT_NORM,            {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
+    {LLM_TENSOR_FC_NORM_0,                  {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
+    {LLM_TENSOR_FC_NORM_1,                  {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
+    {LLM_TENSOR_FC_NORM_2,                  {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL}},
     {LLM_TENSOR_ROPE_FREQS,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ROPE}},
     {LLM_TENSOR_ROPE_FACTORS_LONG,          {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ROPE}},
     {LLM_TENSOR_ROPE_FACTORS_SHORT,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ROPE}},
@@ -1277,6 +1286,7 @@ bool llm_arch_supports_mixed_batch(const llm_arch & arch) {
         case LLM_ARCH_DEEPSEEK4:
         case LLM_ARCH_GRANITE_SWITCH:
         case LLM_ARCH_EAGLE3:
+        case LLM_ARCH_EAGLE4:
         case LLM_ARCH_DFLASH:
         case LLM_ARCH_GEMMA4_ASSISTANT:
             return false;

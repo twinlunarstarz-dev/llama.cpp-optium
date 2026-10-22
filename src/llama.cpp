@@ -318,8 +318,25 @@ static bool llama_model_arch_supports_sequential_load(const llm_arch arch);
 static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
     try {
+        // Count devices from tensor_split
+        int n_devices = 0;
+        if (params.tensor_split != nullptr) {
+            while (params.tensor_split[n_devices] > 0.0f && n_devices < (int)llama_max_devices()) {
+                n_devices++;
+            }
+        }
+        if (n_devices == 0) n_devices = 1;
+
+        // Create loader - MoE solver runs in constructor after all metadata is loaded
         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
-            params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
+            params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides,
+            params.tensor_buft_overrides,  // original overrides, MoE overrides added in constructor
+            params.moe_ram_mib,
+            params.moe_placement,
+            params.moe_pin_decode,
+            params.tensor_split,
+            n_devices,
+            params.moe_hot);
 
         ml.lazy.mode = params.lazy_mode;
 

@@ -300,6 +300,49 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q5_1(
     return sum;
 }
 
+static __device__ const uint16_t q1t_fattn_lut5[256] = {
+    0x0000, 0x0001, 0x0002, 0x0004, 0x0005, 0x0006, 0x0008, 0x0009,
+    0x000a, 0x0010, 0x0011, 0x0012, 0x0014, 0x0015, 0x0016, 0x0018,
+    0x0019, 0x001a, 0x0020, 0x0021, 0x0022, 0x0024, 0x0025, 0x0026,
+    0x0028, 0x0029, 0x002a, 0x0040, 0x0041, 0x0042, 0x0044, 0x0045,
+    0x0046, 0x0048, 0x0049, 0x004a, 0x0050, 0x0051, 0x0052, 0x0054,
+    0x0055, 0x0056, 0x0058, 0x0059, 0x005a, 0x0060, 0x0061, 0x0062,
+    0x0064, 0x0065, 0x0066, 0x0068, 0x0069, 0x006a, 0x0080, 0x0081,
+    0x0082, 0x0084, 0x0085, 0x0086, 0x0088, 0x0089, 0x008a, 0x0090,
+    0x0091, 0x0092, 0x0094, 0x0095, 0x0096, 0x0098, 0x0099, 0x009a,
+    0x00a0, 0x00a1, 0x00a2, 0x00a4, 0x00a5, 0x00a6, 0x00a8, 0x00a9,
+    0x00aa, 0x0100, 0x0101, 0x0102, 0x0104, 0x0105, 0x0106, 0x0108,
+    0x0109, 0x010a, 0x0110, 0x0111, 0x0112, 0x0114, 0x0115, 0x0116,
+    0x0118, 0x0119, 0x011a, 0x0120, 0x0121, 0x0122, 0x0124, 0x0125,
+    0x0126, 0x0128, 0x0129, 0x012a, 0x0140, 0x0141, 0x0142, 0x0144,
+    0x0145, 0x0146, 0x0148, 0x0149, 0x014a, 0x0150, 0x0151, 0x0152,
+    0x0154, 0x0155, 0x0156, 0x0158, 0x0159, 0x015a, 0x0160, 0x0161,
+    0x0162, 0x0164, 0x0165, 0x0166, 0x0168, 0x0169, 0x016a, 0x0180,
+    0x0181, 0x0182, 0x0184, 0x0185, 0x0186, 0x0188, 0x0189, 0x018a,
+    0x0190, 0x0191, 0x0192, 0x0194, 0x0195, 0x0196, 0x0198, 0x0199,
+    0x019a, 0x01a0, 0x01a1, 0x01a2, 0x01a4, 0x01a5, 0x01a6, 0x01a8,
+    0x01a9, 0x01aa, 0x0200, 0x0201, 0x0202, 0x0204, 0x0205, 0x0206,
+    0x0208, 0x0209, 0x020a, 0x0210, 0x0211, 0x0212, 0x0214, 0x0215,
+    0x0216, 0x0218, 0x0219, 0x021a, 0x0220, 0x0221, 0x0222, 0x0224,
+    0x0225, 0x0226, 0x0228, 0x0229, 0x022a, 0x0240, 0x0241, 0x0242,
+    0x0244, 0x0245, 0x0246, 0x0248, 0x0249, 0x024a, 0x0250, 0x0251,
+    0x0252, 0x0254, 0x0255, 0x0256, 0x0258, 0x0259, 0x025a, 0x0260,
+    0x0261, 0x0262, 0x0264, 0x0265, 0x0266, 0x0268, 0x0269, 0x026a,
+    0x0280, 0x0281, 0x0282, 0x0284, 0x0285, 0x0286, 0x0288, 0x0289,
+    0x028a, 0x0290, 0x0291, 0x0292, 0x0294, 0x0295, 0x0296, 0x0298,
+    0x0299, 0x029a, 0x02a0, 0x02a1, 0x02a2, 0x02a4, 0x02a5, 0x02a6,
+    0x02a8, 0x02a9, 0x02aa, 0x0000, 0x0001, 0x0002, 0x0004, 0x0005,
+    0x0006, 0x0008, 0x0009, 0x000a, 0x0010, 0x0011, 0x0012, 0x0014,
+};
+
+// Decode the 5 trits packed in one byte (base-3, 5 trits per byte).
+// Returns trit values 0..2 packed 2 bits each.
+static __device__ __forceinline__ uint32_t q1t_unpack(const uint8_t * __restrict__ qs, const int b0) {
+    const uint32_t lo = qs[b0];
+    const uint32_t hi = (b0 + 1 < 26) ? qs[b0 + 1] : 0u;   // last byte: caller never crosses the block
+    return q1t_fattn_lut5[lo] | (q1t_fattn_lut5[hi] << 10);
+}
+
 template<int D, int nthreads>
 static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q1_t_g128(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
@@ -315,23 +358,18 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q1_t_g128(
     for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
         const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
 
-        const int ib = (k_KQ*4) / QK1_T_g128;       // 4 elements per int
-        const int j0 = (k_KQ*4) % QK1_T_g128;
+        const int ib = (k_KQ*4) >> 7;
+        const int j0 = (k_KQ*4) & 127;
+        const int b0 = j0 / 5;
+        const int off = j0 - 5*b0;
+
+        const uint32_t packed = q1t_unpack(K_q1_t[ib].qs, b0);
 
         int v;
         int8_t * vp = (int8_t *) &v;
 #pragma unroll
         for (int l = 0; l < 4; ++l) {
-            const int j = j0 + l;
-            int t = K_q1_t[ib].qs[j/5];
-            switch (j % 5) {                        // divide by 3^s, compiler
-                case 4: t /= 3;  // fallthrough      // strength-reduces these
-                case 3: t /= 3;  // fallthrough
-                case 2: t /= 3;  // fallthrough
-                case 1: t /= 3;  // fallthrough
-                default: break;
-            }
-            vp[l] = (int8_t) (t % 3);               // {0,1,2}
+            vp[l] = (int8_t) ((packed >> (2*(off + l))) & 3u);   // {0,1,2}
         }
         const int u = Q_q8[k_KQ_0/nthreads];
 
@@ -539,40 +577,31 @@ template <typename T, int ne>
 static __device__ __forceinline__ void dequantize_V_q1_t_g128(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
     const block_q1_t_g128 * x = (const block_q1_t_g128 *) vx;
 
-    const int64_t ib = i0 / QK1_T_g128;
+    const int64_t ib = i0 >> 7;                 // QK1_T_g128 == 128
+    const int     j0 = (int)(i0 & 127);
+    const int     b0 = j0 / 5;
+    const int     off = j0 - 5*b0;
 
-    int8_t q8[ne];
+    // Two bytes cover any 4 consecutive elements; decode both once, no per-lane division.
+    const uint32_t packed = q1t_unpack(x[ib].qs, b0);
+
     static_assert(ne == 2 || ne == 4, "bad ne");
-#pragma unroll
-    for (int l = 0; l < ne; ++l) {
-        const int j = (int)(i0 % QK1_T_g128) + l;
-        int t = x[ib].qs[j/5];
-        switch (j % 5) {
-            case 4: t /= 3;  // fallthrough
-            case 3: t /= 3;  // fallthrough
-            case 2: t /= 3;  // fallthrough
-            case 1: t /= 3;  // fallthrough
-            default: break;
-        }
-        q8[l] = (int8_t) (t % 3) - 1;               // {-1, 0, +1}
-    }
-
 #ifdef FP16_AVAILABLE
     if constexpr (std::is_same_v<T, half>) {
         const half2 d = __half2half2(x[ib].d);
-
 #pragma unroll
         for (int l0 = 0; l0 < ne; l0 += 2) {
-            ((half2 *) dst)[l0/2] = d * make_half2(q8[l0 + 0], q8[l0 + 1]);
+            const int qa = int((packed >> (2*(off + l0    ))) & 3u) - 1;
+            const int qb = int((packed >> (2*(off + l0 + 1))) & 3u) - 1;
+            ((half2 *) dst)[l0/2] = d * make_half2(qa, qb);
         }
     } else
 #endif // FP16_AVAILABLE
     if constexpr (std::is_same_v<T, float>) {
         const float d = x[ib].d;
-
 #pragma unroll
         for (int l = 0; l < ne; ++l) {
-            ((float *) dst)[l] = d * q8[l];
+            ((float *) dst)[l] = d * (int((packed >> (2*(off + l))) & 3u) - 1);
         }
     } else {
         static_assert(std::is_same_v<T, void>, "bad type");

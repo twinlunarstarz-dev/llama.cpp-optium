@@ -2,6 +2,7 @@
 #include "http.h"
 #include "server-models.h"
 #include "server-context.h"
+#include "server-vram.h"
 #include "server-stream.h"
 
 #include "build-info.h"
@@ -276,6 +277,11 @@ struct server_lru_sched {
             || count_running() < (size_t) models.base_params.models_max;
     }
 
+    // capacity for one specific model: the count limit and the device memory it needs
+    bool has_capacity(std::unique_lock<std::mutex> & lk, const std::string & model_id) {
+        return has_capacity(lk) && models.vram_fits_locked(model_id);
+    }
+
     // returns "" if no model can be given up
     std::string pick_victim(std::unique_lock<std::mutex> & lk) {
         check_lock(lk);
@@ -335,7 +341,7 @@ struct server_lru_sched {
         if (queue.empty() || queue.front().model_id != model_id || queue.front().loading) {
             return false;
         }
-        if (!has_capacity(lk)) {
+        if (!has_capacity(lk, model_id)) {
             return false;
         }
         queue.front().loading = true;
@@ -361,7 +367,25 @@ struct server_lru_sched {
     // caller must hold models.mutex; never blocks, so it is safe from any thread
     void tick(std::unique_lock<std::mutex> & lk) {
         check_lock(lk);
-        if (models.base_params.models_max <= 0 || queue.empty()) {
+        if (queue.empty()) {
+            return;
+        }
+
+        // device memory: free room for the head of the queue
+        for (int guard = 0; guard < 64; guard++) {
+            const std::string head = queue.front().model_id;
+            if (queue.front().loading || models.vram_fits_locked(head)) {
+                break;
+            }
+            std::string victim = pick_victim(lk);
+            if (victim.empty()) {
+                break; // only busy models are left, wait for a request to end
+            }
+            SRV_INF("evicting idle LRU name=%s to free device memory for name=%s\n", victim.c_str(), head.c_str());
+            models.request_stop(victim);
+        }
+
+        if (models.base_params.models_max <= 0) {
             return;
         }
         int n_running  = 0;
@@ -929,6 +953,7 @@ void server_models::notify_sse(const std::string & event, const std::string & mo
 }
 
 void server_models::load_models() {
+    vram_cache_load();
     // Phase 1: load presets from all sources - pure I/O, no lock needed
     // 1. cached models
     common_presets cached_models = ctx_preset.load_from_cache();
@@ -1333,6 +1358,631 @@ std::vector<server_model_meta> server_models::get_all_meta() {
     return result;
 }
 
+
+//
+// device memory admission
+//
+
+static constexpr size_t VRAM_MIB = 1024ull * 1024ull;
+
+static std::vector<std::string> vram_split_csv(const std::string & value) {
+    std::vector<std::string> out;
+    size_t pos = 0;
+    while (pos <= value.size()) {
+        const size_t comma = value.find(',', pos);
+        std::string item = value.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        const size_t b = item.find_first_not_of(" \t");
+        const size_t e = item.find_last_not_of(" \t");
+        item = b == std::string::npos ? std::string() : item.substr(b, e - b + 1);
+        if (!item.empty()) {
+            out.push_back(item);
+        }
+        if (comma == std::string::npos) {
+            break;
+        }
+        pos = comma + 1;
+    }
+    return out;
+}
+
+static size_t vram_file_size(const std::string & path) {
+    if (path.empty()) {
+        return 0;
+    }
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(path, ec);
+    return ec ? 0 : (size_t) size;
+}
+
+// a --lora entry is "path" or "path:scale"
+static std::string vram_strip_lora_scale(const std::string & item) {
+    const size_t colon = item.rfind(':');
+    if (colon == std::string::npos) {
+        return item;
+    }
+    const std::string tail = item.substr(colon + 1);
+    if (tail.empty() || tail.find_first_not_of("0123456789.") != std::string::npos) {
+        return item;
+    }
+    return item.substr(0, colon);
+}
+
+// the subset of preset options that changes the memory a model needs
+static bool vram_probe_keep(const std::string & arg, bool & takes_value) {
+    static const struct { const char * name; bool value; } table[] = {
+        { "-m",              true  }, { "--model",          true  },
+        { "-c",              true  }, { "--ctx-size",       true  },
+        { "-b",              true  }, { "--batch-size",     true  },
+        { "-ub",             true  }, { "--ubatch-size",    true  },
+        { "-np",             true  }, { "--parallel",       true  },
+        { "-ngl",            true  }, { "--gpu-layers",     true  },
+        { "--n-gpu-layers",  true  },
+        { "-dev",            true  }, { "--device",         true  },
+        { "-sm",             true  }, { "--split-mode",     true  },
+        { "-ts",             true  }, { "--tensor-split",   true  },
+        { "-mg",             true  }, { "--main-gpu",       true  },
+        { "-ctk",            true  }, { "--cache-type-k",   true  },
+        { "-ctv",            true  }, { "--cache-type-v",   true  },
+        { "-fa",             true  }, { "--flash-attn",     true  },
+        { "-ncmoe",          true  }, { "--n-cpu-moe",      true  },
+        { "-ot",             true  }, { "--override-tensor",true  },
+        { "--rope-scaling",  true  }, { "--rope-scale",     true  },
+        { "--rope-freq-base",true  }, { "--rope-freq-scale",true  },
+        // --kv-offload / --kv-unified are server-only args; llama-fit-params rejects
+        // them, and they only move the cache between host and device. A preset with
+        // KV offload disabled therefore over-estimates, which is the safe direction.
+    };
+    for (const auto & row : table) {
+        if (arg == row.name) {
+            takes_value = row.value;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool server_models::vram_active() {
+    return base_params.vram_admission && server_vram::instance().available();
+}
+
+struct vram_opt_key {
+    const char * env; // null when the option has no environment name
+    const char * arg; // arg name without leading dashes
+};
+
+// every preset option that changes the memory a model needs
+static const vram_opt_key VRAM_OPTS[] = {
+    { "LLAMA_ARG_MODEL",        "model" },
+    { "LLAMA_ARG_CTX_SIZE",     "ctx-size" },
+    { "LLAMA_ARG_BATCH",        "batch-size" },
+    { "LLAMA_ARG_UBATCH",       "ubatch-size" },
+    { nullptr,                  "parallel" },
+    { "LLAMA_ARG_N_GPU_LAYERS", "n-gpu-layers" },
+    { "LLAMA_ARG_DEVICE",       "device" },
+    { "LLAMA_ARG_SPLIT_MODE",   "split-mode" },
+    { "LLAMA_ARG_TENSOR_SPLIT", "tensor-split" },
+    { nullptr,                  "main-gpu" },
+    { "LLAMA_ARG_CACHE_TYPE_K", "cache-type-k" },
+    { "LLAMA_ARG_CACHE_TYPE_V", "cache-type-v" },
+    { nullptr,                  "flash-attn" },
+    { nullptr,                  "kv-unified" },
+    { nullptr,                  "no-kv-offload" },
+    { nullptr,                  "n-cpu-moe" },
+    { "LLAMA_ARG_MMPROJ",       "mmproj" },
+    { nullptr,                  "mmproj-device" },
+    { nullptr,                  "model-draft" },
+    { nullptr,                  "spec-draft-device" },
+    { nullptr,                  "lora" },
+};
+
+static bool vram_opt(const common_preset & preset, const vram_opt_key & key, std::string & out) {
+    if (key.env != nullptr && preset.get_option(key.env, out)) {
+        return true;
+    }
+    return preset.get_option(key.arg, out);
+}
+
+static std::string vram_opt(const common_preset & preset, const char * env, const char * arg) {
+    std::string out;
+    if (env != nullptr && preset.get_option(env, out)) {
+        return out;
+    }
+    if (preset.get_option(arg, out)) {
+        return out;
+    }
+    return {};
+}
+
+std::string server_models::vram_signature(const server_model_meta & meta) {
+    std::string sig;
+    for (const auto & key : VRAM_OPTS) {
+        std::string value;
+        if (vram_opt(meta.preset, key, value)) {
+            sig += key.arg;
+            sig += '=';
+            sig += value;
+            sig += ';';
+        }
+    }
+
+    // a replaced or re-quantised file must not reuse the old footprint
+    auto add_file = [&sig](const std::string & path) {
+        if (path.empty()) {
+            return;
+        }
+        std::error_code ec_size;
+        std::error_code ec_time;
+        const auto size = std::filesystem::file_size(path, ec_size);
+        const auto time = std::filesystem::last_write_time(path, ec_time);
+        sig += path;
+        sig += '@';
+        sig += ec_size ? "?" : std::to_string((uint64_t) size);
+        sig += '@';
+        sig += ec_time ? "?" : std::to_string((int64_t) time.time_since_epoch().count());
+        sig += ';';
+    };
+
+    add_file(vram_opt(meta.preset, "LLAMA_ARG_MODEL",        "model"));
+    add_file(vram_opt(meta.preset, "LLAMA_ARG_MMPROJ",       "mmproj"));
+    add_file(vram_opt(meta.preset, nullptr,                  "model-draft"));
+    for (const auto & item : vram_split_csv(vram_opt(meta.preset, nullptr, "lora"))) {
+        add_file(vram_strip_lora_scale(item));
+    }
+    return sig;
+}
+
+server_models::vram_entry server_models::vram_estimate(server_model_meta & meta, const std::string & signature) {
+    vram_entry entry;
+    entry.signature = signature;
+
+    server_vram & drv = server_vram::instance();
+    const size_t n_dev = drv.n_devices();
+    if (n_dev == 0) {
+        return entry;
+    }
+
+    auto opt = [&meta](const char * env, const char * arg) {
+        return vram_opt(meta.preset, env, arg);
+    };
+
+    const std::string dev_opt = opt("LLAMA_ARG_DEVICE", "device");
+    if (dev_opt == "none") {
+        return entry; // CPU only
+    }
+
+    std::vector<int> devs;
+    if (dev_opt.empty()) {
+        for (size_t i = 0; i < n_dev; i++) {
+            devs.push_back((int) i);
+        }
+    } else {
+        for (const auto & name : vram_split_csv(dev_opt)) {
+            const int idx = server_vram::dev_index_from_name(name);
+            if (idx >= 0 && (size_t) idx < n_dev) {
+                devs.push_back(idx);
+            }
+        }
+    }
+    if (devs.empty()) {
+        devs.push_back(0);
+    }
+    // the backend enumerates devices in index order, and the probe prints them
+    // in that same order, so keep the mapping list sorted
+    std::sort(devs.begin(), devs.end());
+    devs.erase(std::unique(devs.begin(), devs.end()), devs.end());
+
+    // locate the measurement tool next to the running binary
+    std::string probe_exe;
+    {
+        const auto slash = bin_path.find_last_of("/\\");
+        const std::string dir = slash == std::string::npos ? std::string(".") : bin_path.substr(0, slash);
+        for (const char * name : { "llama-fit-params", "llama-fit-params.exe" }) {
+            std::error_code ec;
+            const std::string candidate = dir + "/" + name;
+            if (std::filesystem::exists(candidate, ec)) {
+                probe_exe = candidate;
+                break;
+            }
+        }
+    }
+
+    std::vector<size_t> per_dev;
+    if (!probe_exe.empty()) {
+        std::vector<std::string> args = { "--fit-print", "on" };
+        const auto raw = meta.preset.to_args(bin_path);
+        for (size_t i = 1; i < raw.size(); i++) {
+            bool takes_value = false;
+            if (!vram_probe_keep(raw[i], takes_value)) {
+                continue;
+            }
+            args.push_back(raw[i]);
+            if (takes_value && i + 1 < raw.size()) {
+                args.push_back(raw[++i]);
+            }
+        }
+
+        std::string err;
+        const auto probed = server_vram_probe(probe_exe, args, err);
+        if (probed.empty()) {
+            SRV_WRN("vram: could not measure name=%s (%s), falling back to a size estimate\n",
+                    meta.name.c_str(), err.c_str());
+        } else {
+            // probe device k is the k-th device this preset asked for
+            per_dev.assign((size_t) devs.back() + 1, 0);
+            for (size_t k = 0; k < probed.size() && k < devs.size(); k++) {
+                per_dev[(size_t) devs[k]] += probed[k];
+            }
+        }
+    }
+
+    if (per_dev.empty()) {
+        // no measurement: weights plus a generous per-token allowance for the context
+        const size_t model_bytes = vram_file_size(opt("LLAMA_ARG_MODEL", "model"));
+        const int64_t n_ctx = std::max<int64_t>(4096, atoll(opt("LLAMA_ARG_CTX_SIZE", "ctx-size").c_str()));
+        const size_t base = model_bytes + model_bytes / 20 + (size_t) n_ctx * 18 * 1024;
+        per_dev.assign((size_t) devs.back() + 1, 0);
+        per_dev[(size_t) devs[0]] = base;
+    }
+
+    auto add_to_dev = [&per_dev](int idx, size_t bytes) {
+        if (idx < 0 || bytes == 0) {
+            return;
+        }
+        if (per_dev.size() <= (size_t) idx) {
+            per_dev.resize((size_t) idx + 1, 0);
+        }
+        per_dev[(size_t) idx] += bytes;
+    };
+
+    // pieces the offline probe does not model
+    const size_t mmproj_bytes = vram_file_size(opt("LLAMA_ARG_MMPROJ", "mmproj"));
+    if (mmproj_bytes > 0) {
+        const std::string s = opt(nullptr, "mmproj-device");
+        const int idx = s.empty() ? devs[0] : server_vram::dev_index_from_name(s);
+        add_to_dev(idx, mmproj_bytes + 192 * VRAM_MIB);
+    }
+
+    const std::string draft = opt(nullptr, "model-draft");
+    if (!draft.empty()) {
+        const std::string s = opt(nullptr, "spec-draft-device");
+        const int idx = s.empty() ? devs[0] : server_vram::dev_index_from_name(s);
+        add_to_dev(idx, vram_file_size(draft) + 384 * VRAM_MIB);
+    }
+
+    size_t lora_bytes = 0;
+    for (const auto & item : vram_split_csv(opt(nullptr, "lora"))) {
+        lora_bytes += vram_file_size(vram_strip_lora_scale(item));
+    }
+    add_to_dev(devs[0], lora_bytes);
+
+    // the probe reports what the backend accounts for, not the driver's view:
+    // the CUDA context per device and allocator rounding are missing from it.
+    // a measured footprint replaces this estimate after the first load.
+    per_dev.resize(std::max(per_dev.size(), n_dev), 0);
+    const size_t reserve = (size_t) std::max(0, base_params.vram_reserve_mib) * VRAM_MIB;
+    for (auto & bytes : per_dev) {
+        if (bytes > 0) {
+            bytes += reserve;
+        }
+    }
+
+    entry.per_dev = std::move(per_dev);
+    return entry;
+}
+
+std::string server_models::vram_cache_path() const {
+    const char * home = std::getenv("HOME");
+    const std::string dir = std::string(home != nullptr ? home : "/tmp") + "/.cache/llama.cpp";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir + "/vram-footprints.txt";
+}
+
+void server_models::vram_cache_load() {
+    std::ifstream in(vram_cache_path());
+    if (!in) {
+        return;
+    }
+    std::lock_guard<std::mutex> guard(vram_cache_mutex);
+    std::string line;
+    size_t loaded = 0;
+    while (std::getline(in, line) && loaded < 512) {
+        const auto tab = line.find('\t');
+        if (tab == std::string::npos || tab == 0) {
+            continue;
+        }
+        vram_entry entry;
+        entry.measured  = true;
+        entry.signature = line.substr(0, tab);
+
+        const std::string rest = line.substr(tab + 1);
+        size_t pos = 0;
+        bool ok = true;
+        while (pos < rest.size()) {
+            const size_t comma = rest.find(',', pos);
+            const std::string tok = rest.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+            char * end = nullptr;
+            const unsigned long long mib = std::strtoull(tok.c_str(), &end, 10);
+            if (tok.empty() || end == tok.c_str()) {
+                ok = false;
+                break;
+            }
+            entry.per_dev.push_back((size_t) mib * VRAM_MIB);
+            if (comma == std::string::npos) {
+                break;
+            }
+            pos = comma + 1;
+        }
+        if (ok && !entry.per_dev.empty()) {
+            vram_cache[entry.signature] = std::move(entry);
+            loaded++;
+        }
+    }
+    SRV_INF("vram: restored %zu measured footprints from %s\n", loaded, vram_cache_path().c_str());
+}
+
+void server_models::vram_cache_save() {
+    std::vector<std::pair<std::string, vram_entry>> entries;
+    {
+        std::lock_guard<std::mutex> guard(vram_cache_mutex);
+        for (const auto & kv : vram_cache) {
+            if (kv.second.measured) {
+                entries.push_back(kv);
+            }
+        }
+    }
+    if (entries.size() > 128) {
+        entries.erase(entries.begin(), entries.end() - 128);
+    }
+    std::ofstream out(vram_cache_path(), std::ios::trunc);
+    if (!out) {
+        return;
+    }
+    for (const auto & [sig, entry] : entries) {
+        out << sig << '\t';
+        for (size_t i = 0; i < entry.per_dev.size(); i++) {
+            out << (i > 0 ? "," : "") << entry.per_dev[i] / VRAM_MIB;
+        }
+        out << '\n';
+    }
+}
+
+std::vector<size_t> server_models::vram_cached_for_locked(const std::string & name) {
+    auto it = mapping.find(name);
+    if (it == mapping.end()) {
+        return {};
+    }
+    const std::string sig = vram_signature(it->second.meta);
+    std::lock_guard<std::mutex> guard(vram_cache_mutex);
+    auto cached = vram_cache.find(sig);
+    return cached == vram_cache.end() ? std::vector<size_t>{} : cached->second.per_dev;
+}
+
+std::vector<size_t> server_models::vram_footprint_for(const std::string & name) {
+    if (!vram_active()) {
+        return {};
+    }
+    auto meta = get_meta(name);
+    if (!meta.has_value()) {
+        return {};
+    }
+
+    const std::string sig = vram_signature(*meta);
+    {
+        std::lock_guard<std::mutex> guard(vram_cache_mutex);
+        auto it = vram_cache.find(sig);
+        if (it != vram_cache.end()) {
+            return it->second.per_dev;
+        }
+    }
+
+    SRV_INF("vram: measuring the footprint of name=%s\n", name.c_str());
+    vram_entry entry = vram_estimate(*meta, sig);
+    {
+        std::lock_guard<std::mutex> guard(vram_cache_mutex);
+        vram_cache[sig] = entry;
+    }
+
+    std::string human;
+    for (size_t i = 0; i < entry.per_dev.size(); i++) {
+        if (entry.per_dev[i] == 0) {
+            continue;
+        }
+        human += string_format("%sCUDA%zu=%zu MiB", human.empty() ? "" : " ", i, entry.per_dev[i] / VRAM_MIB);
+    }
+    SRV_INF("vram: name=%s needs %s (estimate)\n", name.c_str(), human.c_str());
+    return entry.per_dev;
+}
+
+std::vector<size_t> server_models::vram_effective_free_locked(const std::string & name) {
+    server_vram & drv = server_vram::instance();
+    drv.refresh(0);
+
+    std::vector<size_t> free(drv.n_devices(), 0);
+    for (size_t i = 0; i < free.size(); i++) {
+        free[i] = drv.dev(i).free;
+    }
+
+    // a child that is still coming up is not fully visible in the driver figure yet
+    for (const auto & [other, reserved] : vram_pending) {
+        if (other == name) {
+            continue;
+        }
+        for (size_t i = 0; i < free.size() && i < reserved.size(); i++) {
+            free[i] -= std::min(free[i], reserved[i]);
+        }
+    }
+
+    // a child already on its way out frees its memory shortly
+    for (const auto & [other, inst] : mapping) {
+        if (!stopping_models.count(other) || !inst.meta.is_ready_or_sleep()) {
+            continue;
+        }
+        const auto fp = vram_cached_for_locked(other);
+        for (size_t i = 0; i < free.size() && i < fp.size(); i++) {
+            free[i] += fp[i];
+        }
+    }
+    return free;
+}
+
+bool server_models::vram_fits_locked(const std::string & name) {
+    if (!vram_active()) {
+        return true;
+    }
+    const auto needed = vram_cached_for_locked(name);
+    if (needed.empty()) {
+        return true; // not measured yet, keep the old behaviour instead of blocking
+    }
+    const auto free = vram_effective_free_locked(name);
+    for (size_t i = 0; i < needed.size() && i < free.size(); i++) {
+        if (needed[i] > free[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void server_models::vram_reserve_locked(const std::string & name) {
+    if (!vram_active()) {
+        return;
+    }
+    auto needed = vram_cached_for_locked(name);
+    if (needed.empty()) {
+        return;
+    }
+    server_vram & drv = server_vram::instance();
+    drv.refresh(0);
+    std::vector<size_t> before(drv.n_devices(), 0);
+    for (size_t i = 0; i < before.size(); i++) {
+        before[i] = drv.dev(i).free;
+    }
+    vram_pending[name]     = std::move(needed);
+    vram_free_before[name] = std::move(before);
+}
+
+void server_models::vram_release_locked(const std::string & name) {
+    vram_pending.erase(name);
+    vram_free_before.erase(name);
+}
+
+void server_models::vram_admit(const std::string & name) {
+    if (!vram_active()) {
+        unload_lru();
+        return;
+    }
+
+    // a model that cannot fit on an empty card must not evict anything
+    const auto needed = vram_footprint_for(name);
+    if (!needed.empty()) {
+        server_vram & drv = server_vram::instance();
+        for (size_t i = 0; i < needed.size() && i < drv.n_devices(); i++) {
+            if (needed[i] > drv.dev(i).total) {
+                throw std::runtime_error(string_format(
+                    "model '%s' needs %zu MiB on CUDA%zu but that device has only %zu MiB in total; "
+                    "lower its ctx-size or tensor-split in the preset",
+                    name.c_str(), needed[i] / VRAM_MIB, i, drv.dev(i).total / VRAM_MIB));
+            }
+        }
+    }
+
+    for (int iter = 0; iter < 64; iter++) {
+        std::string victim;
+        {
+            std::unique_lock<std::mutex> lk(mutex);
+
+            size_t n_running = 0;
+            for (const auto & m : mapping) {
+                if (m.second.meta.is_running()) {
+                    n_running++;
+                }
+            }
+            const bool count_ok = base_params.models_max <= 0 ||
+                n_running < (size_t) base_params.models_max;
+            const bool vram_ok = vram_fits_locked(name);
+            if (count_ok && vram_ok) {
+                return;
+            }
+
+            victim = sched->pick_victim(lk);
+            if (victim.empty()) {
+                if (!vram_ok) {
+                    const auto fp   = vram_cached_for_locked(name);
+                    const auto free = vram_effective_free_locked(name);
+                    std::string detail;
+                    for (size_t i = 0; i < fp.size() && i < free.size(); i++) {
+                        if (fp[i] > free[i]) {
+                            detail += string_format(" CUDA%zu: needs %zu MiB, %zu MiB free;",
+                                    i, fp[i] / VRAM_MIB, free[i] / VRAM_MIB);
+                        }
+                    }
+                    throw std::runtime_error(string_format(
+                        "not enough device memory for model '%s' and every other model is busy (%s)",
+                        name.c_str(), detail.c_str()));
+                }
+                throw std::runtime_error(string_format(
+                    "model limit reached for '%s' and every other model is busy", name.c_str()));
+            }
+        }
+
+        SRV_INF("vram: evicting idle name=%s to admit name=%s\n", victim.c_str(), name.c_str());
+        unload(victim);
+        std::unique_lock<std::mutex> lk(mutex);
+        cv.wait(lk, [this, &victim]() {
+            auto it = mapping.find(victim);
+            return it == mapping.end() || it->second.meta.status == SERVER_MODEL_STATUS_UNLOADED;
+        });
+    }
+
+    throw std::runtime_error("could not free enough device memory for model '" + name + "'");
+}
+
+void server_models::vram_on_ready(const std::string & name) {
+    std::unique_lock<std::mutex> lk(mutex);
+    auto before_it = vram_free_before.find(name);
+    if (before_it == vram_free_before.end()) {
+        vram_pending.erase(name);
+        return;
+    }
+
+    server_vram & drv = server_vram::instance();
+    drv.refresh(0);
+
+    const auto & before = before_it->second;
+    std::vector<size_t> used(before.size(), 0);
+    bool any = false;
+    for (size_t i = 0; i < before.size() && i < drv.n_devices(); i++) {
+        const size_t now_free = drv.dev(i).free;
+        used[i] = before[i] > now_free ? before[i] - now_free : 0;
+        any = any || used[i] > 0;
+    }
+
+    auto it = mapping.find(name);
+    if (any && it != mapping.end()) {
+        const std::string sig = vram_signature(it->second.meta);
+        vram_entry entry;
+        entry.per_dev  = used;
+        entry.measured = true;
+        entry.signature = sig;
+        {
+            std::lock_guard<std::mutex> guard(vram_cache_mutex);
+            vram_cache[sig] = entry;
+        }
+        std::string human;
+        for (size_t i = 0; i < used.size(); i++) {
+            if (used[i] == 0) {
+                continue;
+            }
+            human += string_format("%sCUDA%zu=%zu MiB", human.empty() ? "" : " ", i, used[i] / VRAM_MIB);
+        }
+        SRV_INF("vram: measured footprint name=%s -> %s\n", name.c_str(), human.c_str());
+        vram_cache_save();
+    }
+
+    vram_pending.erase(name);
+    vram_free_before.erase(before_it);
+}
+
 void server_models::unload_lru() {
     if (base_params.models_max <= 0) {
         return; // no limit
@@ -1374,7 +2024,10 @@ void server_models::load(const std::string & name, const load_options & opts) {
         if (!has_model(name)) {
             throw std::runtime_error("model name=" + name + " is not found");
         }
-        unload_lru();
+        // measure first: the probe spawns a short-lived process and must not run under the lock.
+        // then evict idle models until both the count limit and the device memory allow the load
+        vram_ensure_footprint(name);
+        vram_admit(name);
     }
 
     std::unique_lock<std::mutex> lk(mutex);
@@ -1442,6 +2095,15 @@ void server_models::load(const std::string & name, const load_options & opts) {
         }
     }
 
+    // the same re-check for device memory, and the reservation that keeps the next
+    // load from taking the room this one was admitted for
+    if (opts.mode == SERVER_CHILD_MODE_NORMAL && vram_active()) {
+        if (!vram_fits_locked(name)) {
+            throw std::runtime_error("device memory was taken while waiting for model '" + name + "'");
+        }
+        vram_reserve_locked(name);
+    }
+
     // prepare new instance info
     instance_t inst;
     inst.meta             = meta;
@@ -1496,6 +2158,7 @@ void server_models::load(const std::string & name, const load_options & opts) {
         // the child writes its commands to stdout and its logs to stderr
         int options = subprocess_option_no_window;
         if (!inst.subproc->sproc.create(child_args, options, child_env)) {
+            vram_release_locked(name);
             throw std::runtime_error("failed to spawn server instance");
         }
     }
@@ -1553,6 +2216,8 @@ void server_models::on_child_exit(const std::string & name, const std::shared_pt
             SERVER_MODEL_STATUS_UNLOADED,
             exit_code
         });
+        std::lock_guard<std::mutex> lk(mutex);
+        vram_release_locked(name);
     }
 }
 
@@ -1774,6 +2439,10 @@ bool server_models::ensure_model_ready(const std::string & name, const std::func
     auto meta = get_meta(name);
     if (!meta.has_value()) {
         throw std::runtime_error("model name=" + name + " is not found");
+    }
+    // measure before queueing, so the queue can decide about device memory, not just slots
+    if (!meta->is_ready_or_sleep()) {
+        vram_ensure_footprint(name);
     }
     bool stopping;
     {
@@ -2001,6 +2670,8 @@ void server_models::handle_child_state(const std::string & name, const std::stri
                     payload.size() > 0 ? payload : nullptr,
                     {}, // reset progress info
                 });
+                // the driver delta across the spawn is the exact cost of this model
+                vram_on_ready(name);
             } break;
         case SERVER_STATE_SLEEPING:
             {

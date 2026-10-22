@@ -51,12 +51,43 @@ struct llama_hparams_posnet {
     uint32_t n_layer;
 };
 
+#include <cstring>
+
 struct llama_hparams_convnext {
     uint32_t n_embd;
     uint32_t n_layer;
 };
 
 struct llama_hparams {
+    // TAARDIS/Forge: weights are stored in a block-diagonal Hadamard basis, so
+    // every linear input whose GGUF basename appears in this table must be
+    // rotated by H_b before its matmul. n == 0 = natural basis; models without
+    // the metadata behave exactly as before.
+    // POD on purpose: llama_hparams is static_assert'd trivially copyable.
+    static constexpr uint32_t FORGE_ROT_MAX_ENTRIES = 24;
+    static constexpr uint32_t FORGE_ROT_MAX_BASE    = 23; // + NUL
+    struct forge_rot_entry {
+        char     base[FORGE_ROT_MAX_BASE + 1];
+        uint32_t block;
+    };
+    forge_rot_entry forge_rot_entries[FORGE_ROT_MAX_ENTRIES] = {};
+    uint32_t forge_rot_n             = 0; // entries used
+    uint32_t forge_rot_block_default = 0;
+    uint32_t forge_rot_count         = 0; // rotated tensors the file promises
+
+    bool forge_rot_active() const {
+        return forge_rot_n > 0;
+    }
+    // 0 = basename not in the table
+    uint32_t forge_rot_block_for_base(const char * base) const {
+        for (uint32_t i = 0; i < forge_rot_n; i++) {
+            if (strcmp(forge_rot_entries[i].base, base) == 0) {
+                return forge_rot_entries[i].block;
+            }
+        }
+        return 0;
+    }
+
     // note: use the `_impl` suffix to avoid name conflict between members and getters
     //       for example: n_embd_out() vs n_embd_out_impl
 
@@ -67,6 +98,7 @@ struct llama_hparams {
     bool swin_norm;
     bool norm_before_residual = false;
     bool norm_before_fc       = false;
+    bool norm_output          = false;
 
     uint32_t n_ctx_train; // context size the model was trained on
     uint32_t n_embd;

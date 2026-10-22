@@ -73,6 +73,7 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"none",          COMMON_SPECULATIVE_TYPE_NONE},
     {"draft-simple",  COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE},
     {"draft-eagle3",  COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3},
+    {"draft-eagle4",  COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE4},
     {"draft-mtp",     COMMON_SPECULATIVE_TYPE_DRAFT_MTP},
     {"draft-dflash",  COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH},
     {"draft-dspark",  COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK},
@@ -542,11 +543,12 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     std::vector<float> features_buf;
     std::vector<float> g_embd_buf;
 
-    common_speculative_impl_draft_eagle3(const common_params_speculative & params, uint32_t n_seq)
-        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, n_seq, params.draft.n_max)
+    common_speculative_impl_draft_eagle3(const common_params_speculative & params, uint32_t n_seq,
+            common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3)
+        : common_speculative_impl(type, n_seq, params.draft.n_max)
         , params(params.draft)
     {
-        SPC_TRC("%s", "adding speculative implementation 'draft-eagle3'\n");
+        SPC_TRC("%s", ("adding speculative implementation '" + common_speculative_type_to_str(type) + "'\n").c_str());
         SPC_TRC("- n_max=%d, n_min=%d, p_min=%f, backend_sampling=%d\n", params.draft.n_max, params.draft.n_min, params.draft.p_min, (int) params.draft.backend_sampling);
 
         auto * ctx_tgt = this->params.ctx_tgt;
@@ -575,7 +577,9 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         for (auto & s : smpls) {
             common_params_sampling sparams;
             sparams.no_perf  = false;
-            sparams.top_k    = 10;
+            // chain drafting: take the argmax so the proposal is the draft model's
+            // most likely token (SGLang/vLLM use greedy for topk=1 chains)
+            sparams.top_k    = 1;
             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
         }
@@ -585,7 +589,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         if (this->params.backend_sampling) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
-                llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
+                llama_sampler_chain_add(chain, llama_sampler_init_top_k(1));
 
                 if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
                     SPC_WRN("backend offload failed for seq_id=%d; using CPU sampler\n", (int) seq_id);
@@ -795,6 +799,22 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
+        const int64_t t0 = ggml_time_us();
+        draft_impl(dparams);
+        stat_us += ggml_time_us() - t0;
+        stat_calls++;
+        if (stat_calls % 8 == 0 && getenv("SPC_STATS")) {
+            LOG_INF("spc-eagle stats: calls=%lld avg_draft_ms=%.2f steps=%lld steps_per_call=%.2f\n",
+                    (long long) stat_calls, stat_us / 1000.0 / stat_calls,
+                    (long long) stat_steps, (double) stat_steps / stat_calls);
+        }
+    }
+
+    int64_t stat_calls = 0;
+    int64_t stat_us    = 0;
+    int64_t stat_steps = 0;
+
+    void draft_impl(common_speculative_draft_params_vec & dparams) {
         auto & ctx_dft = params.ctx_dft;
 
         batch.clear();
@@ -903,6 +923,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
             }
 
             ++i;
+            ++stat_steps;
         }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -1426,6 +1447,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
         // noop
     }
+};
+
+// eagle4 uses the same encoder/decoder speculative machinery as eagle3;
+// only the draft model architecture (per-segment fc_norm, 3 target layers) differs.
+struct common_speculative_impl_draft_eagle4 : public common_speculative_impl_draft_eagle3 {
+    common_speculative_impl_draft_eagle4(const common_params_speculative & params, uint32_t n_seq)
+        : common_speculative_impl_draft_eagle3(params, n_seq, COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE4) {}
 };
 
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
@@ -2354,6 +2382,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_NONE:          return "none";
         case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:  return "draft-simple";
         case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:  return "draft-eagle3";
+        case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE4:  return "draft-eagle4";
         case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:     return "draft-mtp";
         case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:  return "draft-dflash";
         case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:  return "draft-dspark";
@@ -2445,6 +2474,7 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
         switch (type) {
             case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
             case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
+            case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE4:
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
             case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
@@ -2742,7 +2772,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         };
 
         // when adding a new type - update here the logic above
-        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 11);
+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 12);
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
@@ -2754,6 +2784,7 @@ common_speculative * common_speculative_init(common_params_speculative & params,
 
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3, params.draft.ctx_dft != nullptr);
+        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE4, params.draft.ctx_dft != nullptr);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_MTP,    params.draft.ctx_dft != nullptr);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH, params.draft.ctx_dft != nullptr);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK, params.draft.ctx_dft != nullptr);
@@ -2771,6 +2802,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3: {
                 impls.push_back(std::make_unique<common_speculative_impl_draft_eagle3>(config.params, n_seq));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE4: {
+                impls.push_back(std::make_unique<common_speculative_impl_draft_eagle4>(config.params, n_seq));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {

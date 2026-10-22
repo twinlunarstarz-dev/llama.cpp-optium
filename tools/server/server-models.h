@@ -268,6 +268,41 @@ private:
     // unload least recently used models if the limit is reached
     void unload_lru();
 
+    // --- device memory admission -------------------------------------------
+    // A footprint is the projected device memory of one preset, in bytes, indexed
+    // by CUDA device. It comes from an offline measurement of the preset the
+    // first time the model is requested, and from the driver delta of the real
+    // load every time after that.
+    struct vram_entry {
+        std::vector<size_t> per_dev;
+        bool        measured  = false;
+        std::string signature;
+    };
+
+    std::mutex vram_cache_mutex;                          // guards vram_cache only
+    std::map<std::string, vram_entry> vram_cache;         // signature -> footprint
+    std::map<std::string, std::vector<size_t>> vram_pending;     // name -> reserved bytes while the child comes up, guarded by mutex
+    std::map<std::string, std::vector<size_t>> vram_free_before; // name -> free snapshot at spawn, guarded by mutex
+
+    bool vram_active();
+    std::string vram_signature(const server_model_meta & meta);
+    vram_entry  vram_estimate(server_model_meta & meta, const std::string & signature);
+    std::string vram_cache_path() const;
+    void        vram_cache_load();   // exact footprints survive a restart
+    void        vram_cache_save();
+
+    // measures when the signature is unseen; never call with `mutex` held
+    std::vector<size_t> vram_footprint_for(const std::string & name);
+    void vram_ensure_footprint(const std::string & name) { (void) vram_footprint_for(name); }
+
+    std::vector<size_t> vram_cached_for_locked(const std::string & name); // no probing, may be empty
+    std::vector<size_t> vram_effective_free_locked(const std::string & name);
+    bool vram_fits_locked(const std::string & name);
+    void vram_admit(const std::string & name);
+    void vram_reserve_locked(const std::string & name);
+    void vram_release_locked(const std::string & name);
+    void vram_on_ready(const std::string & name);
+
     // not thread-safe, caller must hold mutex
     void add_model(server_model_meta && meta);
 

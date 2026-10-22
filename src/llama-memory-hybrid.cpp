@@ -130,6 +130,10 @@ llama_memory_context_ptr llama_memory_hybrid::init_update(llama_context * lctx, 
     return std::make_unique<llama_memory_hybrid_context>(this, lctx, optimize);
 }
 
+uint32_t llama_memory_hybrid::max_resident_sequences() const {
+    return mem_recr->max_resident_sequences();
+}
+
 bool llama_memory_hybrid::get_can_shift() const {
     // Shifting is trivially supported for recurrent
     return mem_attn->get_can_shift();

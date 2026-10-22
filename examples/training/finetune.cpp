@@ -53,7 +53,7 @@ static std::vector<llama_token> finetune_read_teacher_jsonl(llama_context * ctx,
             inputs.add_generation_prompt = false;
             inputs.use_jinja = true;
             const auto rendered = common_chat_templates_apply(templates.get(), inputs);
-            const auto record_tokens = common_tokenize(ctx, rendered.prompt, tokens.empty(), true);
+            const auto record_tokens = common_tokenize(ctx, rendered.prompt.str(), tokens.empty(), true);
             if (record_tokens.empty()) {
                 throw std::runtime_error("chat template produced no tokens");
             }
