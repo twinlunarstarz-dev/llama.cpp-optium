@@ -154,6 +154,8 @@ struct llama_model_dory : public llama_model_base {
     std::vector<uint32_t> profile;
     std::vector<int> physical;
     std::vector<int> cache_layer;
+    uint32_t n_layer_physical() const override { return n_input + n_recurrent + n_output; }
+    int layer_physical(int il) const override { return physical.at(il); }
     struct scales {
         ggml_tensor * alpha = nullptr;
         ggml_tensor * sqk = nullptr;
