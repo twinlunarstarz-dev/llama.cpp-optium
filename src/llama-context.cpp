@@ -328,6 +328,16 @@ llama_context::llama_context(
     cparams.fused_dsv4_hc_post = true;
     cparams.auto_fhc           = true;
 
+    // Disable experimental fused DSV4-HC ops for qwen4exp: the fused kernels were
+    // written for DeepSeek V4's hyper-connection layout; qwen4exp reuses the enum
+    // with different hc/gate tensor shapes, which produces junk logits.
+    if (model.arch == LLM_ARCH_QWEN4EXP) {
+        cparams.fused_dsv4_hc_pre  = false;
+        cparams.fused_dsv4_hc_comb = false;
+        cparams.fused_dsv4_hc_post = false;
+        cparams.auto_fhc           = false;
+    }
+
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
@@ -550,11 +560,50 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
+        // Dense models have no experts to cache: bypass all MoE logic so a stale
+        // --moe-cache-mib in a preset cannot allocate an unused device cache.
+        if (cparams.moe_cache_size > 0 && model.hparams.n_expert == 0) {
+            LLAMA_LOG_WARN("%s: dense model has no experts; ignoring the MoE cache\n", __func__);
+            cparams.moe_cache_size = 0;
+        }
+
+        // The pre-load placement solver cannot see the KV cache, the draft model,
+        // or the compute buffers, so its leftover figure can exceed what is
+        // actually free once weights are resident. Clamp against live free VRAM
+        // here (after weights + KV, before sched_reserve) so cudaMalloc cannot fail.
+        if (cparams.moe_cache_size > 0) {
+            size_t free_total = 0;
+            size_t n_accel    = 0;
+            for (const auto & d : model.devices) {
+                if (ggml_backend_dev_type(d.dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    continue;
+                }
+                ggml_backend_dev_props props;
+                ggml_backend_dev_get_props(d.dev, &props);
+                if (props.memory_free > 0) {
+                    free_total += props.memory_free;
+                    n_accel++;
+                }
+            }
+            if (n_accel > 0) {
+                // Reserve room for compute buffers plus the draft model (MTP drafts are
+                // loaded after this context and can be several GiB).
+                const size_t reserve = n_accel * 4096ull * 1024ull * 1024ull;
+                const size_t avail   = free_total > reserve ? free_total - reserve : 0;
+                if (cparams.moe_cache_size > avail) {
+                    LLAMA_LOG_WARN("%s: clamping MoE cache from %.2f MiB to %.2f MiB (%.2f MiB free across %zu device(s), %.2f MiB reserve)\n",
+                            __func__, cparams.moe_cache_size / 1024.0 / 1024.0, avail / 1024.0 / 1024.0,
+                            free_total / 1024.0 / 1024.0, n_accel, reserve / 1024.0 / 1024.0);
+                    cparams.moe_cache_size = avail;
+                }
+            }
+        }
+
         if (cparams.moe_cache_size > 0) {
             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size,
                 cparams.moe_profile, cparams.moe_hot);
         } else if (cparams.moe_profile != nullptr || cparams.moe_hot != nullptr) {
-            LLAMA_LOG_WARN("%s: --moe-profile/--moe-hot ignored: --moe-cache-mib is 0\n", __func__);
+            LLAMA_LOG_WARN("%s: --moe-profile/--moe-hot ignored: no MoE cache budget\n", __func__);
         }
 
         sched_reserve();
@@ -2771,11 +2820,24 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     auto * lctx = static_cast<llama_context *>(user_data);
 
     // the slot maps of the MoE cache
-    if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph)) {
+    if (lctx->moe_cache && lctx->moe_cache->copy(backend, src, dst, graph, lctx->sched.get())) {
         return true;
     }
 
     auto & st = lctx->copy_experts;
+    {
+        static std::set<std::string> seen_dbg;
+        if (dst && dst->name && strstr(dst->name, "exps") && seen_dbg.insert(dst->name).second) {
+            const ggml_tensor * dbg_node = ggml_graph_n_nodes(graph) > 0 ? ggml_graph_node(graph, 0) : nullptr;
+            const ggml_tensor * dbg_ids = dbg_node && dbg_node->op == GGML_OP_MUL_MAT_ID ? dbg_node->src[2] : nullptr;
+            LLAMA_LOG_WARN("DBG copycb: backend=%s dst=%s node0=%s ids=%s ids_backend=%s n_nodes=%d\n",
+                ggml_backend_name(backend), dst->name,
+                dbg_node ? dbg_node->name : "none",
+                dbg_ids ? dbg_ids->name : "none",
+                dbg_ids ? ggml_backend_name(ggml_backend_sched_get_tensor_backend(lctx->sched.get(), const_cast<ggml_tensor *>(dbg_ids))) : "none",
+                ggml_graph_n_nodes(graph));
+        }
+    }
 
     // the ids must be computed before the split starts, so only the first node of the split is considered
     if (ggml_graph_n_nodes(graph) == 0) {
@@ -2790,25 +2852,59 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     if (ggml_nelements(ids) == 0) {
         return true;
     }
+    // the ids in the split graph are scheduler copies; resolve to the original tensor,
+    // which is already valid: the producing split ran before this copy callback fires
+    if (const ggml_tensor * ids_src = ggml_backend_sched_copy_source(lctx->sched.get(), ids)) {
+        ids = ids_src;
+    }
 
     const int64_t n_expert    = src->ne[2];
     const size_t  expert_size = src->nb[2];
 
-    if (ids != st.ids || (int64_t) st.used.size() != n_expert) {
+    {
+        // the ids may live on a different backend than this split's (layer split);
+        // read them from the backend they were computed on, not from the split backend
+        ggml_backend_t ids_backend = ggml_backend_sched_get_tensor_backend(lctx->sched.get(), const_cast<ggml_tensor *>(ids));
+        if (ids_backend == nullptr) {
+            ids_backend = backend;
+        }
         st.ids_data.resize(ggml_nbytes(ids)/sizeof(int32_t));
-        ggml_backend_tensor_get_async(backend, ids, st.ids_data.data(), 0, ggml_nbytes(ids));
-        ggml_backend_synchronize(backend);
+        ggml_backend_tensor_get_async(ids_backend, ids, st.ids_data.data(), 0, ggml_nbytes(ids));
+        ggml_backend_synchronize(ids_backend);
 
         st.used.assign(n_expert, false);
+        bool ids_garbage = false;
         for (int64_t i1 = 0; i1 < ids->ne[1]; i1++) {
             for (int64_t i0 = 0; i0 < ids->ne[0]; i0++) {
-                const int32_t id = st.ids_data[i1*ids->nb[1]/sizeof(int32_t) + i0*ids->nb[0]/sizeof(int32_t)];
-                GGML_ASSERT(id >= 0 && id < n_expert);
+                int32_t id = st.ids_data[i1*ids->nb[1]/sizeof(int32_t) + i0*ids->nb[0]/sizeof(int32_t)];
+                if (id < 0 || id >= n_expert) {
+                    // garbage ids mean this split's inputs have not been computed/copied yet;
+                    // re-read once after a full synchronize of the ids backend, and if still
+                    // invalid, copy ALL experts of this layer so the split computes correctly
+                    // (skipping the copy leaves the weights buffer uninitialized and can
+                    // poison the whole generation on layer-split pipelines)
+                    ggml_backend_synchronize(ids_backend);
+                    st.ids_data.resize(ggml_nbytes(ids)/sizeof(int32_t));
+                    ggml_backend_tensor_get_async(ids_backend, ids, st.ids_data.data(), 0, ggml_nbytes(ids));
+                    ggml_backend_synchronize(ids_backend);
+                    id = st.ids_data[i1*ids->nb[1]/sizeof(int32_t) + i0*ids->nb[0]/sizeof(int32_t)];
+                }
+                if (id < 0 || id >= n_expert) {
+                    LLAMA_LOG_WARN("%s: invalid expert id %d at [%lld,%lld] for %s (after resync), copying all %lld experts\n",
+                            __func__, id, (long long)i0, (long long)i1, dst->name ? dst->name : "?", (long long)n_expert);
+                    ids_garbage = true;
+                    break;
+                }
                 st.used[id] = true;
             }
+            if (ids_garbage) {
+                break;
+            }
+        }
+        if (ids_garbage) {
+            st.used.assign(n_expert, true);
         }
 
-        st.ids = ids;
     }
 
     // group consecutive experts and copy them together

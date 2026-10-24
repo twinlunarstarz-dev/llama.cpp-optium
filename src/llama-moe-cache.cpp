@@ -6,6 +6,8 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <atomic>
+#include <thread>
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
@@ -360,6 +362,13 @@ struct llama_moe_cache::impl {
         ggml_context_ptr ctx;
         ggml_backend_buffer_ptr buf;
         size_t buf_size = 0;
+
+        // pinned staging for DISK-tier fills: pread into pinned memory so the
+        // H2D copy is true async DMA (mmap sources page-fault and copy synchronously)
+        ggml_backend_buffer_ptr buf_stage; // two chunk regions, double buffered
+        size_t stage_experts = 32;
+        bool stage_outstd[2] = { false, false }; // chunk region has queued H2D copies
+        int  stage_flip    = 0;                  // which chunk region to fill next
     };
 
     // layers of the same device with the same expert tensor layout share the banks and the LRU of a group
@@ -650,6 +659,31 @@ struct llama_moe_cache::impl {
                 }
                 ggml_backend_buffer_clear(d.buf.get(), 0);
                 d.buf_size = ggml_backend_buffer_get_size(d.buf.get());
+                // pinned staging: two chunks of stage_experts experts, double buffered
+                // so a pread batch overlaps the previous batch's H2D copy
+                {
+                    const size_t dev_idx = (size_t) (&d - devices.data());
+                    size_t max_es = 0;
+                    for (const group & gg : groups) {
+                        if (gg.id == (int32_t) dev_idx && !gg.ref.empty()) {
+                            for (const ggml_tensor * t : gg.ref) {
+                                max_es = std::max(max_es, (size_t) t->nb[2]);
+                            }
+                        }
+                    }
+                    if (max_es > 0) {
+                        ggml_backend_buffer_type_t buft_pinned = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(d.backend));
+                        if (buft_pinned == nullptr) {
+                            buft_pinned = ggml_backend_cpu_buffer_type();
+                        }
+                        const size_t stage_bytes = 2*d.stage_experts*max_es;
+                        d.buf_stage.reset(ggml_backend_buft_alloc_buffer(buft_pinned, stage_bytes));
+                        if (!d.buf_stage) {
+                            LLAMA_LOG_WARN("%s: failed to allocate %.2f MiB of pinned staging, DISK-tier fills use the mmap path\n",
+                                           __func__, stage_bytes/1024.0/1024.0);
+                        }
+                    }
+                }
             }
             buf_host.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_host.get(), buft_host));
             if (!buf_host) {
@@ -706,9 +740,14 @@ struct llama_moe_cache::impl {
         int32_t ne = 0;
         std::vector<uint32_t> hot;
         uint64_t selections = 0;
-        if (!moe_profile_read(hot_path, nl, ne, hot, selections) || nl != (int32_t) layers.size() || ne != n_expert) {
+        if (!moe_profile_read(hot_path, nl, ne, hot, selections) || ne != n_expert || nl <= 0 || nl > (int32_t) layers.size()) {
             LLAMA_LOG_WARN("%s: could not read MoE profile '%s', starting with a cold cache\n", __func__, hot_path.c_str());
             return;
+        }
+        // models with an MTP/nextn block have one more layer than the profile covers;
+        // accept a prefix profile and treat the missing tail layers as cold
+        if (nl < (int32_t) layers.size()) {
+            hot.resize((size_t) layers.size() * (size_t) n_expert, 0);
         }
 
         size_t n_seeded = 0;
@@ -856,7 +895,7 @@ struct llama_moe_cache::impl {
         return n;
     }
 
-    bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
+    bool copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, ggml_backend_sched_t sched) {
         const auto it = layer_of.find(src);
         if (it == layer_of.end()) {
             return false;
@@ -887,15 +926,35 @@ struct llama_moe_cache::impl {
                 GGML_ABORT("the experts of layer %d are selected in the same split as their MoE cache lookup", il);
             }
         }
+        // the ids in the split graph are scheduler copies; resolve to the original tensor,
+        // which is already valid: the producing split ran before this copy callback fires
+        ggml_backend_t sel_backend = backend;
+        if (sched) {
+            const ggml_tensor * sel_src = ggml_backend_sched_copy_source(sched, sel);
+            if (sel_src) {
+                sel = sel_src;
+                ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched, const_cast<ggml_tensor *>(sel_src));
+                if (b) {
+                    sel_backend = b;
+                }
+            }
+        }
         GGML_ASSERT(ggml_is_contiguous(sel));
 
         ids.resize(ggml_nelements(sel));
-        ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
-        ggml_backend_synchronize(backend);
+        ggml_backend_tensor_get_async(sel_backend, sel, ids.data(), 0, ggml_nbytes(sel));
+        ggml_backend_synchronize(sel_backend);
 
         size_t n_hit = 0;
         if (!g.lru.plan(il, ids.data(), ids.size(), fills, n_hit)) {
             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
+        }
+        if (getenv("LLAMA_MOE_DEBUG")) {
+            fprintf(stderr, "MOECACHE il=%d n_slots=%d ids=%zu hits=%zu fills=%zu", il, g.n_slots, ids.size(), n_hit, fills.size());
+            for (size_t i = 0; i < ids.size() && i < 12; ++i) {
+                fprintf(stderr, " e%d->s%d", ids[i], g.lru.slot_map[il][ids[i]]);
+            }
+            fprintf(stderr, "\n");
         }
         if (!counts.empty()) {
             profile_tokens += ids.size() / (size_t) std::max(1, n_expert_used);
@@ -927,17 +986,95 @@ struct llama_moe_cache::impl {
             const ggml_tensor * w    = l.experts[ip];
             ggml_tensor       * bank = g.banks[ip];
             const size_t expert_size = w->nb[2];
-            
-            // Use moe_ram_arena combined buffer as source if available
+
+            // RAM tier: source is the arena combined buffer (resident, or loaded
+            // above by the parallel preads of ensure_experts_loaded)
             const char * tensor_type = moe_get_tensor_type(w->name);
             void * src_data = w->data;
+            bool have_combined = false;
             if (tensor_type && g_moe_ram_arena) {
                 void * combined = g_moe_ram_arena->get_combined_buffer(il, tensor_type);
                 if (combined) {
                     src_data = combined;
+                    have_combined = true;
                 }
             }
-            
+
+            if (!have_combined && tensor_type && g_moe_ram_arena &&
+                devices[g.id].buf_stage != nullptr) {
+                // DISK tier: stream the experts through pinned staging in chunks;
+                // the preads run in parallel workers and overlap the H2D copies of
+                // the previous chunk (reading through the mmap view instead page
+                // faults one 4 KiB page at a time inside the synchronous copy)
+                device & dev = devices[g.id];
+                const size_t K = dev.stage_experts;
+                uint8_t * stage_base = (uint8_t *) ggml_backend_buffer_get_base(dev.buf_stage.get());
+                const int n_workers = (int) std::min<size_t>(K, std::max(1u, std::thread::hardware_concurrency() / 2));
+                size_t i = 0;
+                while (i < fills.size()) {
+                    const size_t c0 = i;
+                    size_t ci = 0;
+                    while (i < fills.size() && ci < K) {
+                        i++;
+                        ci++;
+                    }
+                    const int f = dev.stage_flip;
+                    dev.stage_flip ^= 1;
+                    if (dev.stage_outstd[f]) {
+                        // this chunk region still has queued copies from an earlier
+                        // layer; wait for them before overwriting the pinned memory
+                        ggml_backend_synchronize(backend);
+                        dev.stage_outstd[f] = false;
+                    }
+                    std::atomic<size_t> next(c0);
+                    std::atomic<bool> any_fail(false);
+                    auto worker = [&]() {
+                        for (;;) {
+                            const size_t k = next.fetch_add(1);
+                            if (k >= c0 + ci) {
+                                return;
+                            }
+                            void * dstp = stage_base + (size_t) f*K*expert_size + (k - c0)*expert_size;
+                            if (g_moe_ram_arena->read_expert_direct(il, tensor_type, fills[k].expert, dstp) == 0) {
+                                any_fail.store(true);
+                                return;
+                            }
+                        }
+                    };
+                    if (n_workers <= 1) {
+                        worker();
+                    } else {
+                        std::vector<std::thread> pool;
+                        for (int t = 1; t < n_workers; ++t) {
+                            pool.emplace_back(worker);
+                        }
+                        worker();
+                        for (auto & th : pool) {
+                            th.join();
+                        }
+                    }
+                    if (any_fail.load()) {
+                        // no file metadata for this layer/type: mmap fallback
+                        for (size_t k = c0; k < c0 + ci; ++k) {
+                            ggml_backend_tensor_set_async(backend, bank,
+                                (const uint8_t *) src_data + fills[k].expert*expert_size,
+                                fills[k].slot*expert_size, expert_size);
+                            bytes += expert_size;
+                        }
+                        continue;
+                    }
+                    for (size_t k = c0; k < c0 + ci; ++k) {
+                        ggml_backend_tensor_set_async(backend, bank,
+                            stage_base + (size_t) f*K*expert_size + (k - c0)*expert_size,
+                            fills[k].slot*expert_size, expert_size);
+                        bytes += expert_size;
+                    }
+                    dev.stage_outstd[f] = true;
+                }
+                continue;
+            }
+
+            // RAM tier (or arena-less): upload from the resident source
             for (size_t i = 0; i < fills.size();) {
                 size_t n = 1;
                 while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
@@ -996,8 +1133,8 @@ ggml_tensor * llama_moe_cache::get_experts(const ggml_tensor * w) const {
     return pimpl->get_experts(w);
 }
 
-bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph) {
-    return pimpl->copy(backend, src, dst, graph);
+bool llama_moe_cache::copy(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, ggml_backend_sched_t sched) {
+    return pimpl->copy(backend, src, dst, graph, sched);
 }
 
 int64_t llama_moe_cache::copy_experts(ggml_backend_t backend, const ggml_tensor * w, ggml_tensor * dst, int64_t e, int64_t last) {

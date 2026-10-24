@@ -368,6 +368,18 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model hyperparameters: " + std::string(e.what()));
         }
+        // MoE models are served by the tiered expert cache, not the sequential
+        // streaming MVP (which cannot represent per-expert placement and rejects
+        // every expert/hybrid architecture). Dispatch instead of failing the load.
+        if (params.sequential_load && model->hparams.n_expert != 0) {
+            const bool tiering_configured = params.moe_ram_mib > 0;
+            if (tiering_configured) {
+                LLAMA_LOG_WARN("%s: MoE model (%d experts) with sequential load requested; "
+                               "using tiered expert cache instead (sequential-load disabled)\n",
+                               __func__, (int) model->hparams.n_expert);
+                params.sequential_load = false;
+            }
+        }
         if (params.sequential_load) {
             if (!llama_model_arch_supports_sequential_load(model->arch)) {
                 throw std::runtime_error(

@@ -186,6 +186,31 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_pascal_older(gg
     }
 }
 
+// Ampere consumer cards (RTX 30xx) have enough SMs and bandwidth to run MMVQ
+// at the maximum batch for all quantized types; tuned for GA102-class parts.
+static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_ampere(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_IQ2_S:   return 8;
+        case GGML_TYPE_IQ2_XS:  return 8;
+        case GGML_TYPE_IQ2_XXS: return 8;
+        case GGML_TYPE_IQ3_S:   return 8;
+        case GGML_TYPE_IQ3_XXS: return 8;
+        case GGML_TYPE_MXFP4:   return 8;
+        case GGML_TYPE_NVFP4:   return 8;
+        case GGML_TYPE_Q2_K:    return 8;
+        case GGML_TYPE_Q3_K:    return 8;
+        case GGML_TYPE_Q4_0:    return 8;
+        case GGML_TYPE_Q4_1:    return 8;
+        case GGML_TYPE_Q4_K:    return 8;
+        case GGML_TYPE_Q5_0:    return 8;
+        case GGML_TYPE_Q5_1:    return 8;
+        case GGML_TYPE_Q5_K:    return 8;
+        case GGML_TYPE_Q6_K:    return 8;
+        case GGML_TYPE_Q8_0:    return 8;
+        default:                return MMVQ_MAX_BATCH_SIZE;
+    }
+}
+
 static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_turing_plus(ggml_type type) {
     switch (type) {
         case GGML_TYPE_IQ2_S:   return 7;
@@ -299,6 +324,9 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
         if (cc == GGML_CUDA_CC_PASCAL || cc == GGML_CUDA_CC_VOLTA || cc >= GGML_CUDA_CC_ADA_LOVELACE) {
             return MMVQ_MAX_BATCH_SIZE;
+        }
+        if (cc >= GGML_CUDA_CC_AMPERE) {
+            return get_mmvq_mmid_max_batch_ampere(type);
         }
         if (cc >= GGML_CUDA_CC_TURING) {
             return get_mmvq_mmid_max_batch_turing_plus(type);

@@ -1,5 +1,6 @@
 #include "llama.h"
 #include "../src/llama-ext.h"
+#include "../src/llama-model-loader.h"
 
 #include "arg.h"
 #include "common.h"
@@ -24,8 +25,44 @@ int llama_fit_params(int argc, char ** argv) {
         return 1;
     }
 
+    // Resolve --device raw entries into params.devices, same as the server does,
+    // so the MoE fit planner sees the real device list instead of defaulting to 0.
+    common_params_resolve_devices(params);
+
     llama_backend_init();
     llama_numa_init(params.numa);
+
+    // MoE tiered placement: run the early solver before mparams is built so the
+    // memory estimate reflects the tiering plan instead of the full model.
+    // Mirrors common_init_result() in common/common.cpp; without this the probe
+    // measures all 93 GB of a tiered MoE and over-estimates VRAM by the size of
+    // the RAM and disk tiers, which makes vram_fits_locked() fail forever.
+    // Disabled: the loader's precise per-device plan is authoritative now, and
+    // it is what the no_alloc probe below measures. The early heuristic would
+    // install a coarser override set and suppress that plan.
+    if (false && params.moe_ram_mib > 0 && (params.moe_placement.empty() || params.moe_placement == "auto")) {
+        int moe_n_layer = 0, moe_n_expert = 0, moe_n_expert_used = 0;
+        std::vector<llama_model_tensor_buft_override> moe_overrides;
+        const bool moe_ok = llama_moe_solve_early(
+                params.model.path.c_str(),
+                params.tensor_split,
+                0,
+                params.moe_ram_mib,
+                params.moe_placement.empty() ? nullptr : params.moe_placement.c_str(),
+                params.moe_pin_decode,
+                params.moe_hot.empty() ? nullptr : params.moe_hot.c_str(),
+                moe_n_layer, moe_n_expert, moe_n_expert_used, moe_overrides);
+        if (moe_ok && !moe_overrides.empty()) {
+            params.tensor_buft_overrides = moe_overrides;
+            if (params.tensor_buft_overrides.back().pattern != nullptr) {
+                params.tensor_buft_overrides.push_back({ nullptr, nullptr });
+            }
+            LOG_INF("%s: MoE solver produced %zu tensor overrides (layers=%d experts=%d)\n",
+                    __func__, moe_overrides.size(), moe_n_layer, moe_n_expert);
+        } else {
+            LOG_WRN("%s: MoE solver produced no overrides; estimate will be MoE-blind\n", __func__);
+        }
+    }
 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);

@@ -603,12 +603,12 @@ struct common_params {
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
-    size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
+    size_t moe_cache_size = 0; // internal: VRAM expert cache bytes, derived from the placement solver
     std::string moe_profile;   // record per-expert activation counts to this JSON file (requires --moe-cache-mib)
     std::string moe_hot;       // seed and pin the MoE cache from this JSON profile (requires --moe-cache-mib)
 
     // MoE tiered placement (EXPERIMENTAL)
-    size_t moe_ram_mib = 4096;      // hard RAM cap in MiB for the MoE CPU arena (default: 4096)
+    size_t moe_ram_mib = 0;         // hard RAM cap in MiB for the MoE CPU arena (default: 0 = tiered MoE placement disabled)
     std::string moe_placement;      // "auto" (solver) | "plan:<json>" (explicit plan)
     bool moe_pin_decode = true;     // keep decode/attention layers in VRAM
 

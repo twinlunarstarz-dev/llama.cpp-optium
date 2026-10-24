@@ -653,12 +653,67 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         }
     }
 
+    // The target tolerates position gaps after image spans (M-RoPE only requires X < Y),
+    // but this text-only draft requires strictly consecutive positions (Y = X + 1).
+    // Fill the gap with the vocabulary's padding token when the next text batch arrives,
+    // so drafting can continue after images without corrupting the draft KV.
+    void pad_gap(llama_seq_id seq_id, llama_pos first_pos) {
+        auto * ctx_dft = params.ctx_dft;
+        auto * mem     = llama_get_memory(ctx_dft);
+
+        const llama_pos dft_max = llama_memory_seq_pos_max(mem, seq_id);
+        if (dft_max < 0 || first_pos <= dft_max + 1) {
+            return;
+        }
+
+        const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx_dft));
+        llama_token pad = vocab != nullptr ? llama_vocab_pad(vocab) : -1;
+        if (pad < 0) {
+            pad = 0;
+        }
+
+        const int32_t n_ubatch_dft = std::max(1, (int32_t) llama_n_ubatch(ctx_dft));
+        SPC_WRN("draft KV gap: seq %d padding pos %d..%d (pad token %d)\n",
+                (int) seq_id, (int) dft_max + 1, (int) first_pos - 1, (int) pad);
+
+        llama_pos pos = dft_max + 1;
+        while (pos < first_pos) {
+            batch.clear();
+            for (int32_t k = 0; k < n_ubatch_dft && pos < first_pos; ++k, ++pos) {
+                batch.add(pad, pos, seq_id, /*output=*/ false);
+            }
+            if (batch.size() == 0) {
+                break;
+            }
+            const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            if (rc != 0) {
+                SPC_WRN("draft KV gap padding failed rc=%d (seq=%d, pos=%d)\n",
+                        rc, (int) seq_id, (int) pos);
+                break;
+            }
+        }
+
+        // the deferred boundary is stale across a gap: let the next text batch re-seed it
+        pending_pos_last[seq_id] = -1;
+    }
+
     bool process(const common_batch & batch_in) override {
         if (batch_in.size() <= 0) {
             return true;
         }
 
-        if (!batch_in.has_token() || batch_in.has_embd()) {
+        // image/audio batches carry embeddings the draft cannot consume: keep its KV
+        // positions consecutive so subsequent text batches remain valid
+        if (batch_in.has_embd()) {
+            SPC_DBG("draft: skipping embd batch n=%d pos0=%d pos_last=%d dft_max=%d\n",
+                    batch_in.size(),
+                    (int) batch_in.tokens.front().pos[0],
+                    (int) batch_in.tokens.back().pos[0],
+                    (int) llama_memory_seq_pos_max(llama_get_memory(params.ctx_dft), 0));
+            return true;
+        }
+
+        if (!batch_in.has_token()) {
             return true;
         }
 
@@ -748,6 +803,15 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         //       deferred boundary, completed by the next process() or draft() call.
         //   (c) refresh deferred state — stash this ubatch's full g_embd into verify_g,
         //       update pending_g_last / pending_pos_last to the last row.
+        // fill any position gap left by an image/audio span so the draft KV stays consecutive
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            const int32_t beg = i_batch_beg[seq_id];
+            if (beg < 0) {
+                continue;
+            }
+            pad_gap(seq_id, batch_in.tokens[beg].pos[0]);
+        }
+
         batch.clear();
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {

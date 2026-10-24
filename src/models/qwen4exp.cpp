@@ -650,6 +650,18 @@ public:
     virtual ~llm_graph_input_kpool() = default;
 
     void set_input(const llama_ubatch * ubatch) override {
+        // the k-pool inputs are left unallocated when this graph does not build the
+        // QSA indexer path (e.g. the seq-rm probe decode during load)
+        if (!k_idxs       || !k_idxs->buffer       ||
+            !pool_cells   || !pool_cells->buffer   ||
+            !pool_idxs    || !pool_idxs->buffer    ||
+            !pool_mask    || !pool_mask->buffer    ||
+            !tail_idxs    || !tail_idxs->buffer    ||
+            !new_pool_idxs|| !new_pool_idxs->buffer||
+            !new_pool_rep || !new_pool_rep->buffer ||
+            !new_pool_pos || !new_pool_pos->buffer) {
+            return;
+        }
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
         mctx->set_input_kpool(pool_cells, pool_idxs, pool_mask, tail_idxs, nullptr, new_pool_idxs, new_pool_rep,
                               ubatch, new_pool_pos);

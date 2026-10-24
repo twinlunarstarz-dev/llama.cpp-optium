@@ -298,6 +298,8 @@ private:
     std::vector<size_t> vram_cached_for_locked(const std::string & name); // no probing, may be empty
     std::vector<size_t> vram_effective_free_locked(const std::string & name);
     bool vram_fits_locked(const std::string & name);
+    // human-readable reason a measured footprint does not fit the devices right now
+    std::string vram_refusal_message_locked(const std::string & name);
     void vram_admit(const std::string & name);
     void vram_reserve_locked(const std::string & name);
     void vram_release_locked(const std::string & name);

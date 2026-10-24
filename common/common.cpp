@@ -11,6 +11,7 @@
 #include "log.h"
 #include "llama.h"
 #include "../src/llama-model-loader.h"
+#include "../src/llama-model.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "unicode.h"
@@ -1246,7 +1247,10 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     size_t moe_overrides_count = 0;
     bool moe_solver_ran = false;
 
-    if (params.fit_params && params.moe_ram_mib > 0 && (params.moe_placement.empty() || params.moe_placement == "auto")) {
+    // The loader now computes a precise, per-device plan from real tensor sizes
+    // during load. Running the early heuristic here would install a coarser
+    // override set and the loader would skip its own (better) plan.
+    if (false && params.fit_params && params.moe_ram_mib > 0 && (params.moe_placement.empty() || params.moe_placement == "auto")) {
         COM_TRC("%s", "running MoE early solver for tensor placement ...\n");
         int moe_n_layer = 0, moe_n_expert = 0, moe_n_expert_used = 0;
         std::vector<llama_model_tensor_buft_override> moe_overrides_vec;
@@ -1328,6 +1332,30 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     }
 
     pimpl->model.reset(model);
+
+    // Derive the VRAM expert cache from the placement solver's per-device
+    // budget. The solver already subtracted non-expert weights and the
+    // KV/compute/draft/mmproj reserve, so the sum of the per-device leftovers
+    // is VRAM that is genuinely free for caching host-resident experts.
+    // moe_ram_mib still bounds the host-side arena; experts outside both
+    // tiers are read from disk on demand.
+    if (params.moe_ram_mib > 0 && !model->moe_device_budget.empty()) {
+        size_t solver_vram = 0;
+        for (size_t b : model->moe_device_budget) {
+            solver_vram += b;
+        }
+        // DEBUG BISECT: sentinel file /tmp/nomoecache disables the VRAM expert
+        // cache so experts stream from host/disk every token (correctness probe).
+        if (solver_vram > 0 && access("/tmp/nomoecache", F_OK) == 0) {
+            LOG_INF("MoE cache: DISABLED by /tmp/nomoecache sentinel (correctness bisect)\n");
+            solver_vram = 0;
+        }
+        if (solver_vram > 0) {
+            LOG_INF("MoE cache: %.2f MiB VRAM expert cache from placement solver (%zu device(s)), host arena cap %zu MiB\n",
+                    solver_vram / 1024.0 / 1024.0, model->moe_device_budget.size(), params.moe_ram_mib);
+            cparams.moe_cache_size = solver_vram;
+        }
+    }
 
     if (model_only) {
         return;
@@ -1796,7 +1824,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_v = params.cache_type_v;
 
     cparams.moe_cache_size = params.moe_cache_size;
-    cparams.moe_profile    = params.moe_hot.empty() ? nullptr : params.moe_hot.c_str();
+    cparams.moe_profile    = params.moe_profile.empty() ? nullptr : params.moe_profile.c_str();
     cparams.moe_hot        = params.moe_hot.empty()     ? nullptr : params.moe_hot.c_str();
 
     cparams.moe_ram_mib    = params.moe_ram_mib;

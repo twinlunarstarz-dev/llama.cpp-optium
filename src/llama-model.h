@@ -714,6 +714,10 @@ struct llama_model {
     llama_hparams hparams = {};
     llama_vocab   vocab;
 
+    // per-device leftover VRAM budget for MoE experts from the placement solver;
+    // populated by llama_model_create(loader, params) when a MoE plan exists.
+    std::vector<size_t> moe_device_budget;
+
     // per-tensor activation precision policy
     llama_prec_policy prec_policy;
 

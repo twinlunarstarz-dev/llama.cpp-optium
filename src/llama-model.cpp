@@ -391,7 +391,13 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
         throw std::runtime_error("unknown model architecture: '" + ml.get_arch_name() + "'");
     }
 
-    return llama_model_create(arch, params);
+    llama_model * model = llama_model_create(arch, params);
+    if (model != nullptr && ml.moe_plan) {
+        // Publish the solver's per-device expert budget so the context layer can
+        // size the VRAM expert cache from real placement instead of a fixed preset.
+        model->moe_device_budget = ml.moe_plan->device_budget;
+    }
+    return model;
 }
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {

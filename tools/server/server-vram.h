@@ -54,6 +54,12 @@ private:
 // Runs `exe args...`, parses the `CUDA<n> <model> <context> <compute>` lines
 // printed by `--fit-print on`, and returns the per-device sum in bytes.
 // Returns an empty vector on failure and fills `err`.
+// `cap_compute_layer_split`: when set, the compute column is capped at
+// VRAM_PROBE_COMPUTE_CAP_MIB. MoE models with split-mode layer across multiple
+// devices make the probe copy the expert weights to the main GPU in FP16 for
+// the compute graph, inflating the compute estimate ~100x; without the cap the
+// admission check refuses a model that would actually load.
 std::vector<size_t> server_vram_probe(const std::string & exe,
                                       const std::vector<std::string> & args,
-                                      std::string & err);
+                                      std::string & err,
+                                      bool cap_compute_layer_split = false);

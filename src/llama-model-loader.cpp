@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdarg>
 #include <cstring>
+#include <deque>
 #include <future>
 #include <regex>
 #include <fstream>
@@ -872,6 +873,8 @@ llama_model_loader::llama_model_loader(
 
 
     // MoE tiered placement: compute plan and initialize RAM arena
+    LLAMA_LOG_INFO("%s: moe diag: ram_mib=%zu metadata=%p fname='%s'\n",
+                   __func__, moe_ram_mib, (const void *) metadata, fname.c_str());
     if (moe_ram_mib > 0 && metadata != nullptr && !fname.empty()) {
         // Extract MoE dimensions from metadata
         int n_layer = 0;
@@ -914,7 +917,61 @@ llama_model_loader::llama_model_loader(
             } else {
                 moe_plan = std::make_unique<moe_placement_plan>(moe_solve_placement(
                     metadata, tensor_split, n_devices, moe_ram_mib, moe_placement,
-                    moe_pin_decode, n_layer, n_expert, n_expert_used));
+                    moe_pin_decode, n_layer, n_expert, n_expert_used, this));
+            }
+
+            // The expert cache IS the VRAM tier. Pre-placing whole layers in
+            // dedicated device buffers would spend the expert budget twice:
+            // once on 8 resident layers and again on the leftover cache. When
+            // the cache is enabled, give it the whole expert budget and tier
+            // every expert layer RAM or DISK.
+            const size_t n_dev = moe_plan->device_budget.size();
+            const bool have_dev_breakdown =
+                n_dev > 0 &&
+                moe_plan->device_total.size()     == n_dev &&
+                moe_plan->device_nonexpert.size() == n_dev &&
+                moe_plan->device_committed.size() == n_dev;
+            if (moe_ram_mib > 0 && moe_plan->fits) {
+                size_t full = 0;
+                if (have_dev_breakdown) {
+                    for (size_t i = 0; i < n_dev; ++i) {
+                        moe_plan->device_budget[i] =
+                            moe_plan->device_total[i] > (moe_plan->device_nonexpert[i] + moe_plan->device_committed[i])
+                            ? moe_plan->device_total[i] - moe_plan->device_nonexpert[i] - moe_plan->device_committed[i] : 0;
+                        full += moe_plan->device_budget[i];
+                    }
+                } else if (!moe_plan->vram_expert_budget.empty()) {
+                    // Expert-granular path leaves the per-device breakdown empty;
+                    // its budget vector is the authoritative source.
+                    for (size_t b : moe_plan->vram_expert_budget) full += b;
+                    moe_plan->device_budget = moe_plan->vram_expert_budget;
+                }
+                // The layer solver only fills layer_tier in its precise path, which
+                // requires a loader handle. The expert-granular solver calls it
+                // without one, leaving layer_tier empty -> indexing it segfaults.
+                if (moe_plan->layer_tier.size() != (size_t) n_layer) {
+                    moe_plan->layer_tier.assign(n_layer, 2);
+                }
+                std::fill(moe_plan->layer_tier.begin(), moe_plan->layer_tier.end(), (uint8_t) 2);
+                size_t ram_used = 0;
+                for (int l = 0; l < n_layer; ++l) {
+                    const size_t need = l < (int) moe_plan->layer_expert_bytes.size() ? moe_plan->layer_expert_bytes[l] : 0;
+                    if (ram_used + need <= moe_plan->ram_expert_budget) {
+                        moe_plan->layer_tier[l] = 1;
+                        ram_used += need;
+                    }
+                }
+                moe_plan->n_layers_vram = 0;
+                moe_plan->n_layers_ram  = 0;
+                moe_plan->n_layers_disk = 0;
+                for (uint8_t t : moe_plan->layer_tier) {
+                    if      (t == 0) moe_plan->n_layers_vram++;
+                    else if (t == 1) moe_plan->n_layers_ram++;
+                    else             moe_plan->n_layers_disk++;
+                }
+                moe_plan->vram_expert_budget = moe_plan->device_budget;
+                LLAMA_LOG_INFO("MoE cache mode: %.2f GiB VRAM expert budget to cache, layers VRAM=0 RAM=%d DISK=%d\n",
+                               full / 1073741824.0, moe_plan->n_layers_ram, moe_plan->n_layers_disk);
             }
 
             if (moe_plan->fits) {
@@ -923,11 +980,42 @@ llama_model_loader::llama_model_loader(
                     LLAMA_LOG_INFO("%s\n", line.c_str());
                 }
 
-                // Initialize RAM arena
-                moe_arena = std::make_unique<moe_ram_arena>();
-                if (!moe_arena->init(moe_ram_mib, *moe_plan, n_layer, n_expert, fname.c_str())) {
+                // Apply the plan: host-tier layers get CPU buffer overrides, VRAM
+                // layers keep normal placement. Without this the plan was only
+                // printed and every expert tensor still went to CUDA.
+                // An override buffer can be non-null yet empty: the fit probe
+                // hands in a scratch buffer terminated by {nullptr,nullptr}.
+                const bool have_overrides = tensor_buft_overrides != nullptr &&
+                                            tensor_buft_overrides[0].pattern != nullptr;
+                fprintf(stderr, "MOEDIAG apply: existing_overrides=%p have=%d fits=%d nvram=%d\n",
+                        (const void*)tensor_buft_overrides, (int)have_overrides, (int)moe_plan->fits, moe_plan->n_layers_vram);
+                if (!have_overrides) {
+                    moe_overrides_owned = moe_plan_to_overrides(this, *moe_plan, n_layer);
+                    moe_overrides_owned.push_back({nullptr, nullptr});
+                    tensor_buft_overrides = moe_overrides_owned.data();
+                    LLAMA_LOG_INFO("%s: applying %zu MoE tensor overrides\n",
+                                   __func__, moe_overrides_owned.size() - 1);
+                }
+
+                // Initialize the bounded RAM arena. Ownership moves to the
+                // process-wide pointer so it outlives this loader and can be
+                // read by llama_moe_cache during inference.
+                fprintf(stderr, "TRACE ar1: arena init start cap=%zu expert_tier=%zu\n", moe_ram_mib, moe_plan->expert_tier.size());
+                g_moe_ram_arena = std::make_unique<moe_ram_arena>();
+                std::vector<int> arena_fds;
+                arena_fds.reserve(files.size());
+                for (const auto & f : files) {
+                    arena_fds.push_back(f->file_id());
+                }
+                const bool arena_ok = arena_fds.size() > 1
+                    ? g_moe_ram_arena->init_sharded(moe_ram_mib, *moe_plan, n_layer, n_expert, arena_fds)
+                    : g_moe_ram_arena->init(moe_ram_mib, *moe_plan, n_layer, n_expert, fname.c_str());
+                if (!arena_ok) {
                     LLAMA_LOG_WARN("MoE RAM arena: initialization failed, continuing without arena\n");
-                    moe_arena.reset();
+                    g_moe_ram_arena.reset();
+                } else {
+                    moe_arena = g_moe_ram_arena.get();
+                    fprintf(stderr, "TRACE ar2: arena init ok\n");
                 }
             } else {
                 LLAMA_LOG_ERROR("MoE placement: plan does not fit: %s\n", moe_plan->error.c_str());
@@ -1190,15 +1278,17 @@ ggml_backend_buffer_type_t llama_model_loader::lazy_read::buft() {
     return ggml_backend_dev_buffer_type(cpu_dev);
 }
 
-bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w) {
-    if (mode == LLAMA_LAZY_MODE_OFF) {
-        return false;
-    }
+bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w, bool force) {
+    if (!force) {
+        if (mode == LLAMA_LAZY_MODE_OFF) {
+            return false;
+        }
 
-    // do not lazy-read small tensors, it has significant overhead and is not worth it
-    constexpr size_t auto_min_size = 4ull * 1024 * 1024 * 1024;
-    if (mode != LLAMA_LAZY_MODE_ON && ggml_nbytes(t) <= auto_min_size) {
-        return false;
+        // do not lazy-read small tensors, it has significant overhead and is not worth it
+        constexpr size_t auto_min_size = 4ull * 1024 * 1024 * 1024;
+        if (mode != LLAMA_LAZY_MODE_ON && ggml_nbytes(t) <= auto_min_size) {
+            return false;
+        }
     }
 
     if (!llama_mmap::SUPPORTED) {
@@ -1211,8 +1301,8 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
         ranges[w->idx].emplace_back(w->offs, w->offs + ggml_nbytes(t));
         tensors.insert(name);
 
-        LLAMA_LOG_INFO("%s: tensor %s (size = %zu MiB) lazy read enabled\n",
-                __func__, name.c_str(), ggml_nbytes(t)/1024/1024);
+        LLAMA_LOG_INFO("%s: tensor %s (size = %zu MiB) lazy read enabled%s\n",
+                __func__, name.c_str(), ggml_nbytes(t)/1024/1024, force ? " (MoE tiered placement)" : "");
     }
 
     return true;
@@ -1444,9 +1534,43 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return NULL;
     }
 
-    if (flags & TENSOR_READ_LAZY) {
+    // MoE tiered placement: expert tensors of RAM/DISK-tier layers must never
+    // be eagerly loaded into host RAM (the RAM arena or the mmap page cache
+    // serves them on demand). Force the lazy path regardless of the global
+    // lazy mode. VRAM-tier layers keep normal eager placement (weights must
+    // be uploaded to the device).
+    bool moe_lazy = false;
+    if (moe_plan && tn.bid >= 0 && tn.suffix && strcmp(tn.suffix, "weight") == 0) {
+        bool is_expert_tensor = false;
+        switch (tn.tensor) {
+            case LLM_TENSOR_FFN_GATE_EXPS:
+            case LLM_TENSOR_FFN_UP_EXPS:
+            case LLM_TENSOR_FFN_DOWN_EXPS:
+            case LLM_TENSOR_FFN_GATE_UP_EXPS:
+                is_expert_tensor = true;
+                break;
+            default:
+                break;
+        }
+        if (is_expert_tensor) {
+            if (!moe_plan->expert_tier.empty() && moe_plan->n_expert > 0) {
+                const size_t base = (size_t) tn.bid * moe_plan->n_expert;
+                for (int e = 0; e < moe_plan->n_expert; ++e) {
+                    const size_t idx = base + e;
+                    if (idx < moe_plan->expert_tier.size() && moe_plan->expert_tier[idx] != MOE_TIER_VRAM) {
+                        moe_lazy = true;
+                        break;
+                    }
+                }
+            } else if (tn.bid < (int) moe_plan->layer_tier.size() && moe_plan->layer_tier[tn.bid] != MOE_TIER_VRAM) {
+                moe_lazy = true;
+            }
+        }
+    }
+
+    if ((flags & TENSOR_READ_LAZY) || moe_lazy) {
         // the decision must not depend on the load mode, or the memory-fit pass (no_alloc, no mmap)
-        is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));
+        is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()), moe_lazy);
     }
 
     ggml_tensor t_meta = *cur;
@@ -1801,7 +1925,7 @@ bool llama_model_loader::load_all_data(
         size_t n_size = ggml_nbytes(cur);
 
         // Capture file offset for RAM-tier expert tensors
-        capture_expert_file_offset(ggml_get_name(cur), weight->offs, n_size, cur);
+        capture_expert_file_offset(ggml_get_name(cur), weight->offs, n_size, cur, weight->idx);
 
         const bool from_mapping = use_mmap || lazy.has(cur);
 
@@ -2024,6 +2148,8 @@ std::vector<llama_model_tensor_buft_override> moe_plan_to_overrides(
         const moe_placement_plan & plan,
         int n_layer) {
     std::vector<llama_model_tensor_buft_override> overrides;
+    fprintf(stderr, "TRACE ov1: enter n_layer=%d layer_tier=%zu strings_cap=%zu\n",
+            n_layer, plan.layer_tier.size(), loader->moe_pattern_strings.size());
 
     for (int l = 0; l < n_layer; ++l) {
         // Pattern for this layer's expert tensors
@@ -2036,11 +2162,19 @@ std::vector<llama_model_tensor_buft_override> moe_plan_to_overrides(
         loader->moe_pattern_strings.emplace_back(pattern);
         const char * pattern_ptr = loader->moe_pattern_strings.back().c_str();
 
+        // Prefer the precise per-layer tier map when the solver had real
+        // tensor sizes; fall back to the legacy contiguous counts otherwise.
+        const int tier = (!plan.layer_tier.empty() && l < (int) plan.layer_tier.size())
+                       ? (int) plan.layer_tier[l]
+                       : (l < plan.n_layers_vram ? 0 : (l < plan.n_layers_vram + plan.n_layers_ram ? 1 : 2));
+
+        // VRAM layers keep normal device placement: no override at all.
+        if (tier == 0) {
+            continue;
+        }
+
         ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
-        if (l < plan.n_layers_vram) {
-            // VRAM - let the meta device decide which GPU based on tensor_split
-            buft = ggml_backend_cpu_buffer_type(); // will be remapped by llama_model_load_internal
-        } else if (l < plan.n_layers_vram + plan.n_layers_ram) {
+        if (tier == 1) {
             // RAM
             buft = ggml_backend_cpu_buffer_type();
         } else {
@@ -2049,7 +2183,11 @@ std::vector<llama_model_tensor_buft_override> moe_plan_to_overrides(
         }
 
         overrides.push_back({pattern_ptr, buft});
+        if (l == 0 || l == n_layer - 1) {
+            fprintf(stderr, "TRACE ov2: l=%d tier=%d n_overrides=%zu\n", l, tier, overrides.size());
+        }
     }
+    fprintf(stderr, "TRACE ov3: done n_overrides=%zu strings=%zu\n", overrides.size(), loader->moe_pattern_strings.size());
 
     return overrides;
 }
@@ -2157,8 +2295,11 @@ bool llama_moe_solve_early(
     n_expert_out = n_expert;
     n_expert_used_out = n_expert_used;
 
-    // Use a local vector for pattern string lifetime management
-    std::vector<std::string> pattern_strings;
+    // Pattern strings must outlive this call: overrides_out stores raw const char*
+    // pointers that callers keep for the lifetime of the model params. A local
+    // vector here dangled as soon as the function returned. std::deque never
+    // invalidates references to existing elements on push_back.
+    static std::deque<std::string> pattern_strings;
 
     // Choose solver based on profile availability
     moe_placement_plan plan;
@@ -2202,15 +2343,20 @@ bool llama_moe_solve_early(
                 }
             }
 
-            // Determine buffer type for this layer's expert tensors
-            ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+            // VRAM-tier layers must keep the NORMAL device placement: emit no
+            // override at all. select_weight_buft() then puts the combined tensor
+            // on the layer's GPU. A CPU override here would force the tensor into
+            // host memory and there is no later "remap to GPU" step, so the VRAM
+            // tier would silently become a CPU tier.
             if (any_vram) {
-                buft = ggml_backend_cpu_buffer_type(); // will be remapped to GPU by meta device
-            } else if (any_ram) {
-                buft = ggml_backend_cpu_buffer_type(); // stays on CPU (RAM tier)
-            } else {
-                buft = ggml_backend_cpu_buffer_type(); // disk tier - stays on CPU, loaded on demand
+                LLAMA_LOG_DEBUG("%s: layer %d expert tier VRAM -> normal device placement\n", __func__, l);
+                continue;
             }
+
+            // RAM and disk tiers stay host-resident; the MoE hot cache uploads the
+            // active experts to the device on demand.
+            ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+            (void) any_ram;
 
             // Pattern matches all combined expert tensors for this layer
             static const char * fmt = R"(blk\.%d\.ffn_.*_exps\.weight$)";
@@ -2232,14 +2378,13 @@ bool llama_moe_solve_early(
             pattern_strings.emplace_back(pattern);
             const char * pattern_ptr = pattern_strings.back().c_str();
 
-            ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+            // VRAM-tier layers keep normal device placement (see above).
             if (l < plan.n_layers_vram) {
-                buft = ggml_backend_cpu_buffer_type(); // remapped later
-            } else if (l < plan.n_layers_vram + plan.n_layers_ram) {
-                buft = ggml_backend_cpu_buffer_type();
-            } else {
-                buft = ggml_backend_cpu_buffer_type();
+                LLAMA_LOG_DEBUG("%s: layer %d in VRAM tier -> normal device placement\n", __func__, l);
+                continue;
             }
+
+            ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
 
             overrides_out.push_back({pattern_ptr, buft});
         }
@@ -2281,46 +2426,53 @@ moe_placement_plan moe_solve_placement(
         bool moe_pin_decode,
         int n_layer,
         int n_expert,
-        int n_expert_used) {
+        int n_expert_used,
+        llama_model_loader * loader) {
     moe_placement_plan plan;
 
     // Query actual VRAM per device
     std::vector<size_t> vram_per_device;
+    std::vector<int>    gpu_dev_index; // maps compacted GPU ordinal -> ggml device index
     size_t total_vram = 0;
     if (n_devices <= 0) {
         n_devices = ggml_backend_dev_count();
     }
     for (int i = 0; i < n_devices; ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        // Try to get memory info via backend
-        size_t dev_vram = 0;
         const char * dev_name = ggml_backend_dev_name(dev);
-        if (strcmp(dev_name, "CUDA") == 0 || strcmp(dev_name, "CUDA0") == 0) {
-            dev_vram = 24ull * 1024 * 1024 * 1024; // 24 GB for RTX 3090
-        } else if (strcmp(dev_name, "CUDA1") == 0) {
-            dev_vram = 12ull * 1024 * 1024 * 1024; // 12 GB for RTX 2060
-        } else {
-            // Try to query via backend
-            // Fallback
-            dev_vram = 12ull * 1024 * 1024 * 1024;
+
+        // Only count real accelerator devices. ggml_backend_dev_count() also
+        // enumerates the CPU backend; treating that as a 12 GiB "GPU" inflated
+        // the expert VRAM budget by ~12 GiB and over-assigned layers to CUDA.
+        const enum ggml_backend_dev_type dev_type = ggml_backend_dev_type(dev);
+        if (dev_type != GGML_BACKEND_DEVICE_TYPE_GPU && dev_type != GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+            continue;
         }
-        // Apply 10% safety margin
-        dev_vram = (dev_vram * 9) / 10;
+
+        size_t dev_free = 0;
+        size_t dev_total = 0;
+        ggml_backend_dev_memory(dev, &dev_free, &dev_total);
+        size_t dev_vram = dev_total > 0 ? dev_total : 0;
+        if (dev_vram == 0) {
+            dev_vram = 12ull * 1024 * 1024 * 1024; // unknown device fallback
+        }
         vram_per_device.push_back(dev_vram);
+        gpu_dev_index.push_back(i);
         total_vram += dev_vram;
-        plan.report_lines.push_back(moe_fmt("  Device %d (%s): %.2f GiB (after 10%% margin)", i, dev_name, dev_vram / 1024.0 / 1024.0 / 1024.0));
+        plan.report_lines.push_back(moe_fmt("  Device %d (%s): %.2f GiB", i, dev_name, dev_vram / 1024.0 / 1024.0 / 1024.0));
     }
 
     // Fallback if no devices
     if (vram_per_device.empty()) {
         vram_per_device.push_back(4ull * 1024 * 1024 * 1024); // 4 GB default
+        gpu_dev_index.push_back(0);
         total_vram = vram_per_device[0];
         plan.report_lines.push_back("  No devices found, using 4 GiB default");
     }
 
     // Estimate expert bytes per layer
     // For qwen4exp: 512 experts/layer, ~2.3 MB per expert = ~1.17 GB per layer for all experts
-    size_t expert_bytes_per_layer = (size_t)(1.17 * 1024 * 1024 * 1024);
+    size_t expert_bytes_per_layer = (size_t)(1.45 * 1024 * 1024 * 1024);
     size_t total_expert_bytes = expert_bytes_per_layer * n_layer;
 
     plan.total_expert_bytes = total_expert_bytes;
@@ -2329,24 +2481,38 @@ moe_placement_plan moe_solve_placement(
     // VRAM budget for experts (reserve some for KV cache and context)
     size_t ram_budget = moe_ram_mib * 1024 * 1024;
     size_t vram_budget = total_vram;
-    if (vram_budget > 4ull * 1024 * 1024 * 1024) {
-        vram_budget -= 4ull * 1024 * 1024 * 1024; // Reserve 4 GiB for KV/context
+    // Reserve room for the non-expert weights (attention, embeddings, output) and
+    // the KV/compute buffers. Those are not part of the expert budget but they do
+    // land on the same devices; a 4 GiB reserve over-assigned expert layers and the
+    // footprint estimate then exceeded the card.
+    const size_t non_expert_reserve = 13ull * 1024 * 1024 * 1024;
+    if (vram_budget > non_expert_reserve) {
+        vram_budget -= non_expert_reserve;
+    } else {
+        vram_budget = vram_budget / 4;
     }
 
-    // Distribute VRAM budget across devices according to tensor_split
+    // Distribute VRAM budget across devices according to tensor_split.
+    // vram_per_device is compacted to accelerator devices only, while tensor_split
+    // is indexed by the original ggml device order, so translate via gpu_dev_index.
     plan.vram_expert_budget.resize(vram_per_device.size());
-    if (tensor_split && vram_per_device.size() > 1) {
+    auto split_for_gpu = [&](size_t g) -> float {
+        if (!tensor_split) return 0.0f;
+        const int dev_i = gpu_dev_index[g];
+        return dev_i >= 0 ? tensor_split[dev_i] : 0.0f;
+    };
+    if (vram_per_device.size() > 1) {
         float split_sum = 0;
-        for (size_t i = 0; i < vram_per_device.size(); ++i) split_sum += tensor_split[i];
+        for (size_t i = 0; i < vram_per_device.size(); ++i) split_sum += split_for_gpu(i);
         if (split_sum > 0) {
             for (size_t i = 0; i < vram_per_device.size(); ++i) {
-                plan.vram_expert_budget[i] = (size_t)(vram_budget * tensor_split[i] / split_sum);
+                plan.vram_expert_budget[i] = std::min((size_t)(vram_budget * split_for_gpu(i) / split_sum), vram_per_device[i]);
             }
         } else {
             // Equal split
             size_t per_dev = vram_budget / vram_per_device.size();
             for (size_t i = 0; i < vram_per_device.size(); ++i) {
-                plan.vram_expert_budget[i] = per_dev;
+                plan.vram_expert_budget[i] = std::min(per_dev, vram_per_device[i]);
             }
         }
     } else {
@@ -2356,8 +2522,163 @@ moe_placement_plan moe_solve_placement(
         }
     }
 
+    // ---- precise accounting (real tensor sizes) ----------------------------
+    if (loader != nullptr) {
+        plan.precise = true;
+        const int n_acc = (int) vram_per_device.size();
+        std::vector<float> share(n_acc, 0.0f);
+        {
+            float sum = 0;
+            for (int i = 0; i < n_acc; ++i) { share[i] = split_for_gpu(i); sum += share[i]; }
+            if (sum <= 0) { for (int i = 0; i < n_acc; ++i) share[i] = 1.0f / n_acc; }
+            else for (int i = 0; i < n_acc; ++i) share[i] /= sum;
+        }
+
+        // layer -> device, same rule as llama_model::load_tensors
+        std::vector<int> layer_dev(n_layer, 0);
+        {
+            std::vector<float> cum(n_acc, 0.0f);
+            float acc = 0;
+            for (int i = 0; i < n_acc; ++i) { acc += share[i]; cum[i] = acc; }
+            const int act = n_layer + 1;
+            for (int l = 0; l < n_layer; ++l) {
+                const float f = float(l) / act;
+                int d = (int) (std::upper_bound(cum.begin(), cum.end(), f) - cum.begin());
+                if (d >= n_acc) d = n_acc - 1;
+                layer_dev[l] = d;
+            }
+        }
+
+        plan.layer_expert_bytes.assign(n_layer, 0);
+        std::vector<size_t> nonexpert(n_acc, 0);
+        // The plan is computed in the loader constructor, before any tensor is
+        // mapped, so read the real sizes straight from the GGUF directory.
+        // loader->metadata can be a KV-only context on the no_alloc probe path,
+        // so open each shard header directly (header-only, cheap) and sum the
+        // real tensor sizes. Dedupe because fname may also appear in splits.
+        std::vector<std::string> shards;
+        for (const auto & f : loader->files) {
+            char pbuf[64];
+            snprintf(pbuf, sizeof(pbuf), "/proc/self/fd/%d", f->file_id());
+            shards.emplace_back(pbuf);
+        }
+        if (shards.empty() && loader->metadata != nullptr) {
+            shards.emplace_back(); // use metadata below
+        }
+        for (const auto & shard : shards) {
+            gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+            gguf_context * g = shard.empty()
+                             ? gguf_init_from_file("", gp) // never: guarded below
+                             : gguf_init_from_file(shard.c_str(), gp);
+            if (g == nullptr) continue;
+            const int64_t nt = gguf_get_n_tensors(g);
+            for (int64_t i = 0; i < nt; ++i) {
+                const char * tname = gguf_get_tensor_name(g, i);
+                if (tname == nullptr) continue;
+                const std::string name(tname);
+                const size_t nb = gguf_get_tensor_size(g, i);
+                int l = -1;
+                if (sscanf(name.c_str(), "blk.%d.", &l) != 1) l = -1;
+                if (name.find("_exps") != std::string::npos && l >= 0 && l < n_layer) {
+                    plan.layer_expert_bytes[l] += nb;
+                    continue;
+                }
+                // PLE is a per-layer embedding table that is either lazy-read
+                // or host-resident by design; it never belongs in a device
+                // budget. Counting it put 30 GiB on CUDA0 and zeroed its budget.
+                if (name.find("per_layer_token_embd") != std::string::npos) {
+                    continue;
+                }
+                const int d = (l >= 0 && l < n_layer) ? layer_dev[l] : 0;
+                nonexpert[d] += nb;
+            }
+            gguf_free(g);
+        }
+
+        size_t nonexpert_total = 0, expert_total = 0;
+        for (size_t v : nonexpert) nonexpert_total += v;
+        for (size_t v : plan.layer_expert_bytes) expert_total += v;
+        plan.total_expert_bytes = expert_total;
+        plan.expert_bytes_per_layer = n_layer > 0 ? expert_total / n_layer : 0;
+
+        // Envelope for everything that is not an expert weight: real non-expert
+        // bytes plus KV/compute/draft/mmproj and 512 MiB slack per device.
+        const size_t reserve_total = 13ull * 1024 * 1024 * 1024 + (size_t) n_acc * 512ull * 1024 * 1024;
+        const size_t committed_total = reserve_total > nonexpert_total
+                                     ? reserve_total - nonexpert_total
+                                     : 4ull * 1024 * 1024 * 1024;
+
+        plan.device_total     = vram_per_device;
+        plan.device_nonexpert.assign(n_acc, 0);
+        plan.device_committed.assign(n_acc, 0);
+        plan.device_budget.assign(n_acc, 0);
+        for (int i = 0; i < n_acc; ++i) {
+            plan.device_nonexpert[i] = nonexpert[i];
+            plan.device_committed[i] = (size_t) (committed_total * share[i]);
+            plan.device_budget[i] = vram_per_device[i] > (nonexpert[i] + plan.device_committed[i])
+                                  ? vram_per_device[i] - nonexpert[i] - plan.device_committed[i] : 0;
+        }
+
+        plan.layer_tier.assign(n_layer, 2);
+        size_t ram_used = 0;
+        fprintf(stderr, "MOEDIAG layer-solve: ram_budget=%.2f GiB dev_budgets=[", ram_budget / 1073741824.0);
+        for (size_t b : plan.device_budget) fprintf(stderr, "%.2f ", b / 1073741824.0);
+        fprintf(stderr, "]\n");
+        for (int l = 0; l < n_layer; ++l) {
+            const int d = layer_dev[l];
+            const size_t need = plan.layer_expert_bytes[l];
+            if (plan.device_budget[d] >= need) {
+                plan.layer_tier[l] = 0;
+                plan.device_budget[d] -= need;
+            } else if (ram_used + need <= ram_budget) {
+                plan.layer_tier[l] = 1;
+                ram_used += need;
+            }
+        }
+
+        plan.n_layers_vram = 0; plan.n_layers_ram = 0; plan.n_layers_disk = 0;
+        for (uint8_t t : plan.layer_tier) {
+            if (t == 0) plan.n_layers_vram++;
+            else if (t == 1) plan.n_layers_ram++;
+            else plan.n_layers_disk++;
+        }
+        plan.vram_expert_budget = plan.device_budget;
+        plan.ram_expert_budget = ram_budget;
+        plan.fits = (plan.n_layers_vram + plan.n_layers_ram + plan.n_layers_disk == n_layer);
+        if (!plan.fits) plan.error = moe_fmt("Cannot place %d layers", n_layer);
+
+        plan.report_lines.push_back(moe_fmt("MoE Placement Plan (precise, per-device):"));
+        for (int i = 0; i < n_acc; ++i) {
+            const double total = plan.device_total[i] / 1073741824.0;
+            const double ne    = plan.device_nonexpert[i] / 1073741824.0;
+            const double com   = plan.device_committed[i] / 1073741824.0;
+            const double bud   = (plan.device_total[i] > plan.device_nonexpert[i] + plan.device_committed[i])
+                               ? (plan.device_total[i] - plan.device_nonexpert[i] - plan.device_committed[i]) / 1073741824.0 : 0.0;
+            plan.report_lines.push_back(moe_fmt(
+                "  Device %d: total %.2f GiB | non-expert %.2f | kv+compute+draft+mmproj+reserve %.2f | expert budget %.2f GiB",
+                i, total, ne, com, bud));
+        }
+        plan.report_lines.push_back(moe_fmt("  Expert bytes: total %.2f GiB, avg/layer %.3f GiB",
+            expert_total / 1073741824.0, (n_layer ? (double) expert_total / n_layer : 0) / 1073741824.0));
+        plan.report_lines.push_back(moe_fmt("  Layers VRAM: %d, RAM: %d, DISK: %d",
+            plan.n_layers_vram, plan.n_layers_ram, plan.n_layers_disk));
+        plan.report_lines.push_back(moe_fmt("  Fits: %s", plan.fits ? "YES" : "NO"));
+        fprintf(stderr, "MOEDIAG precise: n_layer=%d n_acc=%d ne_total=%.2f GiB ex_total=%.2f GiB ex0=%.2f GiB vram=%d ram=%d disk=%d\n",
+                n_layer, n_acc, nonexpert_total/1073741824.0, expert_total/1073741824.0,
+                plan.layer_expert_bytes.empty()?0.0:plan.layer_expert_bytes[0]/1073741824.0,
+                plan.n_layers_vram, plan.n_layers_ram, plan.n_layers_disk);
+        for (int i = 0; i < n_acc; ++i) {
+            fprintf(stderr, "MOEDIAG dev%d total=%.2f ne=%.2f com=%.2f budget=%.2f\n", i,
+                plan.device_total[i]/1073741824.0, plan.device_nonexpert[i]/1073741824.0,
+                plan.device_committed[i]/1073741824.0,
+                (plan.device_total[i]>plan.device_nonexpert[i]+plan.device_committed[i])
+                  ?(plan.device_total[i]-plan.device_nonexpert[i]-plan.device_committed[i])/1073741824.0:0.0);
+        }
+        return plan;
+    }
+
     plan.ram_expert_budget = ram_budget;
-    plan.kv_compute_reserve.assign(vram_per_device.size(), 4ull * 1024 * 1024 * 1024);
+    plan.kv_compute_reserve.assign(vram_per_device.size(), non_expert_reserve);
 
     // Simple layer-granular placement: put as many layers in VRAM as fit
     size_t vram_for_experts = 0;
@@ -2421,16 +2742,17 @@ static bool moe_load_profile(const char * path, int n_layer, int n_expert, std::
     const int64_t ne = json_int("n_expert", -1);
     tokens = (uint64_t) std::max<int64_t>(0, json_int("tokens", 0));
     const size_t key = s.find("\"counts\"");
-    if (nl != n_layer || ne != n_expert || nl <= 0 || ne <= 0 || key == std::string::npos) {
+    // models with an MTP/nextn block have one more layer than the profile covers;
+    // accept a prefix profile and treat the missing tail layers as cold
+    if (nl > n_layer || ne != n_expert || nl <= 0 || ne <= 0 || key == std::string::npos) {
         LLAMA_LOG_WARN("MoE profile: dimension mismatch (expected %d layers, %d experts, got %ld, %ld)\n", n_layer, n_expert, (long)nl, (long)ne);
         return false;
-    }
-    const char * p = s.c_str() + key;
+    }    const char * p = s.c_str() + key;
     p = strchr(p, '[');
     if (!p) return false;
     ++p;
 
-    counts.assign((size_t) nl * (size_t) ne, 0);
+    counts.assign((size_t) n_layer * (size_t) ne, 0); // pad tail layers as cold
     int32_t row = 0;
     while (*p != 0) {
         while (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t' || *p == ',') ++p;
@@ -2500,6 +2822,9 @@ moe_placement_plan moe_solve_placement_expert_granular(
     if (!has_profile) {
         plan.profile_counts.assign((size_t) n_layer * (size_t) n_expert, 1);
     }
+    fprintf(stderr, "TRACE eg: has_profile=%d profile_counts=%zu total_expert_bytes=%zu vram_budget=%zu ram_budget=%zu\n",
+            (int) has_profile, plan.profile_counts.size(), plan.total_expert_bytes,
+            plan.vram_expert_budget.size(), plan.ram_expert_budget);
 
     // Compute expert bytes (per expert, per layer)
     size_t expert_bytes_per_expert = 0;
@@ -2521,6 +2846,7 @@ moe_placement_plan moe_solve_placement_expert_granular(
         uint32_t count;
     };
     std::vector<ExpertRank> all_experts;
+    fprintf(stderr, "TRACE eg2: n_layer=%d n_expert=%d pc=%zu\n", n_layer, n_expert, plan.profile_counts.size());
     all_experts.reserve((size_t) n_layer * (size_t) n_expert);
     for (int il = 0; il < n_layer; ++il) {
         for (int e = 0; e < n_expert; ++e) {
@@ -2531,12 +2857,14 @@ moe_placement_plan moe_solve_placement_expert_granular(
         [](const ExpertRank & a, const ExpertRank & b) {
             return a.count != b.count ? a.count > b.count : (a.layer != b.layer ? a.layer < b.layer : a.expert < b.expert);
         });
+    fprintf(stderr, "TRACE eg3: sorted=%zu top_count=%u\n", all_experts.size(), all_experts.empty()?0u:all_experts[0].count);
 
     // Assign experts to tiers based on budget
     plan.expert_tier.assign((size_t) n_layer * (size_t) n_expert, MOE_TIER_DISK);
     plan.expert_slot.assign((size_t) n_layer * (size_t) n_expert, -1);
     plan.tier_expert_counts.assign(3, 0);
     plan.tier_bytes_per_layer.assign(3, 0);
+    fprintf(stderr, "TRACE eg4: tier=%zu slot=%zu counts=%zu\n", plan.expert_tier.size(), plan.expert_slot.size(), plan.tier_expert_counts.size());
 
     size_t vram_used = 0;
     size_t ram_used = 0;
@@ -2572,6 +2900,7 @@ moe_placement_plan moe_solve_placement_expert_granular(
         }
     }
 
+    fprintf(stderr, "TRACE eg5: vram_used=%zu ram_used=%zu\n", vram_used, ram_used);
     // Recompute layer-granular counts from expert-granular assignment
     plan.n_layers_vram = 0;
     plan.n_layers_ram = 0;
@@ -2633,189 +2962,245 @@ static uint64_t moe_get_time_us() {
 // ============================================================================
 
 bool moe_ram_arena::init(size_t capacity_mib, const moe_placement_plan & plan, int n_layer, int n_expert, const char * model_path) {
-    (void)plan;
-    (void)n_layer;
-    (void)n_expert;
     capacity_bytes = capacity_mib * 1024 * 1024;
     used_bytes = 0;
+    slots.clear();
+    lru_list.clear();
+    combined_buffers.clear();
 
-    // Open model file for pread operations
+    // Open the GGUF file once. Every RAM-tier expert is served by pread() at
+    // its tensor offset; nothing is copied to a separate cache file and the
+    // model is not faulted in through mmap.
     model_fd = open(model_path, O_RDONLY);
     if (model_fd < 0) {
         LLAMA_LOG_ERROR("moe_ram_arena: failed to open model file '%s'\n", model_path);
         return false;
     }
 
-    // Count RAM-tier experts
+    // Count RAM-tier experts. The layer-granular solver fills layer_tier only;
+    // the expert-granular solver fills expert_tier. Fall back to layer_tier.
     size_t ram_expert_count = 0;
-    for (size_t i = 0; i < plan.expert_tier.size(); ++i) {
-        if (plan.expert_tier[i] == MOE_TIER_RAM) {
-            ram_expert_count++;
+    if (!plan.expert_tier.empty()) {
+        for (uint8_t t : plan.expert_tier) {
+            if (t == MOE_TIER_RAM) {
+                ram_expert_count++;
+            }
         }
-    }
-
-    slots.resize(ram_expert_count);
-    lru_list.reserve(ram_expert_count);
-
-    // Populate slots with expert metadata
-    size_t slot_idx = 0;
-    for (int l = 0; l < n_layer; ++l) {
-        for (int e = 0; e < n_expert; ++e) {
-            const size_t idx = (size_t) l * n_expert + e;
-            if (idx < plan.expert_tier.size() && plan.expert_tier[idx] == MOE_TIER_RAM) {
-                slots[slot_idx].layer = l;
-                slots[slot_idx].expert = e;
-                slots[slot_idx].size = plan.expert_bytes_per_layer / n_expert; // approximate
-                // file_offset will be filled in later when tensors are mapped
-                slot_idx++;
+    } else {
+        for (int l = 0; l < n_layer; ++l) {
+            if (l < (int) plan.layer_tier.size() && plan.layer_tier[l] == MOE_TIER_RAM) {
+                ram_expert_count += n_expert;
             }
         }
     }
 
-    // Start prefetch worker thread
-    shutdown = false;
-    prefetch_thread = std::thread([this]() {
-        while (!shutdown.load()) {
-            // Simple prefetch: check for pending requests
-            // In a real implementation, this would use a condition variable
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
-    });
+    // Slots are created by capture_expert_file_offset when the real tensor
+    // offsets and strides are known; reserve room for up to 3 tensors/expert.
+    slots.reserve(ram_expert_count * 3);
+    lru_list.reserve(ram_expert_count * 3);
 
-    LLAMA_LOG_INFO("MoE RAM arena: initialized %.2f MiB for %zu experts\n", capacity_bytes / 1024.0 / 1024.0, ram_expert_count);
+    LLAMA_LOG_INFO("MoE RAM arena: %.2f MiB cap, %zu RAM-tier experts (slots filled at load)\n",
+                   capacity_bytes / 1024.0 / 1024.0, ram_expert_count);
+
+    return true;
+}
+
+bool moe_ram_arena::init_sharded(size_t capacity_mib, const moe_placement_plan & plan, int n_layer, int n_expert, const std::vector<int> & shard_fds_in) {
+    // Sharded GGUF: keep the callers' file descriptors open (dup them so the
+    // arena owns its references) and record the source shard per expert slot.
+    capacity_bytes = capacity_mib * 1024 * 1024;
+    used_bytes = 0;
+    slots.clear();
+    lru_list.clear();
+    combined_buffers.clear();
+
+    for (int fd : shard_fds_in) {
+        if (fd < 0) {
+            LLAMA_LOG_ERROR("moe_ram_arena: invalid shard fd\n");
+            return false;
+        }
+        shard_fds.push_back(dup(fd));
+    }
+    if (shard_fds.empty()) {
+        LLAMA_LOG_ERROR("moe_ram_arena: no shard fds provided\n");
+        return false;
+    }
+    model_fd = shard_fds[0];
+
+    size_t ram_expert_count = 0;
+    if (!plan.expert_tier.empty()) {
+        for (uint8_t t : plan.expert_tier) {
+            if (t == MOE_TIER_RAM) {
+                ram_expert_count++;
+            }
+        }
+    } else {
+        for (int l = 0; l < n_layer; ++l) {
+            if (l < (int) plan.layer_tier.size() && plan.layer_tier[l] == MOE_TIER_RAM) {
+                ram_expert_count += n_expert;
+            }
+        }
+    }
+
+    slots.reserve(ram_expert_count * 3);
+    lru_list.reserve(ram_expert_count * 3);
+
+    LLAMA_LOG_INFO("MoE RAM arena: %.2f MiB cap, %zu RAM-tier experts, %zu shards (slots filled at load)\n",
+                   capacity_bytes / 1024.0 / 1024.0, ram_expert_count, shard_fds.size());
 
     return true;
 }
 
 void * moe_ram_arena::load_expert(int layer, int expert, const char * tensor_type) {
-    std::lock_guard<std::mutex> lock(mutex);
-
-    // Find the slot
-    for (size_t i = 0; i < slots.size(); ++i) {
-        if (slots[i].layer == layer && slots[i].expert == expert) {
-            // If tensor_type is specified, verify this slot matches
-            // For now, we load for all tensor types when any is requested
-            if (!slots[i].resident) {
-                // Need to load from disk for all tensor types
-                if (slots[i].file_offset == 0) {
-                    LLAMA_LOG_WARN("moe_ram_arena: expert L%d_E%d has no file offset\n", layer, expert);
-                }
-
-                // Make room if needed
-                if (used_bytes + slots[i].size > capacity_bytes) {
-                    evict_lru(slots[i].size);
-                }
-
-                // Allocate combined buffers for all tensor types if not already done
-                const char * tensor_types[] = {"gate", "up", "down", "gate_up"};
-                for (const char * tt : tensor_types) {
-                    auto key = std::make_pair(layer, std::string(tt));
-                    auto it = combined_buffers.find(key);
-                    if (it == combined_buffers.end()) {
-                        // Will be created when file offset is captured
-                    }
-                }
-
-                // Note: Actual loading happens in ensure_experts_loaded which loads per tensor type
-                // For single expert load, we just mark as resident
-                slots[i].resident = true;
-                used_bytes += slots[i].size;
-
-                LLAMA_LOG_DEBUG("moe_ram_arena: marked expert L%d_E%d as resident\n", layer, expert);
+    // Load every tensor type of (layer, expert) with a real pread into its
+    // combined buffer, then mark it resident. Used by the copy fallback path.
+    struct job { int fd; size_t offset; size_t size; uint8_t * dst; size_t slot_idx; };
+    std::vector<job> jobs;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        const uint64_t now = moe_get_time_us();
+        for (size_t si = 0; si < slots.size(); ++si) {
+            moe_ram_slot & sl = slots[si];
+            if (sl.layer != layer || sl.expert != expert || sl.resident) {
+                continue;
             }
-
-            // Update LRU
-            slots[i].last_access = moe_get_time_us();
-            auto it = std::find(lru_list.begin(), lru_list.end(), i);
-            if (it != lru_list.end()) {
-                lru_list.erase(it);
+            if (tensor_type != nullptr && sl.tensor_type != tensor_type) {
+                continue;
             }
-            lru_list.insert(lru_list.begin(), i);
-
-            // Return pointer to expert data in combined buffer for the requested tensor type
-            if (tensor_type) {
-                auto key = std::make_pair(layer, std::string(tensor_type));
-                auto it = combined_buffers.find(key);
-                if (it != combined_buffers.end()) {
-                    moe_combined_buffer & cb = it->second;
-                    if (expert < (int)cb.resident.size()) {
-                        cb.resident[expert] = true;
-                        return cb.buffer.data() + expert * cb.stride;
-                    }
-                }
+            auto it = combined_buffers.find(std::make_pair(layer, sl.tensor_type));
+            if (it == combined_buffers.end()) {
+                continue;
             }
-            return nullptr;
+            const int fd = (sl.shard_idx < shard_fds.size()) ? shard_fds[sl.shard_idx] : model_fd;
+            if (fd < 0 || sl.file_offset == 0) {
+                continue;
+            }
+            sl.last_access = now;
+            jobs.push_back({ fd, sl.file_offset, sl.size,
+                             it->second.buffer.data() + (size_t) expert * it->second.stride, si });
+            // mark resident optimistically
+            sl.resident = true;
+            it->second.resident[expert] = true;
         }
     }
-    return nullptr; // Not in RAM tier
+    for (auto & j : jobs) {
+        ssize_t got = pread(j.fd, j.dst, j.size, j.offset);
+        if (got != (ssize_t) j.size) {
+            LLAMA_LOG_ERROR("moe_ram_arena: pread failed for L%d_E%d: %zd of %zu\n",
+                            layer, expert, got, j.size);
+        }
+        posix_fadvise(j.fd, j.offset, j.size, POSIX_FADV_DONTNEED);
+    }
+    // resolve the representative pointer (first tensor type that has a buffer)
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        for (size_t si = 0; si < slots.size(); ++si) {
+            if (slots[si].layer == layer && slots[si].expert == expert) {
+                auto it = combined_buffers.find(std::make_pair(layer, slots[si].tensor_type));
+                if (it != combined_buffers.end()) {
+                    return it->second.buffer.data() + (size_t) expert * it->second.stride;
+                }
+            }
+        }
+    }
+    return nullptr;
 }
 
 bool moe_ram_arena::ensure_experts_loaded(int layer, const char * tensor_type, const int * expert_ids, int n_experts) {
-    std::lock_guard<std::mutex> lock(mutex);
-
-    auto key = std::make_pair(layer, std::string(tensor_type));
-    auto it = combined_buffers.find(key);
-    if (it == combined_buffers.end()) {
-        LLAMA_LOG_DEBUG("moe_ram_arena: no combined buffer for layer %d tensor %s\n", layer, tensor_type);
-        return false; // Not a RAM-tier tensor
-    }
-
-    moe_combined_buffer & cb = it->second;
-    bool any_loaded = false;
-
-    for (int i = 0; i < n_experts; ++i) {
-        int expert = expert_ids[i];
-        if (expert < 0 || expert >= (int)cb.resident.size()) {
-            continue;
+    // Collect the experts that need a pread, then serve them with parallel preads:
+    // one serial pread per expert made decode wait ~1.4 s per ubatch on NVMe models.
+    struct job {
+        int fd;
+        size_t offset;
+        size_t size;
+        uint8_t * dst;
+        size_t slot_idx;
+        int expert;
+    };
+    std::vector<job> jobs;
+    auto key = std::make_pair(layer, std::string(tensor_type ? tensor_type : ""));
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = combined_buffers.find(key);
+        if (it == combined_buffers.end()) {
+            return false; // Not a RAM-tier (or arena-backed) tensor
         }
-
-        if (!cb.resident[expert]) {
-            // Find the slot for this expert
+        moe_combined_buffer & cb = it->second;
+        const uint64_t now = moe_get_time_us();
+        cb.last_access = now;
+        for (int i = 0; i < n_experts; ++i) {
+            const int expert = expert_ids[i];
+            if (expert < 0 || expert >= (int) cb.resident.size() || cb.resident[expert]) {
+                continue;
+            }
             for (size_t si = 0; si < slots.size(); ++si) {
-                if (slots[si].layer == layer && slots[si].expert == expert) {
-                    if (slots[si].file_offset == 0) {
+                moe_ram_slot & sl = slots[si];
+                if (sl.layer == layer && sl.expert == expert && sl.tensor_type == tensor_type) {
+                    if (sl.file_offset == 0) {
                         LLAMA_LOG_WARN("moe_ram_arena: expert L%d_E%d has no file offset\n", layer, expert);
-                        continue;
+                        break;
                     }
-
-                    // Make room if needed
-                    if (used_bytes + slots[si].size > capacity_bytes) {
-                        evict_lru(slots[si].size);
+                    const int fd = (sl.shard_idx < shard_fds.size()) ? shard_fds[sl.shard_idx] : model_fd;
+                    if (fd < 0) {
+                        break;
                     }
-
-                    // Load from file using pread into combined buffer
-                    ssize_t bytes_read = pread(model_fd, cb.buffer.data() + expert * cb.stride, slots[si].size, slots[si].file_offset);
-                    if (bytes_read != (ssize_t)slots[si].size) {
-                        LLAMA_LOG_ERROR("moe_ram_arena: pread failed for expert L%d_E%d tensor %s: read %zd of %zu bytes\n", layer, expert, tensor_type, bytes_read, slots[si].size);
-                        continue;
-                    }
-
-                    cb.resident[expert] = true;
-                    slots[si].resident = true;
-                    used_bytes += slots[si].size;
-                    any_loaded = true;
-
-                    LLAMA_LOG_DEBUG("moe_ram_arena: loaded expert L%d_E%d tensor %s from offset %zu (%zu bytes)\n", layer, expert, tensor_type, slots[si].file_offset, slots[si].size);
+                    sl.last_access = now;
+                    jobs.push_back({ fd, sl.file_offset, sl.size,
+                                     cb.buffer.data() + (size_t) expert * cb.stride, si, expert });
+                    break;
                 }
-            }
-        }
-
-        // Update LRU for this slot
-        for (size_t si = 0; si < slots.size(); ++si) {
-            if (slots[si].layer == layer && slots[si].expert == expert) {
-                slots[si].last_access = moe_get_time_us();
-                auto it = std::find(lru_list.begin(), lru_list.end(), si);
-                if (it != lru_list.end()) {
-                    lru_list.erase(it);
-                }
-                lru_list.insert(lru_list.begin(), si);
-                break;
             }
         }
     }
+    if (jobs.empty()) {
+        return false;
+    }
 
-    cb.last_access = moe_get_time_us();
-    return any_loaded;
+    // pread(2) is positional and thread-safe on the shared fds; each job writes a
+    // disjoint slice of the combined buffer, so no lock is needed in the workers
+    const int n_workers = (int) std::min<size_t>(jobs.size(),
+            (size_t) std::max(1u, std::thread::hardware_concurrency() / 2));
+    std::atomic<size_t> next(0);
+    auto worker = [&]() {
+        for (;;) {
+            const size_t k = next.fetch_add(1);
+            if (k >= jobs.size()) {
+                return;
+            }
+            job & j = jobs[k];
+            ssize_t got = pread(j.fd, j.dst, j.size, j.offset);
+            if (got != (ssize_t) j.size) {
+                LLAMA_LOG_ERROR("moe_ram_arena: pread failed for L%d %s: %zd of %zu\n",
+                                layer, tensor_type, got, j.size);
+            }
+            posix_fadvise(j.fd, j.offset, j.size, POSIX_FADV_DONTNEED);
+        }
+    };
+    if (n_workers <= 1) {
+        worker();
+    } else {
+        std::vector<std::thread> pool;
+        for (int t = 1; t < n_workers; ++t) {
+            pool.emplace_back(worker);
+        }
+        worker();
+        for (auto & th : pool) {
+            th.join();
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = combined_buffers.find(key);
+        if (it == combined_buffers.end()) {
+            return false;
+        }
+        for (auto & j : jobs) {
+            it->second.resident[j.expert] = true;
+            slots[j.slot_idx].resident = true;
+        }
+    }
+    return true;
 }
 
 void * moe_ram_arena::get_combined_buffer(int layer, const char * tensor_type) {
@@ -2843,29 +3228,32 @@ void moe_ram_arena::prefetch_expert(int layer, int expert, const char * tensor_t
 
 void moe_ram_arena::evict_lru(size_t need_bytes) {
     std::lock_guard<std::mutex> lock(mutex);
-
-    while (used_bytes + need_bytes > capacity_bytes && !lru_list.empty()) {
-        size_t idx = lru_list.back();
-        if (idx < slots.size() && slots[idx].resident) {
-            // Advise kernel to drop pages for this file range
-            if (model_fd >= 0 && slots[idx].file_offset > 0) {
-                posix_fadvise(model_fd, slots[idx].file_offset, slots[idx].size, POSIX_FADV_DONTNEED);
+    while (used_bytes + need_bytes > capacity_bytes) {
+        // find the least recently touched resident slot; eviction is bookkeeping
+        // only (mark non-resident, fadvise DONTNEED) since combined buffers are
+        // allocated once and never resized
+        ssize_t best = -1;
+        uint64_t best_t = UINT64_MAX;
+        for (size_t i = 0; i < slots.size(); ++i) {
+            if (slots[i].resident && slots[i].last_access < best_t) {
+                best_t = slots[i].last_access;
+                best = (ssize_t) i;
             }
-
-            // Mark as non-resident in all combined buffers
-            int layer = slots[idx].layer;
-            int expert = slots[idx].expert;
-            for (auto & [key, cb] : combined_buffers) {
-                if (cb.layer == layer && expert < (int)cb.resident.size()) {
-                    cb.resident[expert] = false;
-                }
-            }
-
-            slots[idx].resident = false;
-            used_bytes -= slots[idx].size;
-            LLAMA_LOG_DEBUG("moe_ram_arena: evicted expert L%d_E%d (%zu bytes)\n", slots[idx].layer, slots[idx].expert, slots[idx].size);
         }
-        lru_list.pop_back();
+        if (best < 0) {
+            break;
+        }
+        moe_ram_slot & sl = slots[best];
+        const int fd = (sl.shard_idx < shard_fds.size()) ? shard_fds[sl.shard_idx] : model_fd;
+        if (fd >= 0) {
+            posix_fadvise(fd, sl.file_offset, sl.size, POSIX_FADV_DONTNEED);
+        }
+        auto it = combined_buffers.find(std::make_pair(sl.layer, sl.tensor_type));
+        if (it != combined_buffers.end() && sl.expert >= 0 &&
+            sl.expert < (int) it->second.resident.size()) {
+            it->second.resident[sl.expert] = false;
+        }
+        sl.resident = false;
     }
 }
 
@@ -2879,6 +3267,12 @@ void moe_ram_arena::shutdown_worker() {
 moe_ram_arena::~moe_ram_arena() {
     shutdown_worker();
     // Free any remaining resident experts - combined buffers are auto-freed by vector destructor
+    for (int fd : shard_fds) {
+        if (fd >= 0) {
+            close(fd);
+        }
+    }
+    shard_fds.clear();
     if (model_fd >= 0) {
         close(model_fd);
         model_fd = -1;
@@ -2886,7 +3280,7 @@ moe_ram_arena::~moe_ram_arena() {
 }
 
 // Capture file offset for RAM-tier expert tensor and create combined buffers
-void llama_model_loader::capture_expert_file_offset(const char * tensor_name, size_t file_offset, size_t tensor_size, struct ggml_tensor * cur) {
+void llama_model_loader::capture_expert_file_offset(const char * tensor_name, size_t file_offset, size_t tensor_size, struct ggml_tensor * cur, uint16_t shard_idx) {
     if (!moe_plan || !moe_arena) {
         return; // MoE placement not enabled
     }
@@ -2894,85 +3288,116 @@ void llama_model_loader::capture_expert_file_offset(const char * tensor_name, si
     const auto & plan = *moe_plan;
     auto & arena = *moe_arena;
 
-    // Parse tensor name: blk.L.ffn_{gate,up,down}_exps.weight (combined tensor with all experts)
+    // Parse tensor name: blk.L.ffn_{gate,up,down}_exps.weight (one tensor holds
+    // all experts; expert e lives at file_offset + e*nb[2]).
     int layer = -1;
     char ffn_type[32];
-
-    // Match pattern: blk.%d.ffn_%[^_]_exps.weight
-    int matched = sscanf(tensor_name, "blk.%d.ffn_%31[^_]_exps.weight", &layer, ffn_type);
-    if (matched != 2) {
-        return; // Not an expert tensor
+    if (sscanf(tensor_name, "blk.%d.ffn_%31[^_]_exps.weight", &layer, ffn_type) != 2 || layer < 0) {
+        return;
     }
-
-    if (layer < 0) {
+    if (!cur || cur->ne[2] != (int64_t) plan.n_expert) {
         return;
     }
 
-    if (layer >= plan.n_layer) {
-        return;
-    }
-
-    // Map tensor type name
     std::string tensor_type;
-    if (strcmp(ffn_type, "gate") == 0) tensor_type = "gate";
-    else if (strcmp(ffn_type, "up") == 0) tensor_type = "up";
-    else if (strcmp(ffn_type, "down") == 0) tensor_type = "down";
+    if      (strcmp(ffn_type, "gate")    == 0) tensor_type = "gate";
+    else if (strcmp(ffn_type, "up")      == 0) tensor_type = "up";
+    else if (strcmp(ffn_type, "down")    == 0) tensor_type = "down";
     else if (strcmp(ffn_type, "gate_up") == 0) tensor_type = "gate_up";
-    else {
-        LLAMA_LOG_WARN("moe_ram_arena: unknown tensor type '%s' in '%s'\n", ffn_type, tensor_name);
-        return;
-    }
+    else return;
 
-    // Get tensor dimensions for per-expert offset calculation
-    // Expert tensors are 3D: [ne[0], ne[1], n_expert] where n_expert = ne[2]
-    if (!cur || cur->ne[2] != plan.n_expert) {
-        LLAMA_LOG_WARN("moe_ram_arena: expert tensor '%s' has unexpected dimensions (ne[2]=%d, expected %d)\n", tensor_name, cur ? (int)cur->ne[2] : -1, plan.n_expert);
-        return;
-    }
-
-    // Calculate per-expert size and stride
-    const size_t per_expert_size = tensor_size / plan.n_expert;
-    const size_t stride = cur->nb[2];
-
-    std::lock_guard<std::mutex> lock(arena.mutex);
-
-    // Create or get combined buffer for this layer and tensor type
-    auto key = std::make_pair(layer, tensor_type);
-    auto & cb = arena.combined_buffers[key];
-    cb.layer = layer;
-    cb.tensor_type = tensor_type;
-    cb.expert_size = per_expert_size;
-    cb.stride = stride;
-    cb.buffer.resize(plan.n_expert * stride);
-    cb.resident.assign(plan.n_expert, false);
-
-    // Populate slots for all experts in this tensor that are in RAM tier
-    for (int e = 0; e < plan.n_expert; ++e) {
-        const size_t idx = (size_t) layer * plan.n_expert + e;
-        if (idx >= plan.expert_tier.size()) {
-            continue;
-        }
-
-        // Check if this expert is in RAM tier
-        if (plan.expert_tier[idx] != MOE_TIER_RAM) {
-            continue;
-        }
-
-        // Find the corresponding slot in the arena
-        for (size_t i = 0; i < arena.slots.size(); ++i) {
-            if (arena.slots[i].layer == layer && arena.slots[i].expert == e) {
-                // Calculate offset for this expert within the combined tensor
-                arena.slots[i].file_offset = file_offset + e * per_expert_size;
-                arena.slots[i].size = per_expert_size;
-                // data pointer will point into combined buffer when loaded
+    // Only RAM-tier layers get a host arena buffer. VRAM-tier experts are
+    // resident on the device; DISK-tier experts are pread'd on demand.
+    bool is_ram = false;
+    if (!plan.expert_tier.empty()) {
+        for (int e = 0; e < plan.n_expert; ++e) {
+            const size_t idx = (size_t) layer * plan.n_expert + e;
+            if (idx < plan.expert_tier.size() && plan.expert_tier[idx] == MOE_TIER_RAM) {
+                is_ram = true;
                 break;
             }
         }
+    } else {
+        is_ram = layer < (int) plan.layer_tier.size() && plan.layer_tier[layer] == MOE_TIER_RAM;
+    }
+    if (!is_ram) {
+        // DISK-tier: record the offset metadata so fills can be pread directly
+        // into pinned staging instead of faulting through the mmap view
+        std::lock_guard<std::mutex> lock(arena.mutex);
+        auto & dm = arena.disk_meta[std::make_pair(layer, tensor_type)];
+        dm.base_offset = file_offset;
+        dm.stride      = cur->nb[2];
+        dm.shard_idx   = shard_idx;
+        return;
     }
 
-    // Point the model tensor's data to the combined buffer
-    // This allows moe_cache to read directly from the combined buffer
-    cur->data = cb.buffer.data();
+    const size_t stride = cur->nb[2];
+    const size_t per_expert = tensor_size / (size_t) plan.n_expert;
+    if (per_expert != stride) {
+        LLAMA_LOG_WARN("moe_ram_arena: %s: per-expert %zu != stride %zu\n", tensor_name, per_expert, stride);
+    }
+
+    std::lock_guard<std::mutex> lock(arena.mutex);
+
+    auto key = std::make_pair(layer, tensor_type);
+    auto it = arena.combined_buffers.find(key);
+    if (it == arena.combined_buffers.end()) {
+        const size_t need = stride * (size_t) plan.n_expert;
+        if (arena.used_bytes + need > arena.capacity_bytes) {
+            LLAMA_LOG_WARN("moe_ram_arena: %s needs %.2f MiB, arena full (%.2f/%.2f MiB), skipped\n",
+                tensor_name, need/1048576.0, arena.used_bytes/1048576.0, arena.capacity_bytes/1048576.0);
+            return;
+        }
+        arena.used_bytes += need;
+        auto & cb = arena.combined_buffers[key];
+        cb.layer        = layer;
+        cb.tensor_type  = tensor_type;
+        cb.expert_size  = stride;
+        cb.stride       = stride;
+        cb.buffer.reserve(need); // lazy: pages are touched only when pread fills them; eager resize zero-fills 16 GiB at load and OOMs the host
+        cb.resident.assign((size_t) plan.n_expert, false);
+        it = arena.combined_buffers.find(key);
+    }
+
+    moe_combined_buffer & cb = it->second;
+    for (int e = 0; e < plan.n_expert; ++e) {
+        moe_ram_slot slot;
+        slot.layer       = layer;
+        slot.expert      = e;
+        slot.tensor_type = tensor_type;
+        slot.file_offset = file_offset + (size_t) e * stride;
+        slot.shard_idx   = shard_idx;
+        slot.size        = stride;
+        slot.data        = cb.buffer.data() + (size_t) e * stride;
+        slot.resident    = false;
+        arena.slots.push_back(slot);
+    }
+
+    LLAMA_LOG_INFO("moe_ram_arena: L%d %s %zu experts, %.2f MiB, file offset %zu\n",
+        layer, tensor_type.c_str(), (size_t) plan.n_expert, (double)(stride * plan.n_expert)/1048576.0, file_offset);
+}
+
+size_t moe_ram_arena::read_expert_direct(int layer, const char * tensor_type, int expert, void * dst) {
+    // DISK-tier experts have no arena buffer; read straight from the GGUF shard.
+    // Read-only map access + positional pread are thread-safe: no lock in the hot
+    // path, so fill workers can stream disk experts in parallel.
+    auto key = std::make_pair(layer, std::string(tensor_type ? tensor_type : ""));
+    auto it = disk_meta.find(key);
+    if (it == disk_meta.end() || expert < 0) {
+        return 0;
+    }
+    const moe_disk_tensor & dm = it->second;
+    const int fd = (dm.shard_idx < shard_fds.size()) ? shard_fds[dm.shard_idx] : model_fd;
+    if (fd < 0) {
+        return 0;
+    }
+    const size_t off = dm.base_offset + (size_t) expert * dm.stride;
+    ssize_t got = pread(fd, dst, dm.stride, off);
+    if (got != (ssize_t) dm.stride) {
+        return 0;
+    }
+    posix_fadvise(fd, off, dm.stride, POSIX_FADV_DONTNEED);
+    return (size_t) got;
 }
 
 std::string llama_model_loader::ftype_name() const {

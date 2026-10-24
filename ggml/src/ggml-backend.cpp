@@ -3872,6 +3872,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     ggml_backend_synchronize(split_backend);
                 }
 
+                // host-resident weights may be handled by the copy callback (e.g. the MoE
+                // cache slot maps, whose contents are updated before the split runs)
+                if (sched->callback_copy != NULL &&
+                        input->buffer != NULL &&
+                        ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                        ggml_backend_buffer_is_host(input->buffer) &&
+                        sched->callback_copy(split_backend, input, input_cpy, &split->graph, sched->callback_copy_user_data)) {
+                    continue;
+                }
+
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
                 ggml_tensor * node = split->graph.nodes[0];
                 if (split->graph.n_nodes > 0 &&
@@ -4737,6 +4747,21 @@ ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
     return sched->backends[backend_index];
 }
 
+
+const ggml_tensor * ggml_backend_sched_copy_source(ggml_backend_sched_t sched, const ggml_tensor * copy) {
+    GGML_ASSERT(sched);
+    // find the split input whose current copy slot holds `copy`; the original tensor holds
+    // the valid data even before the copy has been enqueued for this ubatch
+    for (int i = 0; i < sched->n_splits; ++i) {
+        struct ggml_backend_sched_split * split = &sched->splits[i];
+        for (int j = 0; j < split->n_inputs; ++j) {
+            if (tensor_copy(split->inputs[j], split->backend_id, sched->cur_copy) == copy) {
+                return split->inputs[j];
+            }
+        }
+    }
+    return NULL;
+}
 // utils
 
 bool ggml_op_alloc_size_may_expand(enum ggml_op op) {

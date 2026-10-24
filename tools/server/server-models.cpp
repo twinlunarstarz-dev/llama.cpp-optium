@@ -348,6 +348,19 @@ struct server_lru_sched {
         return true;
     }
 
+    // true if this model is at the head of the queue but device memory refuses it
+    bool vram_blocked_at_head(std::unique_lock<std::mutex> & lk, const std::string & model_id) {
+        check_lock(lk);
+        return !queue.empty() && queue.front().model_id == model_id
+            && !queue.front().loading
+            && !models.vram_fits_locked(model_id);
+    }
+
+    size_t running(std::unique_lock<std::mutex> & lk) {
+        check_lock(lk);
+        return count_running();
+    }
+
     // on failure the entry is back in line; on success it stays until its waiters leave,
     // so the model coming up is never picked as a victim before they use it
     void claim_done(std::unique_lock<std::mutex> & lk, const std::string & model_id, bool ok) {
@@ -1601,8 +1614,12 @@ server_models::vram_entry server_models::vram_estimate(server_model_meta & meta,
             }
         }
 
+        // split-mode layer with multiple devices: the probe's compute estimate
+        // explodes (MoE expert weights copied to the main GPU in FP16); cap it.
+        const std::string sm = opt(nullptr, "split-mode");
+        const bool cap_compute = (sm.empty() || sm == "layer") && devs.size() > 1;
         std::string err;
-        const auto probed = server_vram_probe(probe_exe, args, err);
+        const auto probed = server_vram_probe(probe_exe, args, err, cap_compute);
         if (probed.empty()) {
             SRV_WRN("vram: could not measure name=%s (%s), falling back to a size estimate\n",
                     meta.name.c_str(), err.c_str());
@@ -1841,6 +1858,24 @@ bool server_models::vram_fits_locked(const std::string & name) {
         }
     }
     return true;
+}
+
+std::string server_models::vram_refusal_message_locked(const std::string & name) {
+    const auto fp   = vram_cached_for_locked(name);
+    const auto free = vram_effective_free_locked(name);
+    std::string detail;
+    for (size_t i = 0; i < fp.size() && i < free.size(); i++) {
+        if (fp[i] > free[i]) {
+            detail += string_format(" CUDA%zu needs %zu MiB but %zu MiB is free;",
+                                    i, fp[i] / VRAM_MIB, free[i] / VRAM_MIB);
+        }
+    }
+    if (detail.empty()) {
+        detail = " device memory is occupied;";
+    }
+    return string_format("model '%s' does not fit in device memory:%s lower its ctx-size, "
+                         "ubatch-size or tensor-split in the preset, or unload another model",
+                         name.c_str(), detail.c_str());
 }
 
 void server_models::vram_reserve_locked(const std::string & name) {
@@ -2481,6 +2516,7 @@ bool server_models::ensure_model_ready(const std::string & name, const std::func
 
     try {
         bool saw_loading = false;
+        int64_t vram_blocked_since = 0;
         while (true) {
             auto it = mapping.find(name);
             if (it == mapping.end()) {
@@ -2544,6 +2580,24 @@ bool server_models::ensure_model_ready(const std::string & name, const std::func
                 sched->claim_done(lk, name, ok);
                 sched->tick(lk);
                 continue;
+            }
+
+            // a model that device memory refuses can never be admitted: report it with
+            // numbers instead of waiting forever and blocking every request behind it
+            if (status == SERVER_MODEL_STATUS_UNLOADED && sched->vram_blocked_at_head(lk, name)) {
+                if (vram_blocked_since == 0) {
+                    vram_blocked_since = ggml_time_ms();
+                    SRV_WRN("model name=%s does not fit in device memory: %s\n",
+                            name.c_str(), vram_refusal_message_locked(name).c_str());
+                }
+                // with nothing running no eviction can ever free room for it
+                const bool hopeless = sched->running(lk) == 0;
+                const bool expired  = ggml_time_ms() - vram_blocked_since > 120000;
+                if (hopeless || expired) {
+                    throw std::runtime_error(vram_refusal_message_locked(name));
+                }
+            } else {
+                vram_blocked_since = 0;
             }
 
             cv.wait_for(lk, std::chrono::milliseconds(200));

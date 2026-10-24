@@ -147,6 +147,15 @@ void ggml_cuda_mul_mat_q(
 
     GGML_TENSOR_BINARY_OP_LOCALS;
 
+    if (getenv("GGML_CUDA_TRACE_MMQ")) {
+        fprintf(stderr, "MMQTRACE name=%s type=%d ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] nbytes=%zu ids=%s src1ne=[%lld,%lld] dstne=[%lld,%lld]\n",
+                src0->name, (int) src0->type,
+                (long long) ne00, (long long) ne01, (long long) ne02, (long long) ne03,
+                nb00, nb01, nb02, nb03, ggml_nbytes(src0),
+                ids ? ids->name : "-", (long long) ne10, (long long) ne11, (long long) ne0, (long long) ne1);
+        fflush(stderr);
+    }
+
     cudaStream_t stream = ctx.stream();
 
     const int    id    = ggml_cuda_get_device();
@@ -296,6 +305,12 @@ void ggml_cuda_mul_mat_q(
     // gate/up activations are broadcast across experts (ne11 == 1): quantize each token once and
     // scatter to its slots. ids_src1 then holds the inverse map (token slot -> compact row).
     const bool dedup_bcast = ne11 == 1 && n_expert_used > 1;
+
+    if (dedup_bcast) {
+        // The inverse map is only written for (token, slot) pairs whose expert exists.
+        // Zero it first so any unwritten slot cannot scatter to a garbage row.
+        CUDA_CHECK(cudaMemsetAsync(ids_src1.get(), 0, (size_t) ne_get_rows * sizeof(int32_t), stream));
+    }
 
     {
         GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));

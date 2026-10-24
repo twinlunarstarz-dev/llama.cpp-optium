@@ -205,21 +205,21 @@ static __device__ float q1_t_g128_lloyd_scale_dev(const float * __restrict__ x, 
         float s1 = 0.0f; int sw = 0;
         for (int j = 0; j < qk; j++) {
             const float w = fabsf(x[j]);
-            if (w > th) { s1 += w; sw++; }
+            if (w > th) { s1 = __fadd_rn(s1, w); sw++; } // IEEE add for CPU parity
         }
-        float a = sw > 0 ? s1/sw : 0.0f;
+        float a = sw > 0 ? __fdiv_rn(s1, (float)sw) : 0.0f;
         for (int it = 0; it < 8 && a > 0.0f; it++) {
             th = 0.5f * a;
             s1 = 0.0f; sw = 0;
             for (int j = 0; j < qk; j++) {
                 const float w = fabsf(x[j]);
-                if (w > th) { s1 += w; sw++; }
+                if (w > th) { s1 = __fadd_rn(s1, w); sw++; } // IEEE add for CPU parity
             }
-            const float na = sw > 0 ? s1/sw : 0.0f;
+            const float na = sw > 0 ? __fdiv_rn(s1, (float)sw) : 0.0f;
             if (fabsf(na - a) <= 1e-6f * fmaxf(na, a)) { a = na; break; }
             a = na;
         }
-        const float obj = sw > 0 ? s1*s1/(float)sw : 0.0f;
+        const float obj = sw > 0 ? __fdiv_rn(__fmul_rn(s1, s1), (float)sw) : 0.0f;
         if (obj > best_obj) { best_obj = obj; best_a = a; }
     }
     return best_a > 0.0f ? best_a : mean;
@@ -230,15 +230,18 @@ static __device__ void quantize_f32_q1_t_g128_block_t(const float * __restrict__
     float sum_abs = 0.0f;
 #pragma unroll
     for (int j = 0; j < QK1_T_g128; ++j) {
-        sum_abs += fabsf(x[j]);
+        // IEEE add (add.rn.f32): -use_fast_math would reassociate this chain,
+        // breaking bit parity with the CPU's sequential summation.
+        sum_abs = __fadd_rn(sum_abs, fabsf(x[j]));
     }
-    float d = sum_abs / QK1_T_g128;
+    // IEEE divide (div.rn.f32): fast-math substitutes an approximate divide here.
+    float d = __fdiv_rn(sum_abs, (float)QK1_T_g128);
     if (lloyd) {
         d = q1_t_g128_lloyd_scale_dev(x, QK1_T_g128, d);
     }
     y->d = __float2half(d);
     const float dq = __half2float(y->d);
-    const float id = dq > 0.0f ? 1.0f/dq : 0.0f;
+    const float id = dq > 0.0f ? __frcp_rn(dq) : 0.0f; // IEEE-rounded reciprocal (fast-math rcp.approx is ~2ulp off vs CPU division)
 
 #pragma unroll
     for (int b = 0; b < 26; ++b) {

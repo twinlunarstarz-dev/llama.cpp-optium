@@ -221,9 +221,14 @@ void server_vram::refresh(int64_t max_age_ms) {
 // probe
 //
 
+// cap for the compute column under split-mode layer with multiple devices
+// (see server_vram_probe declaration in server-vram.h)
+static const long long VRAM_PROBE_COMPUTE_CAP_MIB = 4096;
+
 std::vector<size_t> server_vram_probe(const std::string & exe,
                                       const std::vector<std::string> & args,
-                                      std::string & err) {
+                                      std::string & err,
+                                      bool cap_compute_layer_split) {
 #if defined(_WIN32)
     (void) exe; (void) args;
     err = "probing is not supported on this build";
@@ -334,6 +339,9 @@ std::vector<size_t> server_vram_probe(const std::string & exe,
         }
         if (got < 3) {
             continue;
+        }
+        if (cap_compute_layer_split && v[2] > VRAM_PROBE_COMPUTE_CAP_MIB) {
+            v[2] = VRAM_PROBE_COMPUTE_CAP_MIB;
         }
         const size_t bytes = (size_t) (v[0] + v[1] + v[2]) * MIB;
         // llama-fit-params prints its own device numbering, starting at CUDA0 for

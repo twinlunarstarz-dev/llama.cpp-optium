@@ -11,6 +11,7 @@
 
 #include <cstddef>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -101,7 +102,10 @@ struct llama_model_loader {
 
         // decide whether this tensor is read lazily
         // pass w to also record it, or nullptr to only ask
-        bool add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w);
+        // force: bypass the lazy-mode and size thresholds; used for MoE expert
+        // tensors under tiered placement (RAM arena or mmap page cache serves
+        // them on demand, so they must never be eagerly loaded into host RAM)
+        bool add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w, bool force = false);
 
         bool any() const {
             return !ranges.empty();
@@ -136,9 +140,9 @@ struct llama_model_loader {
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
     const llama_model_tensor_buft_override * tensor_buft_overrides;
     std::vector<llama_model_tensor_buft_override> moe_overrides_owned;
-    std::vector<std::string> moe_pattern_strings;
+    std::deque<std::string> moe_pattern_strings; // stable refs: overrides store raw c_str()
     std::unique_ptr<moe_placement_plan> moe_plan;
-    std::unique_ptr<moe_ram_arena> moe_arena;
+    moe_ram_arena * moe_arena = nullptr; // owned by g_moe_ram_arena
 
     gguf_context_ptr metadata_ptr;
     struct gguf_context * metadata; // either metadata_ptr.get() or externally set
@@ -185,7 +189,7 @@ struct llama_model_loader {
     ggml_backend_buffer_type_t first_moved_to_buft = nullptr;
 
     // Capture file offset for RAM-tier expert tensor
-    void capture_expert_file_offset(const char * tensor_name, size_t file_offset, size_t tensor_size, struct ggml_tensor * cur);
+    void capture_expert_file_offset(const char * tensor_name, size_t file_offset, size_t tensor_size, struct ggml_tensor * cur, uint16_t shard_idx = 0);
 
     llama_model_loader(
         struct gguf_context * metadata,
@@ -315,6 +319,18 @@ struct moe_placement_plan {
     bool fits = false;
     std::string error;
 
+    // Phase 1b: precise per-layer / per-device accounting (filled when the
+    // solver runs with a model loader, i.e. it can read real tensor sizes).
+    // layer_tier[l] = 0 VRAM, 1 RAM, 2 DISK. Placement is non-contiguous
+    // because every expert layer must stay on its attention layer's device.
+    std::vector<uint8_t> layer_tier;
+    std::vector<size_t>  layer_expert_bytes;
+    std::vector<size_t>  device_total;      // total VRAM per accelerator
+    std::vector<size_t>  device_nonexpert;  // real non-expert weight bytes
+    std::vector<size_t>  device_committed;  // kv + compute + draft + mmproj + reserve
+    std::vector<size_t>  device_budget;     // leftover for experts
+    bool precise = false;
+
     // Phase 2: expert-granular placement
     // expert_tier[layer * n_expert + expert] = tier (0=VRAM, 1=RAM, 2=DISK)
     std::vector<uint8_t> expert_tier;
@@ -340,7 +356,8 @@ moe_placement_plan moe_solve_placement(
         bool moe_pin_decode,
         int n_layer,
         int n_expert,
-        int n_expert_used);
+        int n_expert_used,
+        llama_model_loader * loader = nullptr);
 
 // Phase 2: expert-granular solver with profile
 moe_placement_plan moe_solve_placement_expert_granular(
@@ -376,8 +393,10 @@ std::vector<llama_model_tensor_buft_override> moe_plan_to_overrides_expert_granu
 struct moe_ram_slot {
     int layer = -1;
     int expert = -1;
+    std::string tensor_type;     // "gate", "up", "down", "gate_up"
     size_t file_offset = 0;      // Offset in GGUF file for this expert's tensor data
     size_t size = 0;             // Size of expert tensor data in bytes
+    uint16_t shard_idx = 0;      // Source GGUF shard (index into shard_fds)
     // data pointer now points into the combined buffer (set when resident)
     void * data = nullptr;       // Pointer to data in arena (when resident)
     uint64_t last_access = 0;    // For LRU eviction
@@ -398,6 +417,12 @@ struct moe_combined_buffer {
 
 // Bounded RAM arena for MoE experts on disk tier
 // Fixed size (--moe-ram-mib), holds expert tensors loaded on-demand via pread
+// DISK-tier expert tensor metadata (no arena buffer; served by direct pread)
+struct moe_disk_tensor {
+    size_t base_offset = 0;      // file offset of expert 0
+    size_t stride = 0;           // bytes per expert
+    uint16_t shard_idx = 0;      // source GGUF shard
+};
 struct moe_ram_arena {
     size_t capacity_bytes = 0;           // Total arena capacity (--moe-ram-mib)
     size_t used_bytes = 0;               // Currently used bytes
@@ -407,13 +432,18 @@ struct moe_ram_arena {
     std::atomic<bool> shutdown = false;  // Signal worker to stop
     std::thread prefetch_thread;         // Async prefetch worker
     int model_fd = -1;                  // File descriptor for model file (for pread)
+    std::vector<int> shard_fds;          // One fd per GGUF shard (index = shard idx)
 
     // Combined buffers: key = (layer, tensor_type), value = buffer
     // tensor_type: "gate", "up", "down", "gate_up"
     std::map<std::pair<int, std::string>, moe_combined_buffer> combined_buffers;
 
+    // DISK-tier expert tensors: key = (layer, tensor_type)
+    std::map<std::pair<int, std::string>, moe_disk_tensor> disk_meta;
+
     // Initialize arena with given capacity and expert metadata
     bool init(size_t capacity_mib, const moe_placement_plan & plan, int n_layer, int n_expert, const char * model_path);
+    bool init_sharded(size_t capacity_mib, const moe_placement_plan & plan, int n_layer, int n_expert, const std::vector<int> & shard_fds_in);
 
     // Load expert into arena (blocking, for synchronous access)
     // Returns pointer to expert data in combined buffer, or nullptr if not in RAM tier
@@ -426,6 +456,10 @@ struct moe_ram_arena {
     // Get combined buffer pointer for a layer and tensor type
     // Returns nullptr if not a RAM-tier tensor
     void * get_combined_buffer(int layer, const char * tensor_type);
+
+    // Direct pread of one expert (any tier) into dst; returns bytes read, 0 on miss.
+    // Thread-safe for concurrent use: read-only map + positional pread.
+    size_t read_expert_direct(int layer, const char * tensor_type, int expert, void * dst);
 
     // Prefetch expert asynchronously (non-blocking)
     void prefetch_expert(int layer, int expert, const char * tensor_type = nullptr);

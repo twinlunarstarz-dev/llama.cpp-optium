@@ -359,6 +359,9 @@ extern "C" {
 
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);
+    // returns the original input tensor of which `copy` is the current split input copy, or NULL if `copy` is not one
+    GGML_API const struct ggml_tensor * ggml_backend_sched_copy_source(struct ggml_backend_sched * sched, const struct ggml_tensor * copy);
+
 
     // Split graph without allocating it
     GGML_API void                 ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
