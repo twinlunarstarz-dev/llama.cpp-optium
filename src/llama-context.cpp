@@ -8,6 +8,7 @@
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
+#include "llama-model-loader.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
 #include "llama-ext.h"
@@ -588,7 +589,7 @@ llama_context::llama_context(
             if (n_accel > 0) {
                 // Reserve room for compute buffers plus the draft model (MTP drafts are
                 // loaded after this context and can be several GiB).
-                const size_t reserve = n_accel * 4096ull * 1024ull * 1024ull;
+                const size_t reserve = n_accel * 2560ull * 1024ull * 1024ull;
                 const size_t avail   = free_total > reserve ? free_total - reserve : 0;
                 if (cparams.moe_cache_size > avail) {
                     LLAMA_LOG_WARN("%s: clamping MoE cache from %.2f MiB to %.2f MiB (%.2f MiB free across %zu device(s), %.2f MiB reserve)\n",
@@ -2825,6 +2826,12 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     }
 
     auto & st = lctx->copy_experts;
+    struct cb_stats_t {
+        std::atomic<uint64_t> calls{0}, slow{0}, ids_us{0}, arena_us{0}, copy_us{0}, total_us{0};
+        std::atomic<uint64_t> stage_syncs{0}, arena_jobs{0};
+    };
+    static cb_stats_t g_cb_stats;
+    g_cb_stats.calls.fetch_add(1, std::memory_order_relaxed);
     {
         static std::set<std::string> seen_dbg;
         if (dst && dst->name && strstr(dst->name, "exps") && seen_dbg.insert(dst->name).second) {
@@ -2860,6 +2867,12 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 
     const int64_t n_expert    = src->ne[2];
     const size_t  expert_size = src->nb[2];
+
+    const auto t_cb_begin = std::chrono::steady_clock::now();
+    auto t_cb_mark = t_cb_begin;
+    auto cb_us = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
+        return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(b - a).count();
+    };
 
     {
         // the ids may live on a different backend than this split's (layer split);
@@ -2907,6 +2920,67 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 
     }
 
+    {
+        const auto t_now = std::chrono::steady_clock::now();
+        g_cb_stats.ids_us.fetch_add(cb_us(t_cb_mark, t_now), std::memory_order_relaxed);
+        t_cb_mark = t_now;
+    }
+
+    // Serve used experts from the RAM arena when it can: bootstraps missing
+    // experts with parallel preads and avoids faulting the model mmap view.
+    // sched copy dst names look like CUDA0#blk.28.ffn_down_exps.weight#0
+    const char * exps_name = dst->name ? dst->name : "";
+    int il_exps = -1;
+    {
+        const char * b = strstr(exps_name, "blk.");
+        if (b) {
+            il_exps = atoi(b + 4);
+        }
+    }
+    const char * exps_type = strstr(exps_name, "ffn_gate_up_exps") ? "gate_up" :
+                             strstr(exps_name, "ffn_gate_exps")    ? "gate" :
+                             strstr(exps_name, "ffn_up_exps")      ? "up" :
+                             strstr(exps_name, "ffn_down_exps")    ? "down" : nullptr;
+    moe_ram_arena * arena = nullptr;
+    void * cb_data = nullptr;
+    if (il_exps >= 0 && exps_type) {
+        const auto it = g_moe_arenas.find({ (int) lctx->model.hparams.n_layer(), (int) lctx->model.hparams.n_expert });
+        if (it != g_moe_arenas.end()) {
+            arena = it->second.get();
+        } else {
+            arena = g_moe_ram_arena;
+        }
+        if (arena) {
+            cb_data = arena->get_combined_buffer(il_exps, exps_type);
+            if (cb_data) {
+                std::vector<int> used_ids;
+                for (int64_t e = 0; e < n_expert; ++e) {
+                    if (st.used[e]) {
+                        used_ids.push_back((int) e);
+                    }
+                }
+                arena->ensure_experts_loaded(il_exps, exps_type, used_ids.data(), (int) used_ids.size());
+            }
+        }
+    }
+    const uint8_t * copy_src = cb_data ? (const uint8_t *) cb_data : (const uint8_t *) src->data;
+
+    // no combined buffer: stage each used span from the GGUF with direct
+    // preads, so the upload never page-faults the mmap view
+    const uint8_t * combined = cb_data ? (const uint8_t *) cb_data : nullptr;
+    {
+        static std::atomic<int> dbg_stage{0};
+        if (arena && dbg_stage.fetch_add(1) < 24) {
+            LLAMA_LOG_WARN("MOESRC il=%d type=%s combined=%d n_used=%ld\n", il_exps, exps_type ? exps_type : "?", combined != nullptr, (long) std::count(st.used.begin(), st.used.end(), true));
+        }
+    }
+
+    {
+        const auto t_now = std::chrono::steady_clock::now();
+        g_cb_stats.arena_us.fetch_add(cb_us(t_cb_mark, t_now), std::memory_order_relaxed);
+        t_cb_mark = t_now;
+    }
+
     // group consecutive experts and copy them together
     for (int64_t first = 0; first < n_expert; ) {
         if (!st.used[first]) {
@@ -2918,6 +2992,47 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
             last++;
         }
 
+        const uint8_t * group_src = combined;
+        if (!combined && !st.used.empty()) {
+            if (arena && il_exps >= 0 && exps_type) {
+                const size_t span = (last + 1 - first) * expert_size + 512;
+                bool ok = expert_size > 0 && span > expert_size;
+                if (ok) {
+                    const auto t_r0 = std::chrono::steady_clock::now();
+                    st.stage.resize(span);
+                    for (int64_t e = first; ok && e <= last; ++e) {
+                        if (!arena->read_expert_direct(il_exps, exps_type, (int) e,
+                                    st.stage.data() + (e - first) * expert_size)) {
+                            ok = false;
+                        }
+                    }
+                    static std::atomic<int> dbg_read{0};
+                    if (ok && dbg_read.fetch_add(1) < 4) {
+                        LLAMA_LOG_WARN("FBSTAGE read done il=%d lo=%lld hi=%lld ms=%lld ok=%d\n",
+                            il_exps, (long long) first, (long long) last,
+                            (long long) std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - t_r0).count(), (int) ok);
+                    }
+                }
+                if (ok) {
+                    group_src = st.stage.data();
+                } else {
+                    static std::mutex fb_mu;
+                    static std::set<std::pair<int, std::string>> fb_note;
+                    {
+                        std::lock_guard<std::mutex> lk(fb_mu);
+                        if (fb_note.insert({il_exps, exps_type ? exps_type : "?"}).second) {
+                            LLAMA_LOG_WARN("FBSTAGE read failed il=%d type=%s lo=%lld hi=%lld (first occurrence; fallback to mmap copies)\n",
+                                il_exps, exps_type, (long long) first, (long long) last);
+                        }
+                    }
+                }
+            }
+        }
+        if (!group_src) {
+            group_src = copy_src;
+        }
+
         // the experts in the MoE cache are copied from device memory, the others are uploaded
         int64_t next = first;
         for (int64_t e = first; e <= last && lctx->moe_cache; ) {
@@ -2927,7 +3042,8 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
                 continue;
             }
             if (next < e) {
-                ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + next*expert_size, next*expert_size, (e - next)*expert_size);
+                const size_t src_off2 = group_src == st.stage.data() ? (size_t) (next - first)*expert_size : (size_t) next*expert_size;
+                ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) group_src + src_off2, next*expert_size, (e - next)*expert_size);
             }
             e   += n;
             next = e;
@@ -2938,10 +3054,43 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         const size_t padding = last < n_expert - 1 ? std::min<size_t>(expert_size, 512) : 0;
         const size_t size    = (last + 1 - next)*expert_size + padding;
         if (size > 0) {
-            ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) src->data + offset, offset, size);
+            // staged buffers hold only the experts of this group, their src
+            // offset is relative to the group start; combined buffers span the
+            // whole (layer, type), so they use the absolute expert offset
+            const size_t src_off = group_src == st.stage.data() ? (size_t) (next - first)*expert_size : (size_t) offset;
+            ggml_backend_tensor_set_async(backend, dst, (const uint8_t *) group_src + src_off, offset, size);
+        }
+
+        // staged groups reuse one host buffer, so wait for the copy before
+        // the next group overwrites it
+        if (group_src == st.stage.data()) {
+            g_cb_stats.stage_syncs.fetch_add(1, std::memory_order_relaxed);
+            ggml_backend_synchronize(backend);
         }
 
         first = last + 1;
+    }
+
+    {
+        const auto t_now = std::chrono::steady_clock::now();
+        g_cb_stats.copy_us.fetch_add(cb_us(t_cb_mark, t_now), std::memory_order_relaxed);
+        g_cb_stats.total_us.fetch_add(cb_us(t_cb_begin, t_now), std::memory_order_relaxed);
+        const uint64_t n_slow = g_cb_stats.slow.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n_slow % 256 == 0) {
+            const uint64_t c = g_cb_stats.calls.load();
+            const uint64_t s_ = n_slow;
+            LLAMA_LOG_WARN("CBSTAT calls=%llu slow=%llu avg_total=%.2fms avg_ids=%.2fms avg_arena=%.2fms avg_copy=%.2fms stage_syncs=%llu\n",
+                (unsigned long long) c, (unsigned long long) s_,
+                g_cb_stats.total_us.load() / 1000.0 / s_,
+                g_cb_stats.ids_us.load()   / 1000.0 / s_,
+                g_cb_stats.arena_us.load() / 1000.0 / s_,
+                g_cb_stats.copy_us.load()  / 1000.0 / s_,
+                (unsigned long long) g_cb_stats.stage_syncs.load());
+            g_cb_stats.calls.store(0); g_cb_stats.slow.store(0);
+            g_cb_stats.ids_us.store(0); g_cb_stats.arena_us.store(0);
+            g_cb_stats.copy_us.store(0); g_cb_stats.total_us.store(0);
+            g_cb_stats.stage_syncs.store(0);
+        }
     }
 
     return true;

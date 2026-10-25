@@ -1,4 +1,5 @@
 #include "mmvq.cuh"
+
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -487,6 +488,10 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
     return get_mmvq_mmid_max_batch_gcn(type);
 #elif !defined(GGML_USE_MUSA) && (__CUDA_ARCH__ == GGML_CUDA_CC_PASCAL || __CUDA_ARCH__ == GGML_CUDA_CC_VOLTA || __CUDA_ARCH__ >= GGML_CUDA_CC_ADA_LOVELACE)
     return MMVQ_MAX_BATCH_SIZE;
+// the table used here must match get_mmvq_mmid_max_batch(type, cc) exactly, or the launcher can
+// request more warps than __launch_bounds__ allows and the kernel launch fails with invalid argument
+#elif !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+    return get_mmvq_mmid_max_batch_ampere(type);
 #elif !defined(GGML_USE_MUSA) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING
     return get_mmvq_mmid_max_batch_turing_plus(type);
 #else
@@ -923,7 +928,13 @@ static __global__ void mul_mat_vec_q(
 // Block: (warp_size, ncols_dst) - each warp handles one token independently.
 // No shared memory reduction needed since each warp works alone.
 template <ggml_type type, int c_rows_per_block, bool has_fusion = false>
-__launch_bounds__(get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_get_physical_warp_size(), 1)
+// The MoE kernel takes ncols_dst as a runtime argument and the launcher may request the full
+// MMVQ_MAX_BATCH_SIZE warps for any type. Declaring the per-type table value here (6 for some
+// types on Turing) makes that request an illegal launch -> "CUDA error: invalid argument".
+// The table only tunes the chosen block width at launch time, not this bound, so always allow
+// the maximum batch size. Register pressure is unaffected: the kernel is memory bound and the
+// block width actually used is still decided by calc_nwarps()/ncols_dst.
+__launch_bounds__(MMVQ_MAX_BATCH_SIZE*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion,
         float * dst_ptr,

@@ -1,3 +1,4 @@
+#include <map>
 #include "llama-model-loader.h"
 
 #include "ggml-alloc.h"
@@ -11,6 +12,7 @@
 #include <cinttypes>
 #include <cstdint>
 #include <cstdarg>
+#include <cerrno>
 #include <cstring>
 #include <deque>
 #include <future>
@@ -20,6 +22,7 @@
 #include <unordered_set>
 #include <thread>
 #include <mutex>
+#include <set>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -907,7 +910,44 @@ llama_model_loader::llama_model_loader(
         if (n_expert_used == 0) n_expert_used = (int) get_u64("llama.expert_used_count");
 
         if (n_layer > 0 && n_expert > 0 && n_expert_used > 0) {
+            // 'auto' must be resolved here too: the cache resolves it for pinning,
+            // but the placement solver needs the same concrete file or it silently
+            // falls back to a uniform profile.
+            std::string moe_hot_resolved;
             const char * moe_profile_path = moe_hot;
+            {
+                const std::string p = moe_hot != nullptr ? moe_hot : "";
+                if (p == "auto") {
+                    auto get_str = [&](const char * key) -> std::string {
+                        const int kid = gguf_find_key(metadata, key);
+                        if (kid < 0 || gguf_get_kv_type(metadata, kid) != GGUF_TYPE_STRING) {
+                            return std::string();
+                        }
+                        return std::string(gguf_get_val_str(metadata, kid));
+                    };
+                    std::string name = get_str("general.name");
+                    if (name.empty()) {
+                        const size_t slash = fname.find_last_of("/\\");
+                        const size_t beg   = slash == std::string::npos ? 0 : slash + 1;
+                        const size_t dot   = fname.find_last_of('.');
+                        name = fname.substr(beg, (dot == std::string::npos || dot < beg) ? std::string::npos : dot - beg);
+                    }
+                    for (char & c : name) {
+                        if (!isalnum((unsigned char) c) && c != '-' && c != '_' && c != '.') {
+                            c = '-';
+                        }
+                    }
+                    if (name.empty() || name == "n/a") {
+                        name = "model";
+                    }
+                    const char * cache = getenv("LLAMA_CACHE");
+                    const char * home  = getenv("HOME");
+                    const std::string dir = cache != nullptr ? cache : (home != nullptr ? std::string(home) + "/.cache/llama.cpp" : ".");
+                    moe_hot_resolved = dir + "/moe-profiles/" + name + ".json";
+                    moe_profile_path = moe_hot_resolved.c_str();
+                    LLAMA_LOG_INFO("%s: moe profile 'auto' -> '%s'\n", __func__, moe_profile_path);
+                }
+            }
 
             // Compute placement plan
             if (moe_profile_path && *moe_profile_path) {
@@ -1001,20 +1041,21 @@ llama_model_loader::llama_model_loader(
                 // process-wide pointer so it outlives this loader and can be
                 // read by llama_moe_cache during inference.
                 fprintf(stderr, "TRACE ar1: arena init start cap=%zu expert_tier=%zu\n", moe_ram_mib, moe_plan->expert_tier.size());
-                g_moe_ram_arena = std::make_unique<moe_ram_arena>();
+                auto arena_new = std::make_unique<moe_ram_arena>();
                 std::vector<int> arena_fds;
                 arena_fds.reserve(files.size());
                 for (const auto & f : files) {
                     arena_fds.push_back(f->file_id());
                 }
                 const bool arena_ok = arena_fds.size() > 1
-                    ? g_moe_ram_arena->init_sharded(moe_ram_mib, *moe_plan, n_layer, n_expert, arena_fds)
-                    : g_moe_ram_arena->init(moe_ram_mib, *moe_plan, n_layer, n_expert, fname.c_str());
+                    ? arena_new->init_sharded(moe_ram_mib, *moe_plan, n_layer, n_expert, arena_fds)
+                    : arena_new->init(moe_ram_mib, *moe_plan, n_layer, n_expert, fname.c_str());
                 if (!arena_ok) {
                     LLAMA_LOG_WARN("MoE RAM arena: initialization failed, continuing without arena\n");
-                    g_moe_ram_arena.reset();
                 } else {
-                    moe_arena = g_moe_ram_arena.get();
+                    moe_arena = arena_new.get();
+                    g_moe_ram_arena = moe_arena; // most recently initialised (compat)
+                    g_moe_arenas[{ (int) n_layer, (int) n_expert }] = std::move(arena_new);
                     fprintf(stderr, "TRACE ar2: arena init ok\n");
                 }
             } else {
@@ -2603,7 +2644,13 @@ moe_placement_plan moe_solve_placement(
 
         // Envelope for everything that is not an expert weight: real non-expert
         // bytes plus KV/compute/draft/mmproj and 512 MiB slack per device.
-        const size_t reserve_total = 13ull * 1024 * 1024 * 1024 + (size_t) n_acc * 512ull * 1024 * 1024;
+        // Draft and compute buffers measured ~5.5 GiB; the extra GiB keeps the
+        // pool clear of VRAM saturation with system processes sharing the GPU.
+        // Envelope for everything that is not an expert weight: real non-expert
+        // bytes plus KV/compute/draft/mmproj and 512 MiB slack per device.
+        // Draft and compute buffers measured ~5.5 GiB; the extra GiB keeps the
+        // pool clear of VRAM saturation with system processes sharing the GPU.
+        const size_t reserve_total = (size_t) (14.5 * 1024.0 * 1024.0 * 1024.0) + (size_t) n_acc * 512ull * 1024 * 1024;
         const size_t committed_total = reserve_total > nonexpert_total
                                      ? reserve_total - nonexpert_total
                                      : 4ull * 1024 * 1024 * 1024;
@@ -2951,7 +2998,11 @@ moe_placement_plan moe_solve_placement_expert_granular(
 #include <unistd.h>
 #include <sys/mman.h>
 
-std::unique_ptr<moe_ram_arena> g_moe_ram_arena;
+// One arena per (n_layer, n_expert) geometry. The target model and the MTP/draft
+// head are loaded by separate loaders; a single global unique_ptr meant the draft
+// load destroyed the target's arena, its disk_meta and its combined buffers.
+std::map<std::pair<int,int>, std::unique_ptr<moe_ram_arena>> g_moe_arenas;
+moe_ram_arena * g_moe_ram_arena = nullptr;
 
 static uint64_t moe_get_time_us() {
     return (uint64_t) ggml_time_us();
@@ -3005,6 +3056,26 @@ bool moe_ram_arena::init(size_t capacity_mib, const moe_placement_plan & plan, i
     return true;
 }
 
+// Page-cache policy for expert reads.
+// The GGUF shards are read with plain pread (no O_DIRECT), so every read fills the
+// page cache. Dropping it right away (POSIX_FADV_DONTNEED) forces each re-read of a
+// hot expert back to disk, which dominates decode once the model is larger than
+// VRAM+RAM. Keep the cache by default and let the kernel reclaim it under pressure.
+// Set LLAMA_MOE_KEEP_PAGECACHE=0 to restore the old drop-after-read behaviour.
+static bool moe_keep_pagecache() {
+    static const bool keep = [] {
+        const char * e = getenv("LLAMA_MOE_KEEP_PAGECACHE");
+        return !(e && atoi(e) == 0);
+    }();
+    return keep;
+}
+
+static inline void moe_drop_pagecache(int fd, off_t off, size_t size) {
+    if (!moe_keep_pagecache()) {
+        posix_fadvise(fd, off, size, POSIX_FADV_DONTNEED);
+    }
+}
+
 bool moe_ram_arena::init_sharded(size_t capacity_mib, const moe_placement_plan & plan, int n_layer, int n_expert, const std::vector<int> & shard_fds_in) {
     // Sharded GGUF: keep the callers' file descriptors open (dup them so the
     // arena owns its references) and record the source shard per expert slot.
@@ -3019,7 +3090,27 @@ bool moe_ram_arena::init_sharded(size_t capacity_mib, const moe_placement_plan &
             LLAMA_LOG_ERROR("moe_ram_arena: invalid shard fd\n");
             return false;
         }
-        shard_fds.push_back(dup(fd));
+        // The GGUF shards are opened with O_DIRECT when load-mode=dio. dup()
+        // preserves that flag, but the arena issues expert-slice preads whose
+        // offsets/sizes are not block aligned, which O_DIRECT rejects with
+        // EINVAL. Re-open the backing file without O_DIRECT so arena reads work.
+        char link[64];
+        snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+        char path[4096];
+        const ssize_t nlen = readlink(link, path, sizeof(path) - 1);
+        int dfd = -1;
+        if (nlen > 0) {
+            path[nlen] = '\0';
+            dfd = open(path, O_RDONLY | O_CLOEXEC);
+        }
+        if (dfd < 0) {
+            dfd = dup(fd);   // fallback: works if the shard was not O_DIRECT
+        }
+        if (dfd < 0) {
+            LLAMA_LOG_ERROR("moe_ram_arena: cannot reopen shard fd %d: %s\n", fd, strerror(errno));
+            return false;
+        }
+        shard_fds.push_back(dfd);
     }
     if (shard_fds.empty()) {
         LLAMA_LOG_ERROR("moe_ram_arena: no shard fds provided\n");
@@ -3086,10 +3177,10 @@ void * moe_ram_arena::load_expert(int layer, int expert, const char * tensor_typ
     for (auto & j : jobs) {
         ssize_t got = pread(j.fd, j.dst, j.size, j.offset);
         if (got != (ssize_t) j.size) {
-            LLAMA_LOG_ERROR("moe_ram_arena: pread failed for L%d_E%d: %zd of %zu\n",
-                            layer, expert, got, j.size);
+            LLAMA_LOG_ERROR("moe_ram_arena: pread failed for L%d_E%d: %zd of %zu (fd=%d off=%lld errno=%d %s)\n",
+                            layer, expert, got, j.size, j.fd, (long long) j.offset, errno, strerror(errno));
         }
-        posix_fadvise(j.fd, j.offset, j.size, POSIX_FADV_DONTNEED);
+        moe_drop_pagecache(j.fd, j.offset, j.size);
     }
     // resolve the representative pointer (first tensor type that has a buffer)
     {
@@ -3170,13 +3261,14 @@ bool moe_ram_arena::ensure_experts_loaded(int layer, const char * tensor_type, c
             job & j = jobs[k];
             ssize_t got = pread(j.fd, j.dst, j.size, j.offset);
             if (got != (ssize_t) j.size) {
-                LLAMA_LOG_ERROR("moe_ram_arena: pread failed for L%d %s: %zd of %zu\n",
-                                layer, tensor_type, got, j.size);
+                LLAMA_LOG_ERROR("moe_ram_arena: pread failed for L%d %s: %zd of %zu (fd=%d off=%lld errno=%d %s)\n",
+                                layer, tensor_type, got, j.size, j.fd, (long long) j.offset, errno, strerror(errno));
             }
-            posix_fadvise(j.fd, j.offset, j.size, POSIX_FADV_DONTNEED);
+            moe_drop_pagecache(j.fd, j.offset, j.size);
         }
     };
-    if (n_workers <= 1) {
+    // a handful of experts is cheaper to read inline than to hand to a fresh pool
+    if (n_workers <= 1 || jobs.size() <= 4) {
         worker();
     } else {
         std::vector<std::thread> pool;
@@ -3246,7 +3338,7 @@ void moe_ram_arena::evict_lru(size_t need_bytes) {
         moe_ram_slot & sl = slots[best];
         const int fd = (sl.shard_idx < shard_fds.size()) ? shard_fds[sl.shard_idx] : model_fd;
         if (fd >= 0) {
-            posix_fadvise(fd, sl.file_offset, sl.size, POSIX_FADV_DONTNEED);
+            moe_drop_pagecache(fd, sl.file_offset, sl.size);
         }
         auto it = combined_buffers.find(std::make_pair(sl.layer, sl.tensor_type));
         if (it != combined_buffers.end() && sl.expert >= 0 &&
@@ -3320,14 +3412,25 @@ void llama_model_loader::capture_expert_file_offset(const char * tensor_name, si
     } else {
         is_ram = layer < (int) plan.layer_tier.size() && plan.layer_tier[layer] == MOE_TIER_RAM;
     }
-    if (!is_ram) {
-        // DISK-tier: record the offset metadata so fills can be pread directly
-        // into pinned staging instead of faulting through the mmap view
+    {
+        static std::atomic<int> dbg_cap{0};
+        if (dbg_cap.fetch_add(1) < 40) {
+            LLAMA_LOG_INFO("MOECAP %s layer=%d type=%s is_ram=%d ne2=%lld plan_ne=%d tier_sz=%zu\n",
+                           tensor_name, layer, tensor_type.c_str(), (int) is_ram,
+                           (long long) cur->ne[2], (int) plan.n_expert, plan.expert_tier.size());
+        }
+    }
+    // Always record offset metadata so fills can pread directly into pinned
+    // staging instead of faulting through the mmap view - even for layers
+    // where only some experts are RAM-resident (partial-combined blocks too)
+    {
         std::lock_guard<std::mutex> lock(arena.mutex);
         auto & dm = arena.disk_meta[std::make_pair(layer, tensor_type)];
         dm.base_offset = file_offset;
         dm.stride      = cur->nb[2];
         dm.shard_idx   = shard_idx;
+    }
+    if (!is_ram) {
         return;
     }
 
@@ -3384,6 +3487,12 @@ size_t moe_ram_arena::read_expert_direct(int layer, const char * tensor_type, in
     auto key = std::make_pair(layer, std::string(tensor_type ? tensor_type : ""));
     auto it = disk_meta.find(key);
     if (it == disk_meta.end() || expert < 0) {
+        static std::mutex rd_mu2;
+        static std::set<std::pair<int, std::string>> rd_note2;
+        std::lock_guard<std::mutex> lk(rd_mu2);
+        if (rd_note2.insert(key).second) {
+            LLAMA_LOG_WARN("read_expert_direct: no disk_meta for L%d %s (capture missing?)\n", layer, tensor_type ? tensor_type : "?");
+        }
         return 0;
     }
     const moe_disk_tensor & dm = it->second;
@@ -3394,9 +3503,16 @@ size_t moe_ram_arena::read_expert_direct(int layer, const char * tensor_type, in
     const size_t off = dm.base_offset + (size_t) expert * dm.stride;
     ssize_t got = pread(fd, dst, dm.stride, off);
     if (got != (ssize_t) dm.stride) {
+        static std::mutex rd_mu;
+        static std::set<std::pair<int, std::string>> rd_note;
+        std::lock_guard<std::mutex> lk(rd_mu);
+        if (rd_note.insert(key).second) {
+            LLAMA_LOG_WARN("read_expert_direct: pread failed for L%d %s off=%zu stride=%zu shard=%d fds=%zu got=%zd\n",
+                layer, tensor_type, off, dm.stride, dm.shard_idx, shard_fds.size(), got);
+        }
         return 0;
     }
-    posix_fadvise(fd, off, dm.stride, POSIX_FADV_DONTNEED);
+    moe_drop_pagecache(fd, off, dm.stride);
     return (size_t) got;
 }
 

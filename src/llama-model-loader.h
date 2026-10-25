@@ -475,7 +475,8 @@ struct moe_ram_arena {
 };
 
 // Global arena instance (owned by llama_model_loader)
-extern std::unique_ptr<moe_ram_arena> g_moe_ram_arena;
+extern moe_ram_arena * g_moe_ram_arena;
+extern std::map<std::pair<int,int>, std::unique_ptr<moe_ram_arena>> g_moe_arenas;
 
 // Early MoE solver - called from common.cpp before standard parameter fitting
 // Returns true on success, false on failure (error in plan.error)

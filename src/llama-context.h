@@ -377,6 +377,8 @@ private:
         const ggml_tensor *  ids = nullptr;
         std::vector<int32_t> ids_data;
         std::vector<bool>    used;
+        // host staging for experts served straight from disk (no combined buffer)
+        std::vector<uint8_t> stage;
 
         void reset() {
             ids = nullptr;
