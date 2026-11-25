@@ -2138,12 +2138,26 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                 const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
                 assert(expert_to_use >= 0 && expert_to_use < ne02);
                 if (expert_to_use == i02) {
+                    // No early break: several experts of one token can legitimately
+                    // map to the same all-zero bank row, and each (token, expert)
+                    // pair still needs an entry or the sorted id map comes up short.
                     ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
                     ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);
                     tokens_per_expert[i02]++;
-                    break;
                 }
             }
+        }
+    }
+    if (ids_to_sorted_host.size() != size_t(ne_get_rows) && getenv("GGML_MMID_DEBUG") != nullptr) {
+        fprintf(stderr, "MMIDDBG src0=%s ne02=%lld ne12=%lld ne11=%lld n_used=%lld got=%zu want=%lld\n",
+                src0->name, (long long) ne02, (long long) ne12, (long long) ne11,
+                (long long) n_expert_used, ids_to_sorted_host.size(), (long long) ne_get_rows);
+        for (int64_t t = 0; t < ne12 && t < 2; ++t) {
+            fprintf(stderr, "  tok%lld:", (long long) t);
+            for (int64_t k = 0; k < n_expert_used; ++k) {
+                fprintf(stderr, " %d", *(const int32_t *)(ids_host.data() + t*ids->nb[1] + k*ids->nb[0]));
+            }
+            fprintf(stderr, "\n");
         }
     }
     GGML_ASSERT(ids_to_sorted_host.size() == size_t(ne_get_rows));
@@ -2717,7 +2731,29 @@ static bool ggml_cuda_graph_debug_enabled() {
     return enabled;
 }
 
+// Runtime (non-env) kill switch for CUDA graph capture. The MoE expert-cache
+// issues dynamic H2D staged copies from the sched eval callback; when those
+// copies are captured into a graph, replays re-execute them with the capture-
+// time slot offsets while the expert->slot assignment changes every ubatch,
+// silently feeding wrong expert weights to MUL_MAT_ID (corrupted output).
+static std::atomic<bool> g_cuda_graphs_disabled_runtime{ false };
+
+static bool ggml_cuda_graphs_disabled_runtime() {
+    return g_cuda_graphs_disabled_runtime.load(std::memory_order_relaxed);
+}
+
+void ggml_backend_cuda_disable_graphs(bool disabled) {
+    g_cuda_graphs_disabled_runtime.store(disabled, std::memory_order_relaxed);
+}
+
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+
+    // A/B switch for diagnosing graph-capture-only failures (MoE MUL_MAT_ID on some
+    // architectures): force the plain execution path without touching any preset.
+    static const bool graphs_disabled = ggml_cuda_env_flag("GGML_CUDA_NO_GRAPHS");
+    if (graphs_disabled || ggml_cuda_graphs_disabled_runtime()) {
+        return false;
+    }
 
     bool use_cuda_graph = true;
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
@@ -5485,14 +5521,16 @@ static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t *
 }
 
 static enum ggml_backend_dev_type ggml_backend_cuda_device_get_type(ggml_backend_dev_t dev) {
-    ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *) dev->context;
+    GGML_UNUSED(dev);
 
-    cudaDeviceProp prop;
-    CUDA_CHECK(cudaGetDeviceProperties(&prop, ggml_cuda_get_physical_device(ctx->device)));
-
-    return prop.integrated
-        ? GGML_BACKEND_DEVICE_TYPE_IGPU
-        : GGML_BACKEND_DEVICE_TYPE_GPU;
+    // Do not consult cudaGetDeviceProperties().integrated here. On hybrid/
+    // WSL systems the driver reports integrated=true for discrete GPUs, which
+    // demotes the device to GGML_BACKEND_DEVICE_TYPE_IGPU. Downstream that
+    // (a) makes the MoE tier planner's GPU/ACCEL filter skip the device, so
+    // experts are sized against a fake 4 GiB fallback plan, and (b) disables
+    // mmap_support for the buffer interface. The fork already forces
+    // info.devices[id].integrated = false at init for the same reason.
+    return GGML_BACKEND_DEVICE_TYPE_GPU;
 }
 
 static void ggml_backend_cuda_device_get_props(ggml_backend_dev_t dev, ggml_backend_dev_props * props) {
@@ -5607,6 +5645,16 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             {
                 struct ggml_tensor * a = op->src[0];
                 struct ggml_tensor * b = op->src[1];
+                // Host-resident expert weights (the MoE RAM tier) are computed on the
+                // CPU. Running them on CUDA would pull the whole expert tensor across
+                // PCIe for every token, and their id maps legitimately contain -1.
+                if (a->buffer != nullptr && !ggml_backend_buft_is_cuda(a->buffer->buft)) {
+                    // check the buffer TYPE, not the buffer instance: the placement probe
+                    // allocates a zero-sized dummy buffer, whose iface is empty, so an
+                    // instance-based check rejected every candidate and silently sent
+                    // all weights to the CPU.
+                    return false;
+                }
                 if (a->nb[0] != ggml_element_size(a) || b->nb[0] != ggml_element_size(b)) {
                     return false; // TODO this could in principle be implemented though currently there is no use case.
                 }
@@ -5614,6 +5662,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     return false;
                 }
                 if (op->op == GGML_OP_MUL_MAT_ID && ggml_get_op_params_i32(op, 3) == GGML_PREC_F32) {
+                    return false;
+                }
+                // Q8_0 routed experts produce silently wrong output through the CUDA
+                // MUL_MAT_ID path on this build (measured: every MoE layer whose expert
+                // block is Q8_0 corrupts generations, while IQ4_NL blocks are exact).
+                // Refuse the op so those experts stay on the CPU instead of corrupting.
+                if (op->op == GGML_OP_MUL_MAT_ID && a->type == GGML_TYPE_Q8_0) {
                     return false;
                 }
 #ifdef GGML_USE_MUSA
