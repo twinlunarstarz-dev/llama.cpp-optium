@@ -136,6 +136,7 @@ struct llama_hparams {
     struct llama_hparams_convnext convnext;
 
     uint32_t n_shortconv_l_cache  = 0;
+    uint32_t n_sconv_channels     = 0;
 
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_arr;
     std::array<uint32_t, LLAMA_MAX_LAYERS> n_head_kv_arr;
@@ -165,6 +166,8 @@ struct llama_hparams {
     float    expert_group_scale   = 0.05f;
     float    expert_weights_scale = 0.0f;
     bool     expert_weights_norm  = false;
+    float    expert_weights_norm_eps = 0.0f; // > 0: weights / (sum + eps), else the sum is clamped
+    bool     expert_router_f32    = false;   // compute the router logits in F32
     uint32_t expert_gating_func   = LLAMA_EXPERT_GATING_FUNC_TYPE_NONE;
     uint32_t moe_every_n_layers   = 0;
     uint32_t moe_latent_size      = 0;
@@ -252,6 +255,16 @@ struct llama_hparams {
     float    kda_gate_lower_bound = -INFINITY;
     float    situ_beta            = 1.0f;
     float    situ_linear_beta     = 0.0f;   // 0 = no linear-beta transform on the up branch
+
+    // inkling2
+    uint32_t n_relative        = 0;
+    uint32_t n_relative_extent = 0;
+    uint32_t n_vocab_unpadded  = 0;
+    uint32_t n_vocab_padded    = 0;
+    uint32_t n_log_scale_floor = 0;
+    float    f_log_scale_alpha = 0.0f;
+    float    f_qk_clip         = 0.0f;
+    float    f_relative_clip   = 0.0f;
 
     // hrm-text (looped H/L stacks)
     uint32_t n_hrm_layers_per_stack = 0;

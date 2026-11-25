@@ -343,11 +343,39 @@ static void soft_max_f32_cuda(const float *                                x,
 
 
     const int id       = ggml_cuda_get_device();
-    const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
 
+    // the cached device info can be stale/corrupt in long-lived processes, and a bogus
+    // shared-memory limit makes every cudaFuncSetAttribute below fail with "invalid argument";
+    // ask the driver directly and fall back to the cached value only if that fails
+    static constexpr size_t soft_max_smpbo_max = 256u * 1024u;
+    size_t smpbo = 0;
+    {
+        int v = 0;
+        if (cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin, id) == cudaSuccess && v > 0) {
+            smpbo = (size_t) v;
+        } else {
+            smpbo = ggml_cuda_info().devices[id].smpbo;
+        }
+        if (smpbo == 0 || smpbo > soft_max_smpbo_max) {
+            smpbo = std::min<size_t>(soft_max_smpbo_max, 48u * 1024u);
+        }
+    }
+
+    if (getenv("GGML_CUDA_SOFTMAX_DEBUG") != nullptr) {
+        fprintf(stderr, "SOFTMAXDBG2 dev=%d ncols=%lld nth=%d grid=[%u,%u,%u] smpbo=%zu smpb=%zu nsm=%d cc=%d warp=%d nbytes_shared=%zu coop=%d\n",
+                id, (long long) ncols_x, nth,
+                block_nums.x, block_nums.y, block_nums.z, smpbo,
+                ggml_cuda_info().devices[id].smpb, ggml_cuda_info().devices[id].nsm,
+                ggml_cuda_info().devices[id].cc, ggml_cuda_info().devices[id].warp_size,
+                nbytes_shared,
+                (int) ggml_cuda_info().devices[id].supports_cooperative_launch);
+    }
 
     if (nbytes_shared <= smpbo) {
         launch_soft_max_kernels<32, 64, 128, 256, 512, 1024, 2048, 4096>(x, mask, sinks, dst, params, stream, block_dims, block_nums, nbytes_shared);
+        if (getenv("GGML_CUDA_SOFTMAX_DEBUG") != nullptr) {
+            fprintf(stderr, "SOFTMAXDBG3 branch=template err=%s\n", cudaGetErrorString(cudaGetLastError()));
+        }
     } else {
         // Parallelize across SMs for top-p/dist-sampling
         // The heuristic for parallelizing rows across SMs vs parallelizing single row & looping over all rows was done on the basis of a B6000 GPU and
@@ -423,6 +451,16 @@ void ggml_cuda_op_soft_max(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
     const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
 
+
+    if (getenv("GGML_CUDA_SOFTMAX_DEBUG") != nullptr) {
+        fprintf(stderr, "SOFTMAXDBG src0 ne=[%lld,%lld,%lld,%lld] nb=[%lld,%lld,%lld] dst ne=[%lld,%lld,%lld,%lld] buf_src0='%s' buf_dst='%s' mask=%p sinks=%p\n",
+                (long long) src0->ne[0], (long long) src0->ne[1], (long long) src0->ne[2], (long long) src0->ne[3],
+                (long long) src0->nb[0], (long long) src0->nb[1], (long long) src0->nb[2],
+                (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2], (long long) dst->ne[3],
+                src0->buffer ? ggml_backend_buffer_name(src0->buffer) : "none",
+                dst->buffer ? ggml_backend_buffer_name(dst->buffer) : "none",
+                (const void *) src1, (const void *) src2);
+    }
 
     soft_max_params params = {};
     params.nheads = src0->ne[2];

@@ -56,6 +56,8 @@ struct llama_cparams {
     bool training;           // set by llama_opt_init()
 
     size_t moe_cache_size;
+    float  moe_cache_cpu_share;
+    size_t moe_cache_reserve;
     const char * moe_profile;
     const char * moe_hot;
 

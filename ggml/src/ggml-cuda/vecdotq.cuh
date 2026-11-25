@@ -94,13 +94,45 @@ static __device__ __forceinline__ int2 get_int_from_table_16(const int & q4, con
 #endif
 }
 
+#if defined(__CUDA_ARCH_LIST__) && __CUDA_ARCH_LIST__ == 600
+#define GGML_CUDA_VECDOT_PASCAL 1
+#endif
+
 static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
     // v is a 7 bit int, with the 8th sign being encodable as popcnt
     // with xor we can "correct" the bit instead of having to mask
     const uint32_t p = __popc(v) & 1;
     const uint32_t s = v ^ p << 7;
     // broadcast over uint to allow for 0x08040201 / 0x80402010 as selectors
+#ifdef GGML_CUDA_VECDOT_PASCAL
+    return __byte_perm(s, 0, 0); // sm_60 has no 32 bit multiply
+#else
     return s * 0x01010101;
+#endif
+}
+
+// negate the grid bytes whose sign bit is set in sb (sign byte broadcast over the uint), selectors 0x08040201 / 0x80402010
+static __device__ __forceinline__ int sign_flip_lo(const int grid, const uint32_t sb) {
+#ifdef GGML_CUDA_VECDOT_PASCAL
+    // PRMT replicates the msb of each byte; grid bytes are never 0 so the +1 of the negate cannot carry
+    uint32_t m;
+    asm("prmt.b32 %0, %1, 0, 0xBA98;" : "=r"(m) : "r"((sb & 0x08040201) + 0x787C7E7F));
+    return (grid ^ m) + (m & 0x01010101);
+#else
+    const int signs = __vcmpne4(sb & 0x08040201, 0);
+    return __vsub4(grid ^ signs, signs);
+#endif
+}
+
+static __device__ __forceinline__ int sign_flip_hi(const int grid, const uint32_t sb) {
+#ifdef GGML_CUDA_VECDOT_PASCAL
+    uint32_t m;
+    asm("prmt.b32 %0, %1, 0, 0xBA98;" : "=r"(m) : "r"((sb & 0x80402010) + 0x70707070));
+    return (grid ^ m) + (m & 0x01010101);
+#else
+    const int signs = __vcmpne4(sb & 0x80402010, 0);
+    return __vsub4(grid ^ signs, signs);
+#endif
 }
 
 // VDR = vec dot ratio, how many contiguous integers each thread processes when the vec dot kernel is called

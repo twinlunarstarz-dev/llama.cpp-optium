@@ -380,6 +380,15 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     return false;
 #endif // GGML_CUDA_FORCE_CUBLAS
 
+    // Multi-token MUL_MAT_ID (MoE prefill) through MMQ builds an illegal launch on
+    // pre-Ampere NVIDIA parts: the J tile chosen for the expert-count/batch shape
+    // is not a valid block geometry there and the launch dies with
+    // "CUDA error: invalid argument" mid-prefill. The row-gather fallback produces
+    // the same result; single-token MoE still takes the MMVQ kernel.
+    if (n_experts > 0 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc < GGML_CUDA_CC_AMPERE) {
+        return false;
+    }
+
     bool mmq_supported;
 
     switch (type) {

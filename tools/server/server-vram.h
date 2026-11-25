@@ -62,4 +62,5 @@ private:
 std::vector<size_t> server_vram_probe(const std::string & exe,
                                       const std::vector<std::string> & args,
                                       std::string & err,
-                                      bool cap_compute_layer_split = false);
+                                      bool cap_compute_layer_split = false,
+                                      std::vector<size_t> * ctx_out = nullptr);

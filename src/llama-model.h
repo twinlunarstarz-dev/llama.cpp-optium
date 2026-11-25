@@ -588,6 +588,22 @@ struct llama_layer {
 
     // kimi-k3
     struct ggml_tensor * ssm_g           = nullptr; // full-rank KDA gate (replaces ssm_g_a/ssm_g_b)
+    struct ggml_tensor * attn_q_clip     = nullptr; // inkling2
+    struct ggml_tensor * attn_sink_proj  = nullptr; // inkling2
+    struct ggml_tensor * attn_rel        = nullptr; // inkling2
+    struct ggml_tensor * attn_rel_bias   = nullptr; // inkling2
+    struct ggml_tensor * attn_rel_clip   = nullptr; // inkling2
+    struct ggml_tensor * attn_k_conv     = nullptr; // inkling2
+    struct ggml_tensor * attn_v_conv     = nullptr; // inkling2
+    struct ggml_tensor * attn_k_conv_proj = nullptr; // inkling2
+    struct ggml_tensor * attn_v_conv_proj = nullptr; // inkling2
+    struct ggml_tensor * attn_post_conv  = nullptr; // inkling2
+    struct ggml_tensor * ffn_post_conv   = nullptr; // inkling2
+    struct ggml_tensor * attn_q_inp_norm = nullptr; // inkling2
+    struct ggml_tensor * attn_k_inp_norm = nullptr; // inkling2
+    struct ggml_tensor * attn_v_inp_norm = nullptr; // inkling2
+    struct ggml_tensor * attn_res_query  = nullptr; // inkling2
+    struct ggml_tensor * ffn_res_query   = nullptr; // inkling2
     struct ggml_tensor * attn_res_score  = nullptr; // fused res_norm*res_proj, pre-attention
     struct ggml_tensor * ffn_res_score   = nullptr; // fused res_norm*res_proj, pre-FFN
     struct ggml_tensor * ffn_routed_down = nullptr; // latent MoE: n_embd -> n_expert_latent
@@ -664,6 +680,12 @@ struct llama_prec_policy {
 
     bool apply(ggml_tensor * res) const;
 
+    void set_acc(const ggml_tensor * w, ggml_prec prec) {
+        if (w) {
+            prec_acc[w] = prec;
+        }
+    }
+
     void load(llama_model_loader & ml, const llama_model & model);
 };
 
@@ -737,6 +759,7 @@ struct llama_model {
 
     struct ggml_tensor * output_norm     = nullptr;
     struct ggml_tensor * output_res_score = nullptr; // kimi-k3: final cross-layer residual mix
+    struct ggml_tensor * output_res_query = nullptr; // inkling2
     struct ggml_tensor * output_norm_b   = nullptr;
     struct ggml_tensor * output          = nullptr;
     struct ggml_tensor * output_b        = nullptr;
@@ -931,6 +954,7 @@ struct llama_model {
     // model must define these
     virtual void load_arch_hparams(llama_model_loader & ml) = 0;
     virtual void load_arch_tensors(llama_model_loader & ml) = 0;
+    virtual void post_arch_tensors(llama_model_loader & ml) {}
     virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
 
 protected:

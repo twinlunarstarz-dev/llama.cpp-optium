@@ -1,3 +1,6 @@
+#include <sys/mman.h>
+#include <unistd.h>
+
 #include "llama-model.h"
 
 #include "llama-arch.h"
@@ -306,6 +309,10 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_openai_moe(params);
         case LLM_ARCH_FALCON_H1:
             return new llama_model_falcon_h1(params);
+        case LLM_ARCH_INKLING2:
+            return new llama_model_inkling2(params);
+        case LLM_ARCH_INKLING2_LOOP:
+            return new llama_model_inkling2_loop(params);
         case LLM_ARCH_LFM2:
             return new llama_model_lfm2(params);
         case LLM_ARCH_LFM2MOE:
@@ -387,6 +394,16 @@ llama_model * llama_model_create(llm_arch arch, const llama_model_params & param
 
 llama_model * llama_model_create(llama_model_loader & ml, const llama_model_params & params) {
     llm_arch arch = ml.get_arch();
+
+    // some Inkling-2 loop checkpoints are tagged with the base architecture and carry the
+    // loop-expanded block count, so select the loop variant from the loop metadata
+    if (arch == LLM_ARCH_INKLING2) {
+        uint32_t n_loops = 0;
+        if (ml.get_key(std::string("inkling2.num_loops"), n_loops, false) && n_loops > 1) {
+            arch = LLM_ARCH_INKLING2_LOOP;
+        }
+    }
+
     if (arch == LLM_ARCH_UNKNOWN) {
         throw std::runtime_error("unknown model architecture: '" + ml.get_arch_name() + "'");
     }
@@ -1586,6 +1603,85 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
     vocab.load(ml, kv);
 }
 
+// Warm the mapped expert ranges into the page cache without copying them. This is the
+// zero-copy counterpart of the RAM arena: the arena lost because it copied experts into
+// anonymous memory and evicted the very page cache the mmap path reads from. Asking the
+// kernel to keep the pages in place costs no allocation and no PCIe traffic, and the
+// pages stay reclaimable under pressure so it cannot drive the host into swap.
+//
+// The budget is spread proportionally over every expert tensor, so each layer and each
+// of gate/up/down is resident to the same fraction. Routing is roughly uniform over
+// expert ids, so equal fractional coverage maximises hits per byte; a greedy per-layer
+// split would leave ffn_down_exps (the largest tier) permanently cold.
+static size_t warm_expert_pages(
+        const std::vector<std::pair<std::string, struct ggml_tensor *>> & tbn,
+        size_t budget_mib) {
+    size_t total_bytes = 0;
+    std::vector<std::pair<ggml_tensor *, size_t>> ents;
+    ents.reserve(256);
+
+    for (const auto & [name, t] : tbn) {
+        if (name.find("ffn_gate_exps") == std::string::npos &&
+            name.find("ffn_up_exps")   == std::string::npos &&
+            name.find("ffn_down_exps") == std::string::npos) {
+            continue;
+        }
+        if (t == nullptr || t->data == nullptr || t->buffer == nullptr) {
+            continue;
+        }
+        // only mapped/host buffers are readable from the page cache; a tensor already
+        // sitting in a device buffer needs no warming
+        if (!ggml_backend_buffer_is_host(t->buffer)) {
+            continue;
+        }
+        const size_t nbytes = ggml_nbytes(t);
+        if (nbytes == 0) {
+            continue;
+        }
+        ents.emplace_back(t, nbytes);
+        total_bytes += nbytes;
+    }
+
+    if (ents.empty() || total_bytes == 0) {
+        LLAMA_LOG_INFO("%s: no mapped expert tensors to warm\n", __func__);
+        return 0;
+    }
+
+    const long   page   = sysconf(_SC_PAGESIZE);
+    const size_t budget = budget_mib * 1024ull * 1024ull;
+    const bool   all    = budget >= total_bytes;
+
+    size_t warmed = 0;
+    size_t n_tens = 0;
+
+    for (const auto & [t, nbytes] : ents) {
+        size_t want = all ? nbytes : (size_t) ((unsigned long long) budget * nbytes / total_bytes);
+        if (want > nbytes) {
+            want = nbytes;
+        }
+        if (want < (size_t) page) {
+            continue;
+        }
+        const uintptr_t raw = (uintptr_t) t->data;
+        const uintptr_t beg = raw & ~(uintptr_t) (page - 1);
+        const size_t    len = ((raw + want + page - 1) & ~(uintptr_t) (page - 1)) - beg;
+#ifdef MADV_WILLNEED
+        if (madvise((void *) beg, len, MADV_WILLNEED) == 0) {
+            warmed += len;
+            n_tens++;
+        }
+#endif
+    }
+
+    if (warmed > 0) {
+        LLAMA_LOG_INFO("%s: warming %zu MiB of expert pages across %zu tensors (%.1f%% of %.2f GiB)\n",
+                __func__, warmed / (1024ull * 1024ull), n_tens,
+                100.0 * (double) warmed / (double) total_bytes,
+                (double) total_bytes / (1024.0 * 1024.0 * 1024.0));
+    }
+    return warmed;
+}
+
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const auto & split_mode   = params.split_mode;
     const bool use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
@@ -1630,7 +1726,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         __func__, load_mode_name);
 
     // build a list of buffer types for the CPU and GPU devices
-    pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
+    // inkling2/inkling2-loop: without the host buffer the expert/relative-position path reads stale data
+    const bool no_host_eff = params.no_host && arch != LLM_ARCH_INKLING2 && arch != LLM_ARCH_INKLING2_LOOP;
+    if (params.no_host && !no_host_eff) {
+        LLAMA_LOG_WARN("%s: --no-host ignored for arch '%s' (host buffer required)\n", __func__, arch_name().c_str());
+    }
+    pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, no_host_eff);
     for (const auto & dev : devices) {
         buft_list_t buft_list = make_gpu_buft_list(dev.dev, split_mode, tensor_split);
         // add CPU buffer types as a fallback
@@ -1879,6 +1980,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+        post_arch_tensors(ml);
     ml.done_getting_tensors();
 
     if (per_layer_tok_embd && ml.lazy.has(per_layer_tok_embd)) {
@@ -2044,11 +2146,32 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         if (!ml.load_all_data(ctx, bufs, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
         }
+
+        // MoE tiered placement: give every RAM-tier expert tensor a host view of
+        // its arena block, then fill that block before the first token. Experts
+        // that live in the arena are computed on the CPU from locked RAM; only the
+        // experts that are not RAM-resident are streamed over PCIe.
+        ml.rebind_moe_arena_tensors();
+        const char * preload_env = getenv("LLAMA_MOE_PRELOAD");
+        if (preload_env == nullptr || atoi(preload_env) != 0) {
+            const char * pin_env = getenv("LLAMA_MOE_PIN_RAM");
+            const bool lock_ram = pin_env != nullptr && atoi(pin_env) != 0;
+            ml.preload_moe_arena(8, lock_ram);
+        }
     }
 
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
+        }
+    }
+
+    // page-cache warming must run after every tensor has its final data pointer, which is
+    // only true once all of ctx_bufs has been loaded
+    {
+        const char * warm_env = getenv("LLAMA_MOE_WARM_MIB");
+        if (warm_env != nullptr && atoll(warm_env) > 0) {
+            warm_expert_pages(tensors_by_name, (size_t) atoll(warm_env));
         }
     }
 
@@ -3217,7 +3340,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     // a null filter_idx means the GGUF has no indexer tensors
                     llama_memory_hybrid::layer_filter_cb filter_idx  = nullptr;
                     const bool needs_mem_idx = (arch == LLM_ARCH_QWEN4EXP);
-                    if (arch == LLM_ARCH_FALCON_H1) {
+                    if (arch == LLM_ARCH_FALCON_H1 || arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP) {
                         filter_attn = [&](uint32_t) { return true; };
                         filter_recr = [&](uint32_t) { return true; };
                     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
@@ -3605,6 +3728,8 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_NEMOTRON_H_MOE:
         case LLM_ARCH_KIMI_LINEAR:
         case LLM_ARCH_KIMI_K3:
+        case LLM_ARCH_INKLING2:
+        case LLM_ARCH_INKLING2_LOOP:
         case LLM_ARCH_GLM5_NEXT:
             return LLAMA_ROPE_TYPE_NONE;
 

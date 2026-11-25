@@ -1407,6 +1407,132 @@ static size_t vram_file_size(const std::string & path) {
     return ec ? 0 : (size_t) size;
 }
 
+// total layer count (block_count) from a GGUF header; 0 when it cannot be read
+static size_t vram_gguf_block_count(const std::string & path) {
+    if (path.empty()) {
+        return 0;
+    }
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        return 0;
+    }
+    auto read_u32 = [&in](uint32_t & out) -> bool {
+        unsigned char b[4];
+        if (!in.read((char *) b, 4)) {
+            return false;
+        }
+        out = (uint32_t) b[0] | ((uint32_t) b[1] << 8) | ((uint32_t) b[2] << 16) | ((uint32_t) b[3] << 24);
+        return true;
+    };
+    auto read_u64 = [&in](uint64_t & out) -> bool {
+        unsigned char b[8];
+        if (!in.read((char *) b, 8)) {
+            return false;
+        }
+        out = 0;
+        for (int i = 7; i >= 0; i--) {
+            out = (out << 8) | b[i];
+        }
+        return true;
+    };
+    auto skip = [&in](uint64_t n) -> bool {
+        in.seekg((std::streamoff) n, std::ios::cur);
+        return (bool) in;
+    };
+
+    char magic[4];
+    if (!in.read(magic, 4) || magic[0] != 'G' || magic[1] != 'G' || magic[2] != 'U' || magic[3] != 'F') {
+        return 0;
+    }
+    uint32_t version   = 0;
+    uint64_t n_tensors = 0;
+    uint64_t n_kv      = 0;
+    if (!read_u32(version) || !read_u64(n_tensors) || !read_u64(n_kv)) {
+        return 0;
+    }
+    if (version < 2 || n_kv == 0 || n_kv > 100000) {
+        return 0;
+    }
+    (void) n_tensors; // only the KV block is walked
+
+    for (uint64_t i = 0; i < n_kv; i++) {
+        uint64_t key_len = 0;
+        if (!read_u64(key_len) || key_len > 4096) {
+            return 0;
+        }
+        std::string key(key_len, '\0');
+        if (key_len > 0 && !in.read(&key[0], (std::streamsize) key_len)) {
+            return 0;
+        }
+        uint32_t type = 0;
+        if (!read_u32(type)) {
+            return 0;
+        }
+        const bool want = key == "block_count" ||
+            (key.size() > 12 && key.compare(key.size() - 12, 12, ".block_count") == 0);
+        uint64_t value = 0;
+        switch (type) {
+            case 0: case 1: case 7:
+                if (!skip(1)) { return 0; }
+                break;
+            case 2: case 3:
+                if (!skip(2)) { return 0; }
+                break;
+            case 4:
+                {
+                    uint32_t v = 0;
+                    if (!read_u32(v)) { return 0; }
+                    value = v;
+                }
+                break;
+            case 5: case 6:
+                if (!skip(4)) { return 0; }
+                break;
+            case 8:
+                {
+                    uint64_t len = 0;
+                    if (!read_u64(len) || len > (1u << 20) || !skip(len)) { return 0; }
+                }
+                break;
+            case 9:
+                {
+                    uint32_t at = 0;
+                    uint64_t n  = 0;
+                    if (!read_u32(at) || !read_u64(n) || n > 1000000) { return 0; }
+                    if (at == 8) {
+                        for (uint64_t e = 0; e < n; e++) {
+                            uint64_t len = 0;
+                            if (!read_u64(len) || len > (1u << 20) || !skip(len)) { return 0; }
+                        }
+                    } else {
+                        size_t elem = 0;
+                        switch (at) {
+                            case 0: case 1: case 7:          elem = 1; break;
+                            case 2: case 3:                  elem = 2; break;
+                            case 4: case 5: case 6:          elem = 4; break;
+                            case 10: case 11: case 12:       elem = 8; break;
+                            default: return 0;
+                        }
+                        if (!skip((uint64_t) elem * n)) { return 0; }
+                    }
+                }
+                break;
+            case 10:
+                if (!read_u64(value)) { return 0; }
+                break;
+            case 11: case 12:
+                if (!skip(8)) { return 0; }
+                break;
+            default:
+                return 0;
+        }
+        if (want && value > 0 && value < 100000) {
+            return (size_t) value;
+        }
+    }
+    return 0;
+}
+
 // a --lora entry is "path" or "path:scale"
 static std::string vram_strip_lora_scale(const std::string & item) {
     const size_t colon = item.rfind(':');
@@ -1437,7 +1563,11 @@ static bool vram_probe_keep(const std::string & arg, bool & takes_value) {
         { "-ctk",            true  }, { "--cache-type-k",   true  },
         { "-ctv",            true  }, { "--cache-type-v",   true  },
         { "-fa",             true  }, { "--flash-attn",     true  },
+        { "-cmoe",           false }, { "--cpu-moe",        false },
         { "-ncmoe",          true  }, { "--n-cpu-moe",      true  },
+        { "-ncffn",          true  }, { "--n-cpu-ffn",      true  },
+        { "--moe-ram-mib",   true  }, { "--moe-placement",  true  },
+        { "--moe-cache-mib", true  }, { "--moe-cache-cpu-share", true },
         { "-ot",             true  }, { "--override-tensor",true  },
         { "--rope-scaling",  true  }, { "--rope-scale",     true  },
         { "--rope-freq-base",true  }, { "--rope-freq-scale",true  },
@@ -1479,8 +1609,14 @@ static const vram_opt_key VRAM_OPTS[] = {
     { "LLAMA_ARG_CACHE_TYPE_V", "cache-type-v" },
     { nullptr,                  "flash-attn" },
     { nullptr,                  "kv-unified" },
+    { nullptr,                  "kv-offload" },
     { nullptr,                  "no-kv-offload" },
-    { nullptr,                  "n-cpu-moe" },
+    { "LLAMA_ARG_CPU_MOE",      "cpu-moe" },
+    { "LLAMA_ARG_N_CPU_MOE",    "n-cpu-moe" },
+    { "LLAMA_ARG_N_CPU_FFN",    "n-cpu-ffn" },
+    { "LLAMA_ARG_MOE_RAM_MIB",  "moe-ram-mib" },
+    { "LLAMA_ARG_MOE_CACHE_MIB","moe-cache-mib" },
+    { "LLAMA_ARG_MOE_CACHE_CPU_SHARE", "moe-cache-cpu-share" },
     { "LLAMA_ARG_MMPROJ",       "mmproj" },
     { nullptr,                  "mmproj-device" },
     { nullptr,                  "model-draft" },
@@ -1488,19 +1624,47 @@ static const vram_opt_key VRAM_OPTS[] = {
     { nullptr,                  "lora" },
 };
 
+static bool vram_preset_opt(const common_preset & preset, const char * env, const char * arg, std::string & out);
+
 static bool vram_opt(const common_preset & preset, const vram_opt_key & key, std::string & out) {
-    if (key.env != nullptr && preset.get_option(key.env, out)) {
-        return true;
+    return vram_preset_opt(preset, key.env, key.arg, out);
+}
+
+// common_preset::get_option only matches the LLAMA_ARG_* env name, while presets are
+// usually written with the CLI spelling (gpu-layers, kv-offload, model-draft, ...).
+// Resolve by env name first, then by any positive or negated CLI alias, otherwise
+// every alias lookup silently returns nothing (wrong cache signatures, no draft
+// accounting, KV offload never detected).
+static bool vram_preset_opt(const common_preset & preset, const char * env, const char * arg, std::string & out) {
+    for (const auto & item : preset.options) {
+        const common_arg & opt = item.first;
+        if (env != nullptr && opt.env != nullptr && env == std::string(opt.env)) {
+            out = item.second;
+            return true;
+        }
+        if (arg == nullptr) {
+            continue;
+        }
+        const std::string want = std::string("--") + arg;
+        for (const char * a : opt.args) {
+            if (a != nullptr && want == a) {
+                out = item.second;
+                return true;
+            }
+        }
+        for (const char * a : opt.args_neg) {
+            if (a != nullptr && want == a) {
+                out = item.second;
+                return true;
+            }
+        }
     }
-    return preset.get_option(key.arg, out);
+    return false;
 }
 
 static std::string vram_opt(const common_preset & preset, const char * env, const char * arg) {
     std::string out;
-    if (env != nullptr && preset.get_option(env, out)) {
-        return out;
-    }
-    if (preset.get_option(arg, out)) {
+    if (vram_preset_opt(preset, env, arg, out)) {
         return out;
     }
     return {};
@@ -1584,6 +1748,19 @@ server_models::vram_entry server_models::vram_estimate(server_model_meta & meta,
     std::sort(devs.begin(), devs.end());
     devs.erase(std::unique(devs.begin(), devs.end()), devs.end());
 
+    // KV cache lives on the device only when KV offload is enabled; when it is
+    // off the KV bytes must not compete with weights for VRAM
+    bool kv_on_device = true;
+    {
+        std::string kv_val;
+        if (vram_preset_opt(meta.preset, nullptr, "kv-offload", kv_val)) {
+            kv_on_device = !(kv_val == "false" || kv_val == "0" || kv_val == "off" || kv_val == "no");
+        }
+        if (vram_preset_opt(meta.preset, nullptr, "no-kv-offload", kv_val)) {
+            kv_on_device = !(kv_val == "false" || kv_val == "0" || kv_val == "off" || kv_val == "no");
+        }
+    }
+
     // locate the measurement tool next to the running binary
     std::string probe_exe;
     {
@@ -1618,8 +1795,19 @@ server_models::vram_entry server_models::vram_estimate(server_model_meta & meta,
         // explodes (MoE expert weights copied to the main GPU in FP16); cap it.
         const std::string sm = opt(nullptr, "split-mode");
         const bool cap_compute = (sm.empty() || sm == "layer") && devs.size() > 1;
+        if (getenv("LLAMA_VRAM_DEBUG") != nullptr) {
+            std::string joined;
+            for (const auto & a : args) { joined += a; joined += ' '; }
+            SRV_INF("vram: probe args for %s: %s\n", meta.name.c_str(), joined.c_str());
+        }
         std::string err;
-        const auto probed = server_vram_probe(probe_exe, args, err, cap_compute);
+        std::vector<size_t> probed_ctx;
+        const auto probed = server_vram_probe(probe_exe, args, err, cap_compute, &probed_ctx);
+        if (getenv("LLAMA_VRAM_DEBUG") != nullptr) {
+            std::string got;
+            for (size_t k = 0; k < probed.size(); k++) { got += std::to_string(probed[k]); got += ' '; }
+            SRV_INF("vram: probe result for %s: [%s] err=%s\n", meta.name.c_str(), got.c_str(), err.c_str());
+        }
         if (probed.empty()) {
             SRV_WRN("vram: could not measure name=%s (%s), falling back to a size estimate\n",
                     meta.name.c_str(), err.c_str());
@@ -1627,7 +1815,15 @@ server_models::vram_entry server_models::vram_estimate(server_model_meta & meta,
             // probe device k is the k-th device this preset asked for
             per_dev.assign((size_t) devs.back() + 1, 0);
             for (size_t k = 0; k < probed.size() && k < devs.size(); k++) {
-                per_dev[(size_t) devs[k]] += probed[k];
+                size_t v = probed[k];
+                // the probe always models the KV cache on the device; with KV
+                // offload disabled that memory is host resident, so subtract it
+                // (otherwise more layers never appear to fit and the VRAM freed
+                // by moving KV to the host is wasted)
+                if (!kv_on_device && k < probed_ctx.size() && probed_ctx[k] < v) {
+                    v -= probed_ctx[k];
+                }
+                per_dev[(size_t) devs[k]] += v;
             }
         }
     }
@@ -1636,9 +1832,44 @@ server_models::vram_entry server_models::vram_estimate(server_model_meta & meta,
         // no measurement: weights plus a generous per-token allowance for the context
         const size_t model_bytes = vram_file_size(opt("LLAMA_ARG_MODEL", "model"));
         const int64_t n_ctx = std::max<int64_t>(4096, atoll(opt("LLAMA_ARG_CTX_SIZE", "ctx-size").c_str()));
-        const size_t base = model_bytes + model_bytes / 20 + (size_t) n_ctx * 18 * 1024;
-        per_dev.assign((size_t) devs.back() + 1, 0);
-        per_dev[(size_t) devs[0]] = base;
+
+        // Account for partial GPU offload: when gpu-layers is set to a specific
+        // number, only the weights for the GPU-allocated layers need to fit in VRAM.
+        // The remaining layers are offloaded to system RAM.
+        const std::string n_gpu_layers_str = opt("LLAMA_ARG_N_GPU_LAYERS", "n-gpu-layers");
+        int n_gpu_layers = -1;
+        if (!n_gpu_layers_str.empty()) {
+            const char * cstr = const_cast<char *>(n_gpu_layers_str.c_str());
+            long n_gl = strtoll(cstr, nullptr, 10);
+            if (n_gl > 0 && n_gl <= 100000) {
+                n_gpu_layers = static_cast<int>(n_gl);
+            }
+        }
+
+        // Real layer count from the GGUF header: the GPU share is then the
+        // actual n_gpu_layers / block_count fraction of the weights, not a guess.
+        const std::string model_path = opt("LLAMA_ARG_MODEL", "model");
+        size_t total_layers = vram_gguf_block_count(model_path);
+        if (total_layers == 0) {
+            total_layers = 100; // unreadable header: stay conservative
+        }
+        if (n_gpu_layers > 0 && n_gpu_layers < total_layers) {
+            // Only the GPU-allocated layers keep their weights *and* their KV cache
+            // on the device; the rest live in system RAM.
+            const size_t gpu_weight_bytes = model_bytes * n_gpu_layers / total_layers;
+            const size_t gpu_ctx_bytes    = kv_on_device
+                ? (size_t) n_ctx * 18 * 1024 * n_gpu_layers / total_layers
+                : 0;
+            const size_t base = gpu_weight_bytes + gpu_weight_bytes / 20 + gpu_ctx_bytes;
+            per_dev.assign((size_t) devs.back() + 1, 0);
+            per_dev[(size_t) devs[0]] = base;
+        } else {
+            // No partial offload (gpu-layers >= total, or "auto"/"all") - use full model size
+            const size_t ctx_bytes = kv_on_device ? (size_t) n_ctx * 18 * 1024 : 0;
+            const size_t base = model_bytes + model_bytes / 20 + ctx_bytes;
+            per_dev.assign((size_t) devs.back() + 1, 0);
+            per_dev[(size_t) devs[0]] = base;
+        }
     }
 
     auto add_to_dev = [&per_dev](int idx, size_t bytes) {
@@ -1659,7 +1890,11 @@ server_models::vram_entry server_models::vram_estimate(server_model_meta & meta,
         add_to_dev(idx, mmproj_bytes + 192 * VRAM_MIB);
     }
 
-    const std::string draft = opt(nullptr, "model-draft");
+    // a draft sidecar (mtp-/dspark-/dflash-) is discovered automatically next to the model, but
+    // with speculative decoding disabled it is never loaded, so it must not be charged to VRAM
+    const std::string spec_type = opt(nullptr, "spec-type");
+    const bool spec_enabled = spec_type.empty() ? true : (spec_type != "none" && spec_type != "off" && spec_type != "false");
+    const std::string draft = spec_enabled ? opt(nullptr, "model-draft") : std::string();
     if (!draft.empty()) {
         const std::string s = opt(nullptr, "spec-draft-device");
         const int idx = s.empty() ? devs[0] : server_vram::dev_index_from_name(s);
@@ -1683,6 +1918,13 @@ server_models::vram_entry server_models::vram_estimate(server_model_meta & meta,
         }
     }
 
+    if (getenv("LLAMA_VRAM_DEBUG") != nullptr) {
+        std::string bd;
+        for (size_t k = 0; k < per_dev.size(); k++) { bd += std::to_string(k) + "=" + std::to_string(per_dev[k]/VRAM_MIB) + "MiB "; }
+        SRV_INF("vram: final per_dev for %s: %s (reserve=%zu MiB, mmproj=%zu MiB, draft='%s' %zu MiB, lora=%zu MiB)\n",
+                meta.name.c_str(), bd.c_str(), reserve/VRAM_MIB, mmproj_bytes/VRAM_MIB,
+                draft.c_str(), vram_file_size(draft)/VRAM_MIB, lora_bytes/VRAM_MIB);
+    }
     entry.per_dev = std::move(per_dev);
     return entry;
 }

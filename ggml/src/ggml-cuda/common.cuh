@@ -241,11 +241,21 @@ static const char * cu_get_error_str(CUresult err) {
 #if !defined(GGML_USE_HIP)
 #    define CUDA_SET_SHARED_MEMORY_LIMIT(kernel, nbytes)                                                       \
         do {                                                                                                   \
-            static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = { false };                         \
+            static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = { false };                          \
             const int   id                                                = ggml_cuda_get_device();            \
+            const size_t limit_bytes = ((size_t) (nbytes) == 0 || (size_t) (nbytes) > 256u*1024u)               \
+                                     ? (size_t) 48u*1024u : (size_t) (nbytes);                                 \
             if (!shared_memory_limit_raised[id]) {                                                             \
-                CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes)); \
-                shared_memory_limit_raised[id] = true;                                                         \
+                const cudaError_t smem_set_err =                                                               \
+                    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, limit_bytes);     \
+                if (smem_set_err == cudaSuccess) {                                                             \
+                    shared_memory_limit_raised[id] = true;                                                     \
+                } else {                                                                                       \
+                    (void) cudaGetLastError();                                                                 \
+                    GGML_LOG_DEBUG("%s: shared-memory limit %zu not raised on device %d (%s); "                 \
+                                   "deferring - normal during CUDA graph capture\n",                           \
+                                   __func__, limit_bytes, id, cudaGetErrorString(smem_set_err));               \
+                }                                                                                              \
             }                                                                                                  \
         } while (0)
 #else

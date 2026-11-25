@@ -309,6 +309,16 @@ private:
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;
 
+    // arena-path MoE profile recorder (active when the VRAM cache budget is 0;
+    // the loader-side placement consumes the profile at the next model load)
+    std::vector<uint32_t> moe_prof_counts;
+    std::string  moe_prof_path;
+    int32_t      moe_prof_nl = 0;
+    int32_t      moe_prof_ne = 0;
+    int32_t      moe_prof_nused = 0;
+    uint64_t     moe_prof_tokens = 0;
+    uint64_t     moe_prof_calls = 0;
+
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
 
@@ -379,6 +389,29 @@ private:
         std::vector<bool>    used;
         // host staging for experts served straight from disk (no combined buffer)
         std::vector<uint8_t> stage;
+        // whole-layer batched staging, double buffered: buffer i is filled with
+        // parallel preads while the other buffer's upload from the previous
+        // layer is still in flight, so disk reads overlap H2D instead of
+        // serialising behind a per-group synchronize.
+        std::vector<uint8_t> stage_all[2];
+        // the same buffers allocated as pinned host memory through the device's
+        // host buffer type (cudaHostAlloc), so the H2D upload reads from pinned
+        // pages instead of pageable ones
+        ggml_backend_buffer_t stage_pinned[2] = { nullptr, nullptr };
+        size_t                stage_pinned_n[2] = { 0, 0 };
+        std::vector<int>     stage_pos;   // compact slot per expert id, -1 if unused
+        int                  stage_toggle = 0;
+        // a buffer may still be the source of an in-flight H2D upload; it must
+        // be drained before being refilled
+        bool                 stage_dirty[2] = { false, false };
+
+        ~copy_experts_info() { stage_release(); }
+
+        // returns a buffer of at least `need` bytes: pinned when the device has a
+        // host buffer type, pageable vector otherwise
+        uint8_t * stage_ensure(int i, size_t need, ggml_backend_t backend);
+        uint8_t * stage_base(int i);
+        void      stage_release();
 
         void reset() {
             ids = nullptr;

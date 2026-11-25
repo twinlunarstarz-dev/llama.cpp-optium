@@ -228,7 +228,8 @@ static const long long VRAM_PROBE_COMPUTE_CAP_MIB = 4096;
 std::vector<size_t> server_vram_probe(const std::string & exe,
                                       const std::vector<std::string> & args,
                                       std::string & err,
-                                      bool cap_compute_layer_split) {
+                                      bool cap_compute_layer_split,
+                                      std::vector<size_t> * ctx_out) {
 #if defined(_WIN32)
     (void) exe; (void) args;
     err = "probing is not supported on this build";
@@ -348,6 +349,9 @@ std::vector<size_t> server_vram_probe(const std::string & exe,
         // whatever subset it was given, so the results are returned in emission
         // order and the caller maps them back to real device indices.
         per_dev.push_back(bytes);
+        if (ctx_out != nullptr) {
+            ctx_out->push_back((size_t) v[1] * MIB);
+        }
     }
 
     if (per_dev.empty()) {

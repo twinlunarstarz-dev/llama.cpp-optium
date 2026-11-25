@@ -6,6 +6,7 @@
 #include <bitset>
 #include <cassert>
 #include <cstring>
+#include <algorithm>
 #include <limits>
 #include <set>
 #include <vector>

@@ -1,8 +1,8 @@
 #include "mmvq.cuh"
-
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
+#include "vecdotq-p100.cuh"
 
 #include <cstdint>
 #include <type_traits>
@@ -46,19 +46,56 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
 #if !defined(GGML_USE_HIP)
         case GGML_TYPE_PTQ1_0:  return vec_dot_ptq1_0_q8_1;
 #endif
+        // P100: one lane per block (vdr = qi), aligned loads + funnel shift (vecdotq-p100.cuh)
+#if defined(__CUDA_ARCH_LIST__) && __CUDA_ARCH_LIST__ == 600
+        case GGML_TYPE_Q4_0:    return vec_dot_q4_0_q8_1_p100;
+#else
         case GGML_TYPE_Q4_0:    return vec_dot_q4_0_q8_1;
+#endif
+        // P100: one lane per block (vdr = qi), aligned loads + funnel shift (vecdotq-p100.cuh)
+#if defined(__CUDA_ARCH_LIST__) && __CUDA_ARCH_LIST__ == 600
+        case GGML_TYPE_Q4_1:    return vec_dot_q4_1_q8_1_p100;
+#else
         case GGML_TYPE_Q4_1:    return vec_dot_q4_1_q8_1;
+#endif
+        // P100: one lane per block (vdr = qi), aligned loads + funnel shift (vecdotq-p100.cuh)
+#if defined(__CUDA_ARCH_LIST__) && __CUDA_ARCH_LIST__ == 600
+        case GGML_TYPE_Q5_0:    return vec_dot_q5_0_q8_1_p100;
+#else
         case GGML_TYPE_Q5_0:    return vec_dot_q5_0_q8_1;
+#endif
+        // P100: one lane per block (vdr = qi), aligned loads + funnel shift (vecdotq-p100.cuh)
+#if defined(__CUDA_ARCH_LIST__) && __CUDA_ARCH_LIST__ == 600
+        case GGML_TYPE_Q5_1:    return vec_dot_q5_1_q8_1_p100;
+#else
         case GGML_TYPE_Q5_1:    return vec_dot_q5_1_q8_1;
+#endif
+        // P100: one lane per block (vdr = qi), aligned loads + funnel shift (vecdotq-p100.cuh)
+#if defined(__CUDA_ARCH_LIST__) && __CUDA_ARCH_LIST__ == 600
+        case GGML_TYPE_Q8_0:    return vec_dot_q8_0_q8_1_p100;
+#else
         case GGML_TYPE_Q8_0:    return vec_dot_q8_0_q8_1;
+#endif
         case GGML_TYPE_Q1_0_g128: return vec_dot_q1_0_g128_q8_1;
         case GGML_TYPE_Q1_T_g128: return vec_dot_q1_t_g128_q8_1;
         case GGML_TYPE_MXFP4:   return vec_dot_mxfp4_q8_1;
         case GGML_TYPE_NVFP4:   return vec_dot_nvfp4_q8_1;
+        // P100: weight halves fed straight to the XMADs, min/bias folded in, vdr 4 (vecdotq-p100.cuh)
+#if defined(__CUDA_ARCH_LIST__) && __CUDA_ARCH_LIST__ == 600 // sm_60-only build (GGML_CUDA_MMVQ_PASCAL is defined below)
+        case GGML_TYPE_Q2_K:    return vec_dot_q2_K_q8_1_p100;
+        case GGML_TYPE_Q3_K:    return vec_dot_q3_K_q8_1_p100;
+#else
         case GGML_TYPE_Q2_K:    return vec_dot_q2_K_q8_1;
         case GGML_TYPE_Q3_K:    return vec_dot_q3_K_q8_1;
+#endif
+        // P100: quant halves fed straight to the XMADs, vdr 4, exact integer sums (vecdotq-p100.cuh)
+#if defined(__CUDA_ARCH_LIST__) && __CUDA_ARCH_LIST__ == 600
+        case GGML_TYPE_Q4_K:    return vec_dot_q4_K_q8_1_p100;
+        case GGML_TYPE_Q5_K:    return vec_dot_q5_K_q8_1_p100;
+#else
         case GGML_TYPE_Q4_K:    return vec_dot_q4_K_q8_1;
         case GGML_TYPE_Q5_K:    return vec_dot_q5_K_q8_1;
+#endif
         case GGML_TYPE_Q6_K:    return vec_dot_q6_K_q8_1;
         case GGML_TYPE_IQ2_XXS: return vec_dot_iq2_xxs_q8_1;
         case GGML_TYPE_IQ2_XS:  return vec_dot_iq2_xs_q8_1;
@@ -66,8 +103,18 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
         case GGML_TYPE_IQ3_XXS: return vec_dot_iq3_xxs_q8_1;
         case GGML_TYPE_IQ1_S:   return vec_dot_iq1_s_q8_1;
         case GGML_TYPE_IQ1_M:   return vec_dot_iq1_m_q8_1;
+        // P100: one lane per block (vdr = qi), aligned loads + funnel shift (vecdotq-p100.cuh)
+#if defined(__CUDA_ARCH_LIST__) && __CUDA_ARCH_LIST__ == 600
+        case GGML_TYPE_IQ4_NL:  return vec_dot_iq4_nl_q8_1_p100;
+#else
         case GGML_TYPE_IQ4_NL:  return vec_dot_iq4_nl_q8_1;
+#endif
+        // P100: halves fed straight to the XMADs, fewer table PRMTs (vecdotq-p100.cuh)
+#if defined(__CUDA_ARCH_LIST__) && __CUDA_ARCH_LIST__ == 600
+        case GGML_TYPE_IQ4_XS:  return vec_dot_iq4_xs_q8_1_p100;
+#else
         case GGML_TYPE_IQ4_XS:  return vec_dot_iq4_xs_q8_1;
+#endif
         case GGML_TYPE_IQ3_S:   return vec_dot_iq3_s_q8_1;
         default:                return nullptr;
     }
@@ -81,27 +128,72 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
 #if !defined(GGML_USE_HIP)
         case GGML_TYPE_PTQ1_0:  return VDR_PTQ1_0_Q8_1_MMVQ;
 #endif
+        // P100: one lane per block (vdr = qi), aligned loads + funnel shift (vecdotq-p100.cuh)
+#if defined(__CUDA_ARCH_LIST__) && __CUDA_ARCH_LIST__ == 600
+        case GGML_TYPE_Q4_0:    return VDR_Q4_0_Q8_1_MMVQ_P100;
+#else
         case GGML_TYPE_Q4_0:    return VDR_Q4_0_Q8_1_MMVQ;
+#endif
+        // P100: one lane per block (vdr = qi), aligned loads + funnel shift (vecdotq-p100.cuh)
+#if defined(__CUDA_ARCH_LIST__) && __CUDA_ARCH_LIST__ == 600
+        case GGML_TYPE_Q4_1:    return VDR_Q4_1_Q8_1_MMVQ_P100;
+#else
         case GGML_TYPE_Q4_1:    return VDR_Q4_1_Q8_1_MMVQ;
+#endif
+        // P100: one lane per block (vdr = qi), aligned loads + funnel shift (vecdotq-p100.cuh)
+#if defined(__CUDA_ARCH_LIST__) && __CUDA_ARCH_LIST__ == 600
+        case GGML_TYPE_Q5_0:    return VDR_Q5_0_Q8_1_MMVQ_P100;
+#else
         case GGML_TYPE_Q5_0:    return VDR_Q5_0_Q8_1_MMVQ;
+#endif
+        // P100: one lane per block (vdr = qi), aligned loads + funnel shift (vecdotq-p100.cuh)
+#if defined(__CUDA_ARCH_LIST__) && __CUDA_ARCH_LIST__ == 600
+        case GGML_TYPE_Q5_1:    return VDR_Q5_1_Q8_1_MMVQ_P100;
+#else
         case GGML_TYPE_Q5_1:    return VDR_Q5_1_Q8_1_MMVQ;
+#endif
+        // P100: one lane per block (vdr = qi), aligned loads + funnel shift (vecdotq-p100.cuh)
+#if defined(__CUDA_ARCH_LIST__) && __CUDA_ARCH_LIST__ == 600
+        case GGML_TYPE_Q8_0:    return VDR_Q8_0_Q8_1_MMVQ_P100;
+#else
         case GGML_TYPE_Q8_0:    return VDR_Q8_0_Q8_1_MMVQ;
+#endif
         case GGML_TYPE_Q1_0_g128: return VDR_Q1_0_G128_Q8_1_MMVQ;
         case GGML_TYPE_Q1_T_g128: return VDR_Q1_T_G128_Q8_1_MMVQ;
         case GGML_TYPE_MXFP4:   return VDR_MXFP4_Q8_1_MMVQ;
         case GGML_TYPE_NVFP4:   return VDR_NVFP4_Q8_1_MMVQ;
+#if defined(__CUDA_ARCH_LIST__) && __CUDA_ARCH_LIST__ == 600 // sm_60-only build (GGML_CUDA_MMVQ_PASCAL is defined below)
+        case GGML_TYPE_Q2_K:    return VDR_Q2_K_Q8_1_MMVQ_P100;
+        case GGML_TYPE_Q3_K:    return VDR_Q3_K_Q8_1_MMVQ_P100;
+#else
         case GGML_TYPE_Q2_K:    return VDR_Q2_K_Q8_1_MMVQ;
         case GGML_TYPE_Q3_K:    return VDR_Q3_K_Q8_1_MMVQ;
+#endif
+#if defined(__CUDA_ARCH_LIST__) && __CUDA_ARCH_LIST__ == 600
+        case GGML_TYPE_Q4_K:    return VDR_Q4_K_Q8_1_MMVQ_P100;
+        case GGML_TYPE_Q5_K:    return VDR_Q5_K_Q8_1_MMVQ_P100;
+#else
         case GGML_TYPE_Q4_K:    return VDR_Q4_K_Q8_1_MMVQ;
         case GGML_TYPE_Q5_K:    return VDR_Q5_K_Q8_1_MMVQ;
+#endif
         case GGML_TYPE_Q6_K:    return VDR_Q6_K_Q8_1_MMVQ;
         case GGML_TYPE_IQ2_XXS: return VDR_IQ2_XXS_Q8_1_MMVQ;
         case GGML_TYPE_IQ2_XS:  return VDR_IQ2_XS_Q8_1_MMVQ;
         case GGML_TYPE_IQ2_S:   return VDR_IQ2_S_Q8_1_MMVQ;
         case GGML_TYPE_IQ3_XXS: return VDR_IQ3_XXS_Q8_1_MMVQ;
         case GGML_TYPE_IQ3_S:   return VDR_IQ3_S_Q8_1_MMVQ;
+        // P100: one lane per block (vdr = qi), aligned loads + funnel shift (vecdotq-p100.cuh)
+#if defined(__CUDA_ARCH_LIST__) && __CUDA_ARCH_LIST__ == 600
+        case GGML_TYPE_IQ4_NL:  return VDR_IQ4_NL_Q8_1_MMVQ_P100;
+#else
         case GGML_TYPE_IQ4_NL:  return VDR_IQ4_NL_Q8_1_MMVQ;
+#endif
+        // P100: halves fed straight to the XMADs, fewer table PRMTs (vecdotq-p100.cuh)
+#if defined(__CUDA_ARCH_LIST__) && __CUDA_ARCH_LIST__ == 600
+        case GGML_TYPE_IQ4_XS:  return VDR_IQ4_XS_Q8_1_MMVQ_P100;
+#else
         case GGML_TYPE_IQ4_XS:  return VDR_IQ4_XS_Q8_1_MMVQ;
+#endif
         default:                return 1;
     }
 }

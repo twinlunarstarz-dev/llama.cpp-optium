@@ -309,7 +309,35 @@ static void common_params_fit_impl(
     }
 
     int64_t sum_free            = 0;
-    int64_t sum_projected_free  = 0;
+    // Prefill compute buffers grow linearly with n_ubatch and, on architectures that
+    // have no flash-attention kernel, they dominate VRAM at a long context: a 512
+    // ubatch at 180k context needs ~17 GiB of compute buffers on a 12 GiB card.
+    // Clamp the ubatch instead of letting the caller reject the model outright.
+    for (int attempt = 0; nd > 0 && attempt < 8; attempt++) {
+        bool over = false;
+        for (size_t id = 0; id < nd; id++) {
+            const int64_t want = (int64_t) dmds_full[id].mb.total() + margins[id];
+            if (want > (int64_t) dmds_full[id].free) {
+                over = true;
+                break;
+            }
+        }
+        if (!over) {
+            break;
+        }
+        const uint32_t nb = cparams->n_ubatch > 0 ? cparams->n_ubatch : 512;
+        if (nb <= 32) {
+            break;
+        }
+        const uint32_t nb_new = std::max<uint32_t>(32, nb / 2);
+        LOG_WRN("%s: prefill compute buffers do not fit at ubatch %" PRIu32 ", retrying at %" PRIu32 "\n",
+                __func__, nb, nb_new);
+        cparams->n_ubatch = nb_new;
+        dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+        add_extra_memory(dmds_full);
+    }
+
+int64_t sum_projected_free  = 0;
     int64_t sum_projected_used  = 0;
     int64_t sum_projected_model = 0;
     std::vector<int64_t> projected_free_per_device;

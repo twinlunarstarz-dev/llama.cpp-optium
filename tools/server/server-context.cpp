@@ -1127,10 +1127,11 @@ private:
 
         const bool has_mmproj = !params.mmproj.path.empty();
         const bool has_draft = params.speculative.has_dft();
-        const bool spec_mtp = std::find(params_base.speculative.types.begin(),
-                                        params_base.speculative.types.end(),
-                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
-        const bool has_spec = has_draft || spec_mtp;
+        // a set --model-draft alone must not enable speculative decoding: only
+        // an enabled draft-* spec type needs the draft model/context (with e.g.
+        // --spec-type none the draft GGUF would be built as a plain context and
+        // crash in the qwen4exp expert-mix graph build)
+        const bool has_spec = common_speculative_needs_draft_ctx(params_base.speculative.types);
 
         if (callback_state) {
             std::vector<std::string> stages = {"text_model"};

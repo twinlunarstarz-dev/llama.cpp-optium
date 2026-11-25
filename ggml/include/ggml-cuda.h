@@ -67,6 +67,13 @@ GGML_BACKEND_API bool ggml_backend_cuda_get_metrics(ggml_backend_t backend, stru
 GGML_BACKEND_API bool ggml_backend_cuda_get_metrics_delta(ggml_backend_t backend, const struct ggml_backend_cuda_metrics * baseline, struct ggml_backend_cuda_metrics * out);
 GGML_BACKEND_API void ggml_backend_cuda_reset_metrics(ggml_backend_t backend);
 
+// Disable CUDA graph capture/replay for all CUDA backends in this process.
+// The MoE expert-cache issues dynamic H2D staged copies from the sched eval
+// callback; those copies are captured into the graph and replayed with stale
+// slot offsets, producing silently corrupted expert weights. Callers that
+// enable such dynamic per-ubatch copies must disable graphs.
+GGML_BACKEND_API void ggml_backend_cuda_disable_graphs(bool disabled);
+
 #ifdef  __cplusplus
 }
 #endif

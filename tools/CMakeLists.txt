@@ -22,7 +22,7 @@ else()
     add_subdirectory(perplexity)
     add_subdirectory(quantize)
     if (LLAMA_BUILD_SERVER)
-        add_subdirectory(ui)
+        # add_subdirectory(ui)  # Disabled for now
         add_subdirectory(cli)
         add_subdirectory(server)
     endif()

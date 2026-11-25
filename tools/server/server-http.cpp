@@ -2,7 +2,9 @@
 #include "http.h"
 #include "server-http.h"
 #include "server-common.h"
+#if defined(LLAMA_UI_HAS_ASSETS)
 #include "ui.h"
+#endif
 
 #include <cpp-httplib/httplib.h>
 
@@ -239,6 +241,7 @@ bool server_http_context::init_listener(const common_params & params) {
     //
 
     // Frontend paths - all embedded UI assets
+#if defined(LLAMA_UI_HAS_ASSETS)
     static const std::unordered_set<std::string> frontend_paths = []() {
         std::unordered_set<std::string> paths { "/" };
         for (const llama_ui_asset & a : llama_ui_get_assets()) {
@@ -246,8 +249,12 @@ bool server_http_context::init_listener(const common_params & params) {
         }
         return paths;
     }();
+#else
+    static const std::unordered_set<std::string> frontend_paths = { "/" };
+#endif
 
     // Public endpoints - API routes plus all embedded UI assets
+#if defined(LLAMA_UI_HAS_ASSETS)
     static const std::unordered_set<std::string> get_public_endpoints = []() {
         std::unordered_set<std::string> endpoints {
             "/health",
@@ -256,6 +263,12 @@ bool server_http_context::init_listener(const common_params & params) {
         endpoints.insert(frontend_paths.begin(), frontend_paths.end());
         return endpoints;
     }();
+#else
+    static const std::unordered_set<std::string> get_public_endpoints = {
+        "/health",
+        "/v1/health",
+    };
+#endif
 
     auto middleware_validate_api_key = [api_keys = params.api_keys](const httplib::Request & req, httplib::Response & res) {
         // If API key is not set, skip validation

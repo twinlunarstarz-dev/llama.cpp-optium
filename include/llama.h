@@ -408,7 +408,9 @@ extern "C" {
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
-        size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
+        size_t moe_cache_size; // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled, SIZE_MAX = auto [EXPERIMENTAL]
+        float  moe_cache_cpu_share; // share of MoE cache misses computed on the CPU instead of uploaded, 0 = all uploaded [EXPERIMENTAL]
+        size_t moe_cache_reserve; // VRAM bytes to keep free for compute/mmproj/draft when sizing the MoE cache, 0 = default [EXPERIMENTAL]
         const char * moe_profile; // record per-expert activation counts to this JSON path, NULL = off [EXPERIMENTAL]
         const char * moe_hot;     // seed and pin the MoE cache from this JSON profile, NULL = off [EXPERIMENTAL]
 

@@ -1,6 +1,124 @@
 #include <map>
 #include "llama-model-loader.h"
 
+
+// Free memory right now, in MiB, as the kernel sees it (page cache included).
+static size_t moe_meminfo_mib(const char * key) {
+    FILE * f = fopen("/proc/meminfo", "r");
+    if (f == nullptr) {
+        return 0;
+    }
+    char line[256];
+    size_t out = 0;
+    const size_t klen = strlen(key);
+    while (fgets(line, sizeof(line), f) != nullptr) {
+        if (strncmp(line, key, klen) == 0) {
+            unsigned long long kb = 0;
+            if (sscanf(line + klen, ": %llu kB", &kb) == 1) {
+                out = (size_t) (kb / 1024);
+            }
+            break;
+        }
+    }
+    fclose(f);
+    return out;
+}
+
+// A fixed --moe-ram-mib is sized from *total* RAM, but the RAM tier is anonymous
+// memory and therefore competes with the KV cache, the draft model and every other
+// process in the same cgroup slice. When the host is already busy the requested cap
+// is unreachable and the arena over-commits, which is what made this server OOM-loop
+// mid-load. Clamp to a fraction of what is actually free.
+static size_t moe_effective_ram_mib(size_t requested) {
+    // The RAM-tier arena is opt-in: rebinding experts to host memory makes the GPU
+    // pull weights over PCIe that it could have read straight from the mapped GGUF,
+    // which measured 2.9 vs 10.4 tok/s prompt and multi-minute stalls on this host.
+    // Any config asking for it (a preset, a stale .ini) is pinned to zero unless the
+    // operator explicitly opts in.
+    if (requested > 0) {
+        const char * arena_env = getenv("LLAMA_MOE_ARENA");
+        if (arena_env == nullptr || atoi(arena_env) == 0) {
+            return 0;
+        }
+    }
+    const size_t avail = moe_meminfo_mib("MemAvailable");
+    if (avail == 0) {
+        return requested;
+    }
+    float frac = 0.70f;
+    if (const char * e = getenv("LLAMA_MOE_RAM_FRACTION")) {
+        const float v = (float) atof(e);
+        if (v > 0.0f && v <= 1.0f) {
+            frac = v;
+        }
+    }
+    // Headroom for everything the arena does not own: KV cache, compute buffers,
+    // draft model, page cache for attention weights.
+    const size_t reserve = 6144;
+    const size_t share   = (size_t) ((double) avail * (double) frac);
+    size_t budget        = share > reserve ? share - reserve : share / 2;
+
+    // MemAvailable counts reclaimable page cache, and the mmap'd GGUF *is* page cache.
+    // Sizing the anonymous arena off that number lets the preload consume the very pages
+    // that were serving expert reads, which is how a 31 GiB arena drove this host into
+    // swap and stalled the whole box. Bound it by physical RAM as well.
+    const size_t total = moe_meminfo_mib("MemTotal");
+    if (total > 0) {
+        const size_t hard = (size_t) ((double) total * (double) frac);
+        const size_t cap  = hard > reserve ? hard - reserve : hard / 2;
+        if (cap < budget) {
+            budget = cap;
+        }
+    }
+    return requested < budget ? requested : budget;
+}
+
+// Memory-pressure governor for the arena preload. The preload is a synchronous burst of
+// anonymous writes; if the host is already short on free memory it evicts the page cache
+// the same process is reading experts from and the machine stalls. These helpers let the
+// preload pace itself and give up early (the arena then fills on demand) instead of
+// turning a load into a system-wide hang.
+static bool moe_read_proc_line(const char * path, const char * key, char * out, size_t out_cap) {
+    FILE * f = fopen(path, "r");
+    if (f == nullptr) {
+        return false;
+    }
+    char line[512];
+    bool found = false;
+    const size_t klen = strlen(key);
+    while (fgets(line, sizeof(line), f) != nullptr) {
+        if (strncmp(line, key, klen) == 0) {
+            size_t n = strlen(line);
+            while (n > 0 && (line[n-1] == '\n' || line[n-1] == '\r')) {
+                line[--n] = '\0';
+            }
+            snprintf(out, out_cap, "%s", line + klen);
+            found = true;
+            break;
+        }
+    }
+    fclose(f);
+    return found;
+}
+
+// "some avg10=0.00 avg60=0.00 avg300=0.00 total=0" -> 0.00 ; 0.0 when unavailable
+static double moe_memory_pressure(void) {
+    char line[512];
+    if (!moe_read_proc_line("/proc/pressure/memory", "some", line, sizeof(line))) {
+        return 0.0;
+    }
+    const char * p = strstr(line, "avg10=");
+    return p != nullptr ? atof(p + 6) : 0.0;
+}
+
+static size_t moe_swap_used_mib(void) {
+    const size_t total = moe_meminfo_mib("SwapTotal");
+    const size_t free_ = moe_meminfo_mib("SwapFree");
+    return total > free_ ? total - free_ : 0;
+}
+
+
+
 #include "ggml-alloc.h"
 #include "ggml.h"
 #include "gguf.h"
@@ -26,6 +144,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
@@ -551,6 +670,51 @@ namespace GGUFMeta {
     template bool llama_model_loader::get_key_or_arr<std::array<float,    512>>(enum llm_kv kid, std::array<float,    512> & result, uint32_t n, bool required);
 
 
+// Read a per-layer uint32 array (or a scalar broadcast to every layer) from GGUF
+// metadata. Returns false when the key is absent or its element type is not an
+// integer type we can read; `out` is then left sized n_layer and zeroed, which
+// is also what llama_hparams holds for an absent key - so the geometry
+// fingerprint computed on either side stays identical.
+static bool moe_read_layer_array(struct gguf_context * metadata, const std::string & key, int n_layer, std::vector<uint32_t> & out) {
+    out.assign((size_t) std::max(0, n_layer), 0);
+    if (metadata == nullptr || n_layer <= 0 || key.empty()) {
+        return false;
+    }
+    const int kid = gguf_find_key(metadata, key.c_str());
+    if (kid < 0) {
+        return false;
+    }
+    const enum gguf_type kt = gguf_get_kv_type(metadata, kid);
+    if (kt == GGUF_TYPE_ARRAY) {
+        const size_t n = gguf_get_arr_n(metadata, kid);
+        const enum gguf_type at = gguf_get_arr_type(metadata, kid);
+        const void * data = gguf_get_arr_data(metadata, kid);
+        if (data == nullptr) {
+            return false;
+        }
+        for (size_t i = 0; i < n; ++i) {
+            uint32_t v = 0;
+            if      (at == GGUF_TYPE_UINT32) v = ((const uint32_t *) data)[i];
+            else if (at == GGUF_TYPE_INT32)  v = (uint32_t) ((const int32_t *) data)[i];
+            else if (at == GGUF_TYPE_UINT64) v = (uint32_t) ((const uint64_t *) data)[i];
+            else if (at == GGUF_TYPE_INT64)  v = (uint32_t) ((const int64_t *) data)[i];
+            else return false;
+            if ((int) i < n_layer) {
+                out[i] = v;
+            }
+        }
+        return true;
+    }
+    uint32_t v = 0;
+    if      (kt == GGUF_TYPE_UINT32) v = gguf_get_val_u32(metadata, kid);
+    else if (kt == GGUF_TYPE_INT32)  v = (uint32_t) gguf_get_val_i32(metadata, kid);
+    else if (kt == GGUF_TYPE_UINT64) v = (uint32_t) gguf_get_val_u64(metadata, kid);
+    else if (kt == GGUF_TYPE_INT64)  v = (uint32_t) gguf_get_val_i64(metadata, kid);
+    else return false;
+    std::fill(out.begin(), out.end(), v); // scalar: every layer uses the same value
+    return true;
+}
+
 llama_model_loader::llama_model_loader(
         struct gguf_context * meta,
         llama_model_set_tensor_data_t set_tensor_data,
@@ -875,6 +1039,16 @@ llama_model_loader::llama_model_loader(
     this->load_mtp = load_mtp;
 
 
+    if (moe_ram_mib > 0) {
+        const size_t eff = moe_effective_ram_mib(moe_ram_mib);
+        if (eff < moe_ram_mib) {
+            LLAMA_LOG_WARN("%s: --moe-ram-mib %zu MiB exceeds the free-RAM budget "
+                           "(MemAvailable %zu MiB), clamped to %zu MiB\n",
+                           __func__, moe_ram_mib, moe_meminfo_mib("MemAvailable"), eff);
+            moe_ram_mib = eff;
+        }
+    }
+
     // MoE tiered placement: compute plan and initialize RAM arena
     LLAMA_LOG_INFO("%s: moe diag: ram_mib=%zu metadata=%p fname='%s'\n",
                    __func__, moe_ram_mib, (const void *) metadata, fname.c_str());
@@ -900,14 +1074,37 @@ llama_model_loader::llama_model_loader(
             return 0;
         };
 
-        n_layer = (int) get_u64("qwen4exp.block_count");
-        if (n_layer == 0) n_layer = (int) get_u64("llama.block_count");
+        // Keys are arch-prefixed ("nemotron_h_moe.expert_count", ...), so resolve
+        // them through llm_kv and keep the historical qwen4exp/llama spellings as
+        // fallbacks. Hard-coding the prefixes made n_expert read as 0 for every
+        // other MoE arch, which silently skipped the whole arena.
+        auto get_u64_kv = [&](enum llm_kv kid, const char * alt1, const char * alt2) -> uint64_t {
+            uint64_t v = get_u64(llm_kv(kid).c_str());
+            if (v == 0 && alt1 != nullptr) v = get_u64(alt1);
+            if (v == 0 && alt2 != nullptr) v = get_u64(alt2);
+            return v;
+        };
 
-        n_expert = (int) get_u64("qwen4exp.expert_count");
-        if (n_expert == 0) n_expert = (int) get_u64("llama.expert_count");
+        n_layer = (int) get_u64_kv(LLM_KV_BLOCK_COUNT, "qwen4exp.block_count", "llama.block_count");
 
-        n_expert_used = (int) get_u64("qwen4exp.expert_used_count");
-        if (n_expert_used == 0) n_expert_used = (int) get_u64("llama.expert_used_count");
+        n_expert = (int) get_u64_kv(LLM_KV_EXPERT_COUNT, "qwen4exp.expert_count", "llama.expert_count");
+
+        n_expert_used = (int) get_u64_kv(LLM_KV_EXPERT_USED_COUNT, "qwen4exp.expert_used_count", "llama.expert_used_count");
+
+        // Per-layer expert geometry. Both keys are legitimately arrays on some
+        // arches (nemotron_h_moe ships [0,2048,0,1536,...] widths and
+        // [0,9,0,9,...] top-k), and a scalar on the uniform ones. Absent keys
+        // read as zeros, which is what llama_hparams holds too, so the geometry
+        // fingerprint computed here matches the inference-side one.
+        std::vector<uint32_t> ff_exp_layers;
+        std::vector<uint32_t> used_layers;
+        const bool have_ff   = moe_read_layer_array(metadata, llm_kv(LLM_KV_EXPERT_FEED_FORWARD_LENGTH), n_layer, ff_exp_layers);
+        const bool have_used = moe_read_layer_array(metadata, llm_kv(LLM_KV_EXPERT_USED_COUNT),          n_layer, used_layers);
+        if (n_expert_used == 0 && have_used) {
+            for (uint32_t v : used_layers) {
+                n_expert_used = std::max(n_expert_used, (int) v);
+            }
+        }
 
         if (n_layer > 0 && n_expert > 0 && n_expert_used > 0) {
             // 'auto' must be resolved here too: the cache resolves it for pinning,
@@ -1053,9 +1250,31 @@ llama_model_loader::llama_model_loader(
                 if (!arena_ok) {
                     LLAMA_LOG_WARN("MoE RAM arena: initialization failed, continuing without arena\n");
                 } else {
+                    // Expert geometry is part of the arena identity: every layer
+                    // keeps its own expert width, and the fingerprint makes sure
+                    // a second model with the same block/expert counts but
+                    // different widths can never resolve to this arena.
+                    const uint64_t geom_hash = moe_arena_geom_hash(n_layer, n_expert,
+                            have_ff   ? ff_exp_layers.data() : nullptr,
+                            have_used ? used_layers.data()   : nullptr);
+                    bool hetero_geom = false;
+                    for (int l = 1; l < n_layer && have_ff; ++l) {
+                        hetero_geom |= ff_exp_layers[l] != ff_exp_layers[0];
+                    }
+                    arena_new->n_layer_total = n_layer;
+                    arena_new->geom_hash     = geom_hash;
+                    arena_new->layer_geom.assign((size_t) n_layer, moe_layer_geom{});
                     moe_arena = arena_new.get();
                     g_moe_ram_arena = moe_arena; // most recently initialised (compat)
-                    g_moe_arenas[{ (int) n_layer, (int) n_expert }] = std::move(arena_new);
+                    g_moe_arenas[moe_arena_key{ n_layer, n_expert, geom_hash }] = std::move(arena_new);
+                    LLAMA_LOG_INFO("MoE RAM arena: %s expert geometry (%d layers, %d experts, geom %016llx)\n",
+                            hetero_geom ? "per-layer/heterogeneous" : "uniform",
+                            n_layer, n_expert, (unsigned long long) geom_hash);
+                    size_t warm_mib = 8192;
+                    if (const char * e = getenv("LLAMA_MOE_WARM_MIB")) {
+                        warm_mib = (size_t) std::max(0, atoi(e));
+                    }
+                    moe_arena->warm_arm(moe_profile_path, n_expert, warm_mib);
                     fprintf(stderr, "TRACE ar2: arena init ok\n");
                 }
             } else {
@@ -1950,10 +2169,21 @@ bool llama_model_loader::load_all_data(
         });
     }
 
+    {
+        static std::atomic<int> dbg_skip{0};
+        if (getenv("LLAMA_MOE_DEBUG") != nullptr && dbg_skip.fetch_add(1) < 12) {
+            fprintf(stderr, "MOECAPSKIP tensors_total=%zu moe_plan=%d moe_arena=%d\n",
+                    tensors.size(), moe_plan != nullptr, moe_arena != nullptr);
+        }
+    }
     for (struct ggml_tensor * cur : tensors) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
             // this can happen with split experts models
+            static std::atomic<int> dbg_wnull{0};
+            if (getenv("LLAMA_MOE_DEBUG") != nullptr && dbg_wnull.fetch_add(1) < 8) {
+                fprintf(stderr, "MOECAPSKIP weight_null name=%s\n", ggml_get_name(cur));
+            }
             continue;
         }
 
@@ -2478,7 +2708,12 @@ moe_placement_plan moe_solve_placement(
     if (n_devices <= 0) {
         n_devices = ggml_backend_dev_count();
     }
-    for (int i = 0; i < n_devices; ++i) {
+    // Enumerate the full backend registry: the caller's n_devices counts
+    // accelerators, but ggml_backend_dev_get(i) indexes all devices and the
+    // CPU typically occupies index 0. Bounding the loop by n_devices skipped
+    // the GPU entirely and fell back to a fake 4 GiB plan.
+    const int moe_dev_enum = ggml_backend_dev_count();
+    for (int i = 0; i < moe_dev_enum; ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
         const char * dev_name = ggml_backend_dev_name(dev);
 
@@ -2509,6 +2744,16 @@ moe_placement_plan moe_solve_placement(
         gpu_dev_index.push_back(0);
         total_vram = vram_per_device[0];
         plan.report_lines.push_back("  No devices found, using 4 GiB default");
+        {
+            const int reg_total = ggml_backend_reg_count();
+            fprintf(stderr, "MOEDIAG no-devices: n_devices_arg=%d reg_count=%d dev_count=%d\n",
+                    n_devices, reg_total, ggml_backend_dev_count());
+            for (int i = 0; i < ggml_backend_dev_count() && i < 6; ++i) {
+                ggml_backend_dev_t d = ggml_backend_dev_get(i);
+                fprintf(stderr, "MOEDIAG dev[%d] name=%s type=%d\n", i,
+                        ggml_backend_dev_name(d), (int) ggml_backend_dev_type(d));
+            }
+        }
     }
 
     // Estimate expert bytes per layer
@@ -2526,7 +2771,7 @@ moe_placement_plan moe_solve_placement(
     // the KV/compute buffers. Those are not part of the expert budget but they do
     // land on the same devices; a 4 GiB reserve over-assigned expert layers and the
     // footprint estimate then exceeded the card.
-    const size_t non_expert_reserve = 13ull * 1024 * 1024 * 1024;
+    const size_t non_expert_reserve = std::min<size_t>(vram_budget / 2, (size_t) vram_per_device.size() * 6ull * 1024 * 1024 * 1024);
     if (vram_budget > non_expert_reserve) {
         vram_budget -= non_expert_reserve;
     } else {
@@ -2650,31 +2895,28 @@ moe_placement_plan moe_solve_placement(
         // bytes plus KV/compute/draft/mmproj and 512 MiB slack per device.
         // Draft and compute buffers measured ~5.5 GiB; the extra GiB keeps the
         // pool clear of VRAM saturation with system processes sharing the GPU.
-        const size_t reserve_total = (size_t) (14.5 * 1024.0 * 1024.0 * 1024.0) + (size_t) n_acc * 512ull * 1024 * 1024;
-        const size_t committed_total = reserve_total > nonexpert_total
-                                     ? reserve_total - nonexpert_total
-                                     : 4ull * 1024 * 1024 * 1024;
+        const size_t committed_total = (size_t) n_acc * 2048ull * 1024 * 1024;
 
         plan.device_total     = vram_per_device;
         plan.device_nonexpert.assign(n_acc, 0);
         plan.device_committed.assign(n_acc, 0);
         plan.device_budget.assign(n_acc, 0);
+        size_t total_vram_budget = 0;
         for (int i = 0; i < n_acc; ++i) {
             plan.device_nonexpert[i] = nonexpert[i];
             plan.device_committed[i] = (size_t) (committed_total * share[i]);
             plan.device_budget[i] = vram_per_device[i] > (nonexpert[i] + plan.device_committed[i])
                                   ? vram_per_device[i] - nonexpert[i] - plan.device_committed[i] : 0;
+            total_vram_budget += plan.device_budget[i];
         }
 
+        const bool all_experts_fit_vram = (expert_total > 0 && expert_total <= total_vram_budget);
         plan.layer_tier.assign(n_layer, 2);
         size_t ram_used = 0;
-        fprintf(stderr, "MOEDIAG layer-solve: ram_budget=%.2f GiB dev_budgets=[", ram_budget / 1073741824.0);
-        for (size_t b : plan.device_budget) fprintf(stderr, "%.2f ", b / 1073741824.0);
-        fprintf(stderr, "]\n");
         for (int l = 0; l < n_layer; ++l) {
             const int d = layer_dev[l];
             const size_t need = plan.layer_expert_bytes[l];
-            if (plan.device_budget[d] >= need) {
+            if (all_experts_fit_vram && plan.device_budget[d] >= need) {
                 plan.layer_tier[l] = 0;
                 plan.device_budget[d] -= need;
             } else if (ram_used + need <= ram_budget) {
@@ -2721,6 +2963,10 @@ moe_placement_plan moe_solve_placement(
                 (plan.device_total[i]>plan.device_nonexpert[i]+plan.device_committed[i])
                   ?(plan.device_total[i]-plan.device_nonexpert[i]-plan.device_committed[i])/1073741824.0:0.0);
         }
+        // Expert count is needed downstream by capture_expert_file_offset and
+        // the arena; leaving it at the struct default 0 made capture reject
+        // every expert tensor (ne[2]=512 != 0) and disabled direct pread fills.
+        plan.n_expert = n_expert;
         return plan;
     }
 
@@ -2745,6 +2991,11 @@ moe_placement_plan moe_solve_placement(
     if (moe_pin_decode && plan.n_layers_vram > 0) {
         plan.pinned_decode_bytes = expert_bytes_per_layer;
     }
+
+    // Expert count is needed downstream by capture_expert_file_offset and the
+    // arena; leaving it at the struct default 0 made capture reject every
+    // expert tensor (ne[2]=512 != 0) and disabled direct pread fills.
+    plan.n_expert = n_expert;
 
     // Report
     plan.report_lines.push_back(moe_fmt("MoE Placement Plan (Layer-Granular):"));
@@ -2998,11 +3249,49 @@ moe_placement_plan moe_solve_placement_expert_granular(
 #include <unistd.h>
 #include <sys/mman.h>
 
-// One arena per (n_layer, n_expert) geometry. The target model and the MTP/draft
-// head are loaded by separate loaders; a single global unique_ptr meant the draft
-// load destroyed the target's arena, its disk_meta and its combined buffers.
-std::map<std::pair<int,int>, std::unique_ptr<moe_ram_arena>> g_moe_arenas;
+// One arena per (n_layer, n_expert, per-layer geometry) identity. The target
+// model and the MTP/draft head are loaded by separate loaders; a single global
+// unique_ptr meant the draft load destroyed the target's arena, its disk_meta
+// and its combined buffers. The geometry fingerprint keeps a heterogeneous
+// model from ever aliasing a uniform one that happens to share the same
+// block/expert counts.
+std::map<moe_arena_key, std::unique_ptr<moe_ram_arena>> g_moe_arenas;
 moe_ram_arena * g_moe_ram_arena = nullptr;
+
+bool moe_ram_arena::note_layer_geom(int layer, int n_expert, const char * tensor_type, size_t bytes) {
+    const int t = type_index(tensor_type);
+    if (layer < 0 || layer >= (int) layer_geom.size() || t < 0 || bytes == 0 || n_expert <= 0) {
+        disable("expert tensor outside the arena's layer range or empty geometry");
+        return false;
+    }
+    moe_layer_geom & g = layer_geom[layer];
+    if (g.known) {
+        if (g.n_expert != n_expert || (g.bytes[t] != 0 && g.bytes[t] != bytes)) {
+            LLAMA_LOG_WARN("moe_ram_arena: layer %d %s geometry changed (experts %d->%d, bytes %zu->%zu)\n",
+                    layer, tensor_type ? tensor_type : "?", g.n_expert, n_expert, g.bytes[t], bytes);
+            disable("a layer's expert geometry contradicts what was already captured");
+            return false;
+        }
+    }
+    g.n_expert = n_expert;
+    g.bytes[t] = bytes;
+    g.known    = true;
+    return true;
+}
+
+void moe_ram_arena::disable(const char * reason) {
+    if (!disabled) {
+        disabled = true;
+        LLAMA_LOG_WARN("moe_ram_arena: DISABLED (%s); every expert read falls back to the mmap path\n",
+                reason ? reason : "unspecified");
+    }
+    // Drop the addressing metadata so no caller can pread through a stride we
+    // no longer trust; the mmap view remains valid and is the proven-correct
+    // path (it is exactly what moe-ram-mib=0 uses).
+    std::lock_guard<std::mutex> lock(mutex);
+    disk_meta.clear();
+    combined_buffers.clear();
+}
 
 static uint64_t moe_get_time_us() {
     return (uint64_t) ggml_time_us();
@@ -3143,6 +3432,9 @@ bool moe_ram_arena::init_sharded(size_t capacity_mib, const moe_placement_plan &
 }
 
 void * moe_ram_arena::load_expert(int layer, int expert, const char * tensor_type) {
+    if (disabled) {
+        return nullptr;
+    }
     // Load every tensor type of (layer, expert) with a real pread into its
     // combined buffer, then mark it resident. Used by the copy fallback path.
     struct job { int fd; size_t offset; size_t size; uint8_t * dst; size_t slot_idx; };
@@ -3168,7 +3460,7 @@ void * moe_ram_arena::load_expert(int layer, int expert, const char * tensor_typ
             }
             sl.last_access = now;
             jobs.push_back({ fd, sl.file_offset, sl.size,
-                             it->second.buffer.data() + (size_t) expert * it->second.stride, si });
+                             it->second.base() + (size_t) expert * it->second.stride, si });
             // mark resident optimistically
             sl.resident = true;
             it->second.resident[expert] = true;
@@ -3189,7 +3481,7 @@ void * moe_ram_arena::load_expert(int layer, int expert, const char * tensor_typ
             if (slots[si].layer == layer && slots[si].expert == expert) {
                 auto it = combined_buffers.find(std::make_pair(layer, slots[si].tensor_type));
                 if (it != combined_buffers.end()) {
-                    return it->second.buffer.data() + (size_t) expert * it->second.stride;
+                    return it->second.base() + (size_t) expert * it->second.stride;
                 }
             }
         }
@@ -3198,6 +3490,9 @@ void * moe_ram_arena::load_expert(int layer, int expert, const char * tensor_typ
 }
 
 bool moe_ram_arena::ensure_experts_loaded(int layer, const char * tensor_type, const int * expert_ids, int n_experts) {
+    if (disabled) {
+        return false;
+    }
     // Collect the experts that need a pread, then serve them with parallel preads:
     // one serial pread per expert made decode wait ~1.4 s per ubatch on NVMe models.
     struct job {
@@ -3227,6 +3522,16 @@ bool moe_ram_arena::ensure_experts_loaded(int layer, const char * tensor_type, c
             for (size_t si = 0; si < slots.size(); ++si) {
                 moe_ram_slot & sl = slots[si];
                 if (sl.layer == layer && sl.expert == expert && sl.tensor_type == tensor_type) {
+                    if (sl.size != cb.stride) {
+                        // slot and buffer disagree on this layer's expert size:
+                        // filling would corrupt the neighbouring expert. Set the
+                        // flag inline - disable() takes the mutex we already hold.
+                        if (!disabled) {
+                            disabled = true;
+                            LLAMA_LOG_WARN("moe_ram_arena: DISABLED (arena slot size disagrees with its combined buffer stride)\n");
+                        }
+                        return false;
+                    }
                     if (sl.file_offset == 0) {
                         LLAMA_LOG_WARN("moe_ram_arena: expert L%d_E%d has no file offset\n", layer, expert);
                         break;
@@ -3237,7 +3542,7 @@ bool moe_ram_arena::ensure_experts_loaded(int layer, const char * tensor_type, c
                     }
                     sl.last_access = now;
                     jobs.push_back({ fd, sl.file_offset, sl.size,
-                                     cb.buffer.data() + (size_t) expert * cb.stride, si, expert });
+                                     cb.base() + (size_t) expert * cb.stride, si, expert });
                     break;
                 }
             }
@@ -3296,6 +3601,9 @@ bool moe_ram_arena::ensure_experts_loaded(int layer, const char * tensor_type, c
 }
 
 void * moe_ram_arena::get_combined_buffer(int layer, const char * tensor_type) {
+    if (disabled) {
+        return nullptr;
+    }
     std::lock_guard<std::mutex> lock(mutex);
 
     auto key = std::make_pair(layer, std::string(tensor_type));
@@ -3303,7 +3611,309 @@ void * moe_ram_arena::get_combined_buffer(int layer, const char * tensor_type) {
     if (it == combined_buffers.end()) {
         return nullptr;
     }
-    return it->second.buffer.data();
+    return it->second.base();
+}
+
+// ---- routing-lookahead warm (adapted from Strata's RouterLookahead) ----
+
+bool moe_ram_arena::expert_resident(int il, const char * type, int e) const {
+    if (!type) return false;
+    const auto it = combined_buffers.find({ il, std::string(type) });
+    if (it == combined_buffers.end()) return false;
+    return e >= 0 && e < (int) it->second.resident.size() && it->second.resident[e];
+}
+
+bool moe_ram_arena::expert_resident_all(int layer, int expert, const std::vector<std::string> & types) const {
+    if (disabled || types.empty()) {
+        return false;
+    }
+    for (const std::string & ty : types) {
+        const auto it = combined_buffers.find({ layer, ty });
+        if (it == combined_buffers.end()) {
+            return false;
+        }
+        const auto & cb = it->second;
+        if (expert < 0 || expert >= (int) cb.resident.size() || !cb.resident[expert]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool moe_ram_arena::preload_all(size_t n_workers, bool lock_ram) {
+    if (disabled) {
+        return false;
+    }
+    struct job { int fd; size_t off; size_t size; uint8_t * dst; size_t slot_idx; };
+    std::vector<job> jobs;
+    jobs.reserve(slots.size());
+    {
+        std::lock_guard<std::mutex> lk(mutex);
+        for (size_t k = 0; k < slots.size(); ++k) {
+            moe_ram_slot & sl = slots[k];
+            if (sl.size == 0 || sl.data == nullptr) {
+                continue;
+            }
+            const int fd = (sl.shard_idx < shard_fds.size()) ? shard_fds[sl.shard_idx] : model_fd;
+            if (fd < 0) {
+                continue;
+            }
+            jobs.push_back({ fd, sl.file_offset, sl.size, (uint8_t *) sl.data, k });
+        }
+    }
+    if (jobs.empty()) {
+        return true;
+    }
+    n_workers = std::max<size_t>(1, std::min<size_t>(n_workers, jobs.size()));
+    std::atomic<size_t> next{0};
+    std::vector<uint8_t> loaded(jobs.size(), 0);
+    std::atomic<size_t> bytes{0};
+    std::atomic<int>    failed{0};
+    std::atomic<bool> stalled{false};
+    const size_t floor_mib = 2048;
+    auto worker = [&]() {
+        for (;;) {
+            if (stalled.load(std::memory_order_relaxed)) {
+                return;
+            }
+            // Pace the burst: an anonymous write storm evicts the mmap'd model pages this
+            // very process reads experts from. Yield while the host is under pressure and
+            // stop entirely if free memory does not recover.
+            for (int wait_ms = 0; ; wait_ms += 50) {
+                const size_t avail = moe_meminfo_mib("MemAvailable");
+                const double psi   = moe_memory_pressure();
+                if (avail == 0 || (avail >= floor_mib && psi < 25.0)) {
+                    break;
+                }
+                if (wait_ms >= 3000) {
+                    stalled.store(true, std::memory_order_relaxed);
+                    return;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            const size_t i = next.fetch_add(1);
+            if (i >= jobs.size()) {
+                return;
+            }
+            const job & j = jobs[i];
+            size_t done = 0;
+            while (done < j.size) {
+                const ssize_t n = pread(j.fd, j.dst + done, j.size - done, (off_t) (j.off + done));
+                if (n <= 0) {
+                    failed.fetch_add(1);
+                    return;
+                }
+                done += (size_t) n;
+            }
+            loaded[i] = 1;
+            bytes.fetch_add(j.size);
+            // Keep a healthy cushion so the next job does not have to wait: half the
+            // floor, sampled once per expert tensor.
+            if (moe_meminfo_mib("MemAvailable") < floor_mib * 2) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        }
+    };
+    const int64_t t0 = ggml_time_us();
+    std::vector<std::thread> pool;
+    for (size_t t = 1; t < n_workers; ++t) {
+        pool.emplace_back(worker);
+    }
+    worker();
+    for (auto & th : pool) {
+        th.join();
+    }
+    {
+        std::lock_guard<std::mutex> lk(mutex);
+        for (size_t i = 0; i < jobs.size(); ++i) {
+            if (loaded[i] == 0) {
+                continue; // not read: leave it non-resident so it is fetched on demand
+            }
+            moe_ram_slot & sl = slots[jobs[i].slot_idx];
+            sl.resident = true;
+            sl.last_access = 1;
+            auto it = combined_buffers.find({ sl.layer, sl.tensor_type });
+            if (it != combined_buffers.end() && sl.expert >= 0 &&
+                sl.expert < (int) it->second.resident.size()) {
+                it->second.resident[sl.expert] = true;
+            }
+        }
+    }
+    size_t locked = 0;
+    if (lock_ram) {
+        std::lock_guard<std::mutex> lk(mutex);
+        for (auto & kv : combined_buffers) {
+            moe_combined_buffer & cb = kv.second;
+            if (cb.buffer.empty()) {
+                continue;
+            }
+            const size_t n = cb.stride * (size_t) cb.resident.size();
+            if (mlock(cb.base(), n) == 0) {
+                locked += n;
+            } else {
+                LLAMA_LOG_WARN("MoE RAM arena: mlock failed for L%d %s (%.1f MiB): %s\n",
+                        cb.layer, cb.tensor_type.c_str(), n / 1048576.0, strerror(errno));
+            }
+        }
+    }
+    LLAMA_LOG_INFO("MoE RAM arena: preload %zu expert tensors, %.1f MiB in %.1f s, mlock %.1f MiB, %d read errors\n",
+            jobs.size(), bytes.load() / 1048576.0, (ggml_time_us() - t0) / 1e6,
+            locked / 1048576.0, failed.load());
+    return failed.load() == 0;
+}
+
+void moe_ram_arena::warm_note(int il, const int32_t * ids, int n) {
+    if (il < 0 || !ids || n <= 0) return;
+    std::lock_guard<std::mutex> lk(warm_mu);
+    std::vector<int32_t> v(ids, ids + n);
+    std::sort(v.begin(), v.end());
+    v.erase(std::unique(v.begin(), v.end()), v.end());
+    auto & q = warm_hist[il];
+    q.emplace_front(std::move(v));
+    while ((int) q.size() > warm_hist_n) q.pop_back();
+    warm_event_a.fetch_add(1, std::memory_order_relaxed);
+    const uint64_t evn = warm_event_a.load(std::memory_order_relaxed);
+    for (auto it = warm_armed.begin(); it != warm_armed.end(); ) {
+        if (evn - it->second > 32) it = warm_armed.erase(it); else ++it;
+    }
+}
+
+void moe_ram_arena::warm_lookahead(int il, int ahead) {
+    std::lock_guard<std::mutex> lk(warm_mu);
+    if (warm_workers.empty() && !warm_stop.load()) {
+        if (const char * e = getenv("LLAMA_MOE_WARM_RING_MIB")) {
+            warm_ring_mib = (size_t) std::max(0, atoi(e));
+        }
+        disk_lru_cap = warm_ring_mib << 20;
+        for (int w = 0; w < 2; ++w) {
+            warm_workers.emplace_back([this]() { warm_stage_worker(); });
+        }
+        LLAMA_LOG_INFO("MoE lookahead: init budget=%zuMiB ring=%zuMiB disk_meta=%zu combined=%zu\n",
+                warm_budget >> 20, warm_ring_mib, disk_meta.size(), combined_buffers.size());
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const double win_ms = std::chrono::duration<double, std::milli>(now - warm_win_t0).count();
+    if (warm_win_t0.time_since_epoch().count() == 0 || win_ms >= 250.0) {
+        warm_win_bytes = 0;
+        warm_win_t0 = now;
+    }
+    ahead = ahead < 1 ? 1 : (ahead > 3 ? 3 : ahead);
+    for (int a = 1; a <= ahead; ++a) {
+        const int lt = il + a;
+        std::vector<int32_t> want;
+        {
+            const auto hit = warm_hist.find(lt);
+            if (hit == warm_hist.end()) continue;
+            for (const auto & st2 : hit->second) {
+                want.insert(want.end(), st2.begin(), st2.end());
+            }
+        }
+        std::sort(want.begin(), want.end());
+        want.erase(std::unique(want.begin(), want.end()), want.end());
+        for (const auto & dmk : disk_meta) {
+            if (dmk.first.first != lt) continue;
+            const std::string & type = dmk.first.second;
+            const moe_disk_tensor & dt = dmk.second;
+            if (dt.stride == 0) continue;
+            const uint64_t ti = warm_type_idx(type.c_str());
+            for (const int32_t e : want) {
+                if (warm_win_bytes + dt.stride > warm_budget) break;
+                if (expert_resident(lt, type.c_str(), e)) continue;
+                const uint64_t kb = warm_key(lt, ti, e);
+                if (warm_armed.count(kb)) { warm_dedup.fetch_add(1, std::memory_order_relaxed); continue; }
+                {
+                    std::lock_guard<std::mutex> qlk(warm_q_mu);
+                    if (warm_q_keys.count(kb)) { warm_dedup.fetch_add(1, std::memory_order_relaxed); continue; }
+                    if (warm_q.size() >= 256) break;
+                    warm_q.push_back({ lt, (int) ti, (int) e, warm_event_a.load(std::memory_order_relaxed) });
+                    warm_q_keys.insert(kb);
+                }
+                warm_armed[kb] = warm_event_a.load(std::memory_order_relaxed);
+                warm_win_bytes += dt.stride;
+                warm_pred.fetch_add(1, std::memory_order_relaxed);
+                warm_labytes.fetch_add(dt.stride, std::memory_order_relaxed);
+            }
+        }
+    }
+    warm_q_cv.notify_all();
+    const uint64_t wp = warm_pred.load(std::memory_order_relaxed);
+    if (wp >= warm_next_stat) {
+        warm_next_stat = wp + 16384;
+        LLAMA_LOG_INFO("MoE lookahead: pred=%llu useful=%llu bytes=%llu MiB dedup=%llu late=%llu ring=%zu/%zu MiB hits=%llu misses=%llu\n",
+                (unsigned long long) wp, (unsigned long long) warm_useful.load(),
+                (unsigned long long) (warm_labytes.load() >> 20),
+                (unsigned long long) warm_dedup.load(), (unsigned long long) warm_late.load(),
+                disk_lru_bytes >> 20, disk_lru_cap >> 20,
+                (unsigned long long) disk_lru_hits, (unsigned long long) disk_lru_misses);
+    }
+}
+
+// pread one predicted expert into the disk_lru ring (idempotent, bounded)
+bool moe_ram_arena::warm_stage(int il, int tidx, int expert) {
+    if (expert < 0 || tidx < 0 || tidx > 3 || disk_lru_cap == 0) return false;
+    static const char * tnames[4] = { "gate_up", "gate", "up", "down" };
+    const auto it = disk_meta.find({ il, std::string(tnames[tidx]) });
+    if (it == disk_meta.end()) return false;
+    const moe_disk_tensor & dm = it->second;
+    const int fd = (dm.shard_idx < shard_fds.size()) ? shard_fds[dm.shard_idx] : model_fd;
+    if (fd < 0) return false;
+    const uint64_t k = ((uint64_t)(uint32_t) il << 40) | ((uint64_t)(uint32_t) tidx << 32) | (uint32_t) expert;
+    {
+        std::lock_guard<std::mutex> lk(disk_lru_mu);
+        if (disk_lru.count(k)) return false;
+    }
+    auto buf = std::make_shared<std::vector<uint8_t>>(dm.stride);
+    const size_t off = dm.base_offset + (size_t) expert * dm.stride;
+    const ssize_t got = pread(fd, buf->data(), dm.stride, off);
+    if (got != (ssize_t) dm.stride) return false;
+    std::lock_guard<std::mutex> lk(disk_lru_mu);
+    if (disk_lru.count(k)) return true;
+    if (disk_lru_bytes + dm.stride > disk_lru_cap) {
+        while (disk_lru_bytes + dm.stride > disk_lru_cap && !disk_lru.empty()) {
+            uint64_t best_k = 0;
+            uint64_t best_t = UINT64_MAX;
+            for (const auto & kv : disk_lru) {
+                if (kv.second.last < best_t) {
+                    best_t = kv.second.last;
+                    best_k = kv.first;
+                }
+            }
+            disk_lru_bytes -= disk_lru[best_k].size;
+            disk_lru.erase(best_k);
+        }
+    }
+    disk_lru.emplace(k, disk_lru_ent{ buf, ++disk_lru_clock, (size_t) dm.stride });
+    disk_lru_bytes += dm.stride;
+    return true;
+}
+
+void moe_ram_arena::warm_stage_worker() {
+    for (;;) {
+        warm_qjob job;
+        {
+            std::unique_lock<std::mutex> lk(warm_q_mu);
+            warm_q_cv.wait(lk, [&]{ return warm_stop.load() || !warm_q.empty(); });
+            if (warm_stop.load() && warm_q.empty()) return;
+            job = warm_q.front();
+            warm_q.pop_front();
+            warm_q_keys.erase(warm_key(job.il, (uint64_t) job.tidx, job.e));
+        }
+        if (warm_event_a.load(std::memory_order_relaxed) - job.ev <= 24) {
+            warm_stage(job.il, job.tidx, job.e);
+        } else {
+            warm_late.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+}
+
+bool moe_ram_arena::warm_credit(int il, const char * type, int e) {
+    if (!type) return false;
+    std::lock_guard<std::mutex> lk(warm_mu);
+    const auto it = warm_armed.find(warm_key(il, warm_type_idx(type), e));
+    if (it == warm_armed.end()) return false;
+    warm_useful.fetch_add(1, std::memory_order_relaxed);
+    warm_armed.erase(it);
+    return true;
 }
 
 void moe_ram_arena::prefetch_expert(int layer, int expert, const char * tensor_type) {
@@ -3357,7 +3967,17 @@ void moe_ram_arena::shutdown_worker() {
 }
 
 moe_ram_arena::~moe_ram_arena() {
+    warm_stop.store(true);
+    warm_q_cv.notify_all();
+    for (auto & t : warm_workers) {
+        if (t.joinable()) t.join();
+    }
+    warm_workers.clear();
     shutdown_worker();
+    LLAMA_LOG_INFO("moe_ram_arena: lookahead stats pred=%llu useful=%llu late=%llu ring hits=%llu misses=%llu\n",
+            (unsigned long long) warm_pred.load(), (unsigned long long) warm_useful.load(),
+            (unsigned long long) warm_late.load(),
+            (unsigned long long) disk_lru_hits, (unsigned long long) disk_lru_misses);
     // Free any remaining resident experts - combined buffers are auto-freed by vector destructor
     for (int fd : shard_fds) {
         if (fd >= 0) {
@@ -3374,20 +3994,52 @@ moe_ram_arena::~moe_ram_arena() {
 // Capture file offset for RAM-tier expert tensor and create combined buffers
 void llama_model_loader::capture_expert_file_offset(const char * tensor_name, size_t file_offset, size_t tensor_size, struct ggml_tensor * cur, uint16_t shard_idx) {
     if (!moe_plan || !moe_arena) {
+        static std::atomic<int> dbg_a{0};
+        if (getenv("LLAMA_MOE_DEBUG") != nullptr && dbg_a.fetch_add(1) < 4) {
+            fprintf(stderr, "MOEDBG skip_no_plan name=%s plan=%d arena=%d\n", tensor_name ? tensor_name : "?", moe_plan != nullptr, moe_arena != nullptr);
+        }
         return; // MoE placement not enabled
     }
 
     const auto & plan = *moe_plan;
     auto & arena = *moe_arena;
+    {
+        static bool dbg_plan = getenv("LLAMA_MOE_ARENA_DEBUG") != nullptr;
+        if (dbg_plan) {
+            dbg_plan = false;
+            LLAMA_LOG_INFO("ARENAPLAN n_expert=%d n_layer=%d tier_sz=%zu name=%s\n",
+                    plan.n_expert, (int) plan.layer_tier.size(), plan.expert_tier.size(), tensor_name);
+        }
+    }
 
     // Parse tensor name: blk.L.ffn_{gate,up,down}_exps.weight (one tensor holds
     // all experts; expert e lives at file_offset + e*nb[2]).
     int layer = -1;
     char ffn_type[32];
-    if (sscanf(tensor_name, "blk.%d.ffn_%31[^_]_exps.weight", &layer, ffn_type) != 2 || layer < 0) {
+    int  matched  = 0;
+    // The %n check is essential: sscanf reports the two successful conversions even
+    // when the trailing literal does not match, so a loose match also captured
+    // blk.L.ffn_{up,down}_shexp.weight (shared expert, ne[2]=1) and blk.L.ffn_gate_inp.weight
+    // (router), poisoning the per-layer geometry and disabling the arena.
+    if (sscanf(tensor_name, "blk.%d.ffn_%31[^_]_exps.weight%n", &layer, ffn_type, &matched) != 2 ||
+        matched != (int) strlen(tensor_name) || layer < 0) {
+        static std::atomic<int> dbg_s{0};
+        if (dbg_s.fetch_add(1) < 4) {
+            fprintf(stderr, "MOEDBG skip_name name=%s\n", tensor_name ? tensor_name : "?");
+        }
         return;
     }
-    if (!cur || cur->ne[2] != (int64_t) plan.n_expert) {
+    // Expert tensors are per layer: ne[2] is that layer's expert count and nb[2]
+    // is that layer's stride. A layer may declare FEWER experts than the model
+    // maximum (per-layer routers), so accept anything in (0, n_expert]; the old
+    // exact-equality test silently dropped those layers from the arena.
+    if (!cur || cur->ne[2] <= 0 || cur->ne[2] > (int64_t) plan.n_expert) {
+        static std::atomic<int> dbg_n{0};
+        if (dbg_n.fetch_add(1) < 4) {
+            fprintf(stderr, "MOEDBG skip_ne name=%s ne2=%lld plan_n_expert=%d cur_null=%d\n",
+                    tensor_name ? tensor_name : "?", cur ? (long long) cur->ne[2] : -1LL,
+                    plan.n_expert, cur == nullptr);
+        }
         return;
     }
 
@@ -3420,24 +4072,40 @@ void llama_model_loader::capture_expert_file_offset(const char * tensor_name, si
                            (long long) cur->ne[2], (int) plan.n_expert, plan.expert_tier.size());
         }
     }
+    // Per-layer geometry. The file layout of one expert of THIS layer is
+    // nb[2]; tensor_size / ne[2] must agree with it, otherwise the tensor is not
+    // addressable by a uniform stride and the arena cannot serve it safely.
+    const int    layer_n_expert = (int) cur->ne[2];
+    const size_t stride         = cur->nb[2];
+    const size_t per_expert     = tensor_size / (size_t) layer_n_expert;
+    if (stride == 0 || per_expert != stride) {
+        LLAMA_LOG_WARN("moe_ram_arena: %s (layer %d): per-expert %zu != stride %zu; "
+                       "expert geometry cannot be determined, RAM arena disabled for correctness\n",
+                       tensor_name, layer, per_expert, stride);
+        arena.disable("expert tensor is not addressable by a uniform per-layer stride");
+        return;
+    }
+    if (getenv("LLAMA_MOE_ARENA_DEBUG")) {
+        LLAMA_LOG_INFO("ARENACAP name=%s layer=%d type=%s ne2=%d stride=%zu tensor_size=%zu\n",
+                tensor_name, layer, tensor_type.c_str(), layer_n_expert, stride, tensor_size);
+    }
+    if (!arena.note_layer_geom(layer, layer_n_expert, tensor_type.c_str(), stride)) {
+        return; // contradiction with this layer's recorded geometry: arena disabled
+    }
+
     // Always record offset metadata so fills can pread directly into pinned
     // staging instead of faulting through the mmap view - even for layers
-    // where only some experts are RAM-resident (partial-combined blocks too)
+    // where only some experts are RAM-resident (partial-combined blocks too).
+    // The stride stored here is the one of this layer, not a global constant.
     {
         std::lock_guard<std::mutex> lock(arena.mutex);
         auto & dm = arena.disk_meta[std::make_pair(layer, tensor_type)];
         dm.base_offset = file_offset;
-        dm.stride      = cur->nb[2];
+        dm.stride      = stride;
         dm.shard_idx   = shard_idx;
     }
     if (!is_ram) {
         return;
-    }
-
-    const size_t stride = cur->nb[2];
-    const size_t per_expert = tensor_size / (size_t) plan.n_expert;
-    if (per_expert != stride) {
-        LLAMA_LOG_WARN("moe_ram_arena: %s: per-expert %zu != stride %zu\n", tensor_name, per_expert, stride);
     }
 
     std::lock_guard<std::mutex> lock(arena.mutex);
@@ -3445,7 +4113,7 @@ void llama_model_loader::capture_expert_file_offset(const char * tensor_name, si
     auto key = std::make_pair(layer, tensor_type);
     auto it = arena.combined_buffers.find(key);
     if (it == arena.combined_buffers.end()) {
-        const size_t need = stride * (size_t) plan.n_expert;
+        const size_t need = stride * (size_t) layer_n_expert;
         if (arena.used_bytes + need > arena.capacity_bytes) {
             LLAMA_LOG_WARN("moe_ram_arena: %s needs %.2f MiB, arena full (%.2f/%.2f MiB), skipped\n",
                 tensor_name, need/1048576.0, arena.used_bytes/1048576.0, arena.capacity_bytes/1048576.0);
@@ -3457,13 +4125,20 @@ void llama_model_loader::capture_expert_file_offset(const char * tensor_name, si
         cb.tensor_type  = tensor_type;
         cb.expert_size  = stride;
         cb.stride       = stride;
-        cb.buffer.reserve(need); // lazy: pages are touched only when pread fills them; eager resize zero-fills 16 GiB at load and OOMs the host
-        cb.resident.assign((size_t) plan.n_expert, false);
+        cb.buffer.reserve(need + 64); // lazy: pages are touched only when pread fills them; eager resize zero-fills 16 GiB at load and OOMs the host
+        cb.offset    = (size_t) ((64 - ((uintptr_t) cb.buffer.data() & 63)) & 63);
+        cb.alloc     = need;
+        cb.expert_size = stride;
+        if (cb.base() == nullptr || cb.buffer.capacity() < need + cb.offset) {
+            LLAMA_LOG_WARN("moe_ram_arena: %s: arena block allocation failed\n", tensor_name);
+            return;
+        }
+        cb.resident.assign((size_t) layer_n_expert, false);
         it = arena.combined_buffers.find(key);
     }
 
     moe_combined_buffer & cb = it->second;
-    for (int e = 0; e < plan.n_expert; ++e) {
+    for (int e = 0; e < layer_n_expert; ++e) {
         moe_ram_slot slot;
         slot.layer       = layer;
         slot.expert      = e;
@@ -3471,16 +4146,91 @@ void llama_model_loader::capture_expert_file_offset(const char * tensor_name, si
         slot.file_offset = file_offset + (size_t) e * stride;
         slot.shard_idx   = shard_idx;
         slot.size        = stride;
-        slot.data        = cb.buffer.data() + (size_t) e * stride;
+        slot.data        = cb.base() + (size_t) e * stride;
         slot.resident    = false;
         arena.slots.push_back(slot);
     }
 
-    LLAMA_LOG_INFO("moe_ram_arena: L%d %s %zu experts, %.2f MiB, file offset %zu\n",
-        layer, tensor_type.c_str(), (size_t) plan.n_expert, (double)(stride * plan.n_expert)/1048576.0, file_offset);
+    LLAMA_LOG_INFO("moe_ram_arena: L%d %s %d experts x %.2f MiB (stride %zu), file offset %zu\n",
+        layer, tensor_type.c_str(), layer_n_expert, (double)(stride * layer_n_expert)/1048576.0, stride, file_offset);
 }
 
-size_t moe_ram_arena::read_expert_direct(int layer, const char * tensor_type, int expert, void * dst) {
+void llama_model_loader::rebind_moe_arena_tensors() {
+    if (!moe_arena || moe_arena->disabled) {
+        return;
+    }
+    // Binding the arena block as the tensor's weight buffer is what lets a
+    // resident expert be *computed* on the CPU, but it also drags every expert
+    // GEMM of that layer onto the CPU for the whole prefill. The arena is
+    // equally useful as a pure fill source (copy_experts memcpy's out of the
+    // combined block), so keep the escape hatch for A/B measurement.
+    if (const char * e = getenv("LLAMA_MOE_REBIND")) {
+        if (atoi(e) == 0) {
+            LLAMA_LOG_INFO("%s: arena rebind disabled by LLAMA_MOE_REBIND=0; "
+                           "arena serves as fill source only\n", __func__);
+            return;
+        }
+    }
+    // The arena blocks are owned by the arena (they outlive the model); the
+    // wrapper buffers below only describe them to ggml, so they are never freed.
+    static std::vector<ggml_backend_buffer_t> keep;
+    int n_bound = 0;
+    size_t bytes = 0;
+    for (auto & kv : weights_map) {
+        ggml_tensor * t = kv.second.tensor;
+        if (t == nullptr) {
+            continue;
+        }
+        const char * name = ggml_get_name(t);
+        int layer = -1;
+        int matched = 0;
+        char ffn_type[32];
+        if (sscanf(name, "blk.%d.ffn_%31[^_]_exps.weight%n", &layer, ffn_type, &matched) != 2 ||
+            matched != (int) strlen(name) || layer < 0) {
+            continue;
+        }
+        const auto it = moe_arena->combined_buffers.find({ layer, std::string(ffn_type) });
+        if (it == moe_arena->combined_buffers.end()) {
+            continue;
+        }
+        moe_combined_buffer & cb = it->second;
+        const size_t need = cb.stride * (size_t) cb.resident.size();
+        if (cb.base() == nullptr || cb.alloc < need || need != (size_t) ggml_nbytes(t) || cb.stride != (size_t) t->nb[2]) {
+            LLAMA_LOG_WARN("%s: %s arena block does not match the tensor (alloc %zu need %zu nbytes %zu stride %zu/%lld)\n",
+                    __func__, name, cb.alloc, need, (size_t) ggml_nbytes(t), cb.stride, (long long) t->nb[2]);
+            continue;
+        }
+        ggml_backend_buffer_t buf = ggml_backend_cpu_buffer_from_ptr(cb.base(), need);
+        if (buf == nullptr) {
+            continue;
+        }
+        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        t->buffer = buf;
+        t->data   = cb.base();
+        keep.push_back(buf);
+        n_bound++;
+        bytes += need;
+    }
+    if (n_bound > 0) {
+        LLAMA_LOG_INFO("%s: %d expert tensors (%.1f MiB) now compute from the RAM arena on the CPU\n",
+                __func__, n_bound, bytes / 1048576.0);
+    }
+}
+
+void llama_model_loader::preload_moe_arena(size_t n_workers, bool lock_ram) {
+    if (moe_arena == nullptr || moe_arena->disabled) {
+        return;
+    }
+    moe_arena->preload_all(n_workers, lock_ram);
+}
+
+size_t moe_ram_arena::read_expert_direct(int layer, const char * tensor_type, int expert, void * dst, size_t dst_cap) {
+    if (disabled) {
+        return 0;
+    }
+    if (!warm_done.exchange(true) && !warm_profile_path.empty()) {
+        warm_disk_from_profile(warm_profile_path.c_str(), warm_n_expert, warm_budget_mib);
+    }
     // DISK-tier experts have no arena buffer; read straight from the GGUF shard.
     // Read-only map access + positional pread are thread-safe: no lock in the hot
     // path, so fill workers can stream disk experts in parallel.
@@ -3496,6 +4246,22 @@ size_t moe_ram_arena::read_expert_direct(int layer, const char * tensor_type, in
         return 0;
     }
     const moe_disk_tensor & dm = it->second;
+    // Per-layer geometry guards: the recorded stride must be the one this layer
+    // actually uses, must fit the caller's buffer, and the expert index must be
+    // inside this layer's expert count (layers may have fewer than the max).
+    const size_t layer_bytes = layer_expert_bytes(layer, tensor_type);
+    const int    layer_ne    = layer_n_expert(layer);
+    if (dm.stride == 0 || (layer_bytes != 0 && dm.stride != layer_bytes) ||
+        (layer_ne > 0 && expert >= layer_ne) || dm.stride > dst_cap) {
+        static std::mutex geom_mu;
+        static std::set<std::pair<int, std::string>> geom_note;
+        std::lock_guard<std::mutex> lk(geom_mu);
+        if (geom_note.insert(key).second) {
+            LLAMA_LOG_WARN("read_expert_direct: geometry mismatch for L%d %s (stride=%zu layer=%zu experts=%d cap=%zu); arena read refused\n",
+                layer, tensor_type ? tensor_type : "?", dm.stride, layer_bytes, layer_ne, dst_cap);
+        }
+        return 0;
+    }
     const int fd = (dm.shard_idx < shard_fds.size()) ? shard_fds[dm.shard_idx] : model_fd;
     if (fd < 0) {
         return 0;
@@ -3514,6 +4280,224 @@ size_t moe_ram_arena::read_expert_direct(int layer, const char * tensor_type, in
     }
     moe_drop_pagecache(fd, off, dm.stride);
     return (size_t) got;
+}
+
+size_t moe_ram_arena::read_expert_cached(int layer, const char * tensor_type, int expert, void * dst, size_t dst_cap) {
+    if (disabled || expert < 0) {
+        return 0;
+    }
+    const int tidx = tensor_type ? (strcmp(tensor_type, "gate_up") == 0 ? 0 :
+                                    strcmp(tensor_type, "gate")   == 0 ? 1 :
+                                    strcmp(tensor_type, "up")     == 0 ? 2 :
+                                    strcmp(tensor_type, "down")   == 0 ? 3 : -1) : -1;
+    if (tidx < 0) {
+        return read_expert_direct(layer, tensor_type, expert, dst, dst_cap);
+    }
+    if (disk_lru_cap == 0) {
+        if (const char * e = getenv("LLAMA_MOE_DISK_LRU_MIB")) {
+            disk_lru_cap = (size_t) std::max(0, atoi(e)) << 20;
+        } else {
+            disk_lru_cap = 0; // default off: displaces page cache, measured net loss
+        }
+    }
+    if (disk_lru_cap == 0) {
+        return read_expert_direct(layer, tensor_type, expert, dst, dst_cap);
+    }
+    auto key = std::make_pair(layer, std::string(tensor_type ? tensor_type : ""));
+    auto it = disk_meta.find(key);
+    if (it == disk_meta.end()) {
+        return read_expert_direct(layer, tensor_type, expert, dst, dst_cap);
+    }
+    const moe_disk_tensor & dm = it->second;
+    // Same per-layer geometry guards as read_expert_direct: never memcpy a
+    // layer's expert with a stride that is not this layer's, and never overrun
+    // the caller's buffer.
+    const size_t layer_bytes = layer_expert_bytes(layer, tensor_type);
+    const int    layer_ne    = layer_n_expert(layer);
+    if (dm.stride == 0 || (layer_bytes != 0 && dm.stride != layer_bytes) ||
+        (layer_ne > 0 && expert >= layer_ne) || dm.stride > dst_cap) {
+        return read_expert_direct(layer, tensor_type, expert, dst, dst_cap);
+    }
+    const int fd = (dm.shard_idx < shard_fds.size()) ? shard_fds[dm.shard_idx] : model_fd;
+    if (fd < 0) {
+        return 0;
+    }
+    const uint64_t k = ((uint64_t)(uint32_t) layer << 40) | ((uint64_t)(uint32_t) tidx << 32) | (uint64_t)(uint32_t) expert;
+    const uint64_t now = ++disk_lru_clock;
+    {
+        std::lock_guard<std::mutex> lk(disk_lru_mu);
+        auto lit = disk_lru.find(k);
+        if (lit != disk_lru.end()) {
+            lit->second.last = now;
+            disk_lru_hits++;
+            memcpy(dst, lit->second.buf->data(), dm.stride);
+            return dm.stride;
+        }
+    }
+    disk_lru_misses++;
+    auto buf = std::make_shared<std::vector<uint8_t>>(dm.stride);
+    const size_t off = dm.base_offset + (size_t) expert * dm.stride;
+    ssize_t got = pread(fd, buf->data(), dm.stride, off);
+    if (got != (ssize_t) dm.stride) {
+        return 0;
+    }
+    memcpy(dst, buf->data(), dm.stride);
+    {
+        std::lock_guard<std::mutex> lk(disk_lru_mu);
+        if (disk_lru_bytes + dm.stride > disk_lru_cap) {
+            while (disk_lru_bytes + dm.stride > disk_lru_cap && !disk_lru.empty()) {
+                uint64_t best_k = 0;
+                uint64_t best_t = UINT64_MAX;
+                for (const auto & kv : disk_lru) {
+                    if (kv.second.last < best_t) {
+                        best_t = kv.second.last;
+                        best_k = kv.first;
+                    }
+                }
+                disk_lru_bytes -= disk_lru[best_k].size;
+                disk_lru.erase(best_k);
+            }
+        }
+        disk_lru.emplace(k, disk_lru_ent{ buf, now, (size_t) dm.stride });
+        disk_lru_bytes += dm.stride;
+    }
+    return (size_t) got;
+}
+
+void moe_ram_arena::warm_disk_from_profile(const char * profile_path, int n_expert_in, size_t budget_mib) {
+    if (!profile_path || !*profile_path) {
+        LLAMA_LOG_WARN("moe warm: bail no path\n");
+        return;
+    }
+    if (disk_meta.empty()) {
+        LLAMA_LOG_WARN("moe warm: bail disk_meta empty (%zu combined)\n", combined_buffers.size());
+        return;
+    }
+    if (budget_mib == 0) {
+        return;
+    }
+    if (getenv("LLAMA_MOE_NO_WARM") != nullptr) {
+        return;
+    }
+    std::ifstream f(profile_path);
+    if (!f) {
+        return;
+    }
+    std::string s((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    auto jint = [&](const char * key, int64_t def) {
+        const std::string k = std::string("\"") + key + "\"";
+        const size_t pos = s.find(k);
+        if (pos == std::string::npos) {
+            return def;
+        }
+        const size_t colon = s.find(':', pos + k.size());
+        if (colon == std::string::npos) {
+            return def;
+        }
+        return (int64_t) strtoll(s.c_str() + colon + 1, nullptr, 10);
+    };
+    const int64_t nl = jint("n_layer", 0);
+    const int64_t ne = jint("n_expert", 0);
+    if (nl <= 0 || ne != (int64_t) n_expert_in) {
+        LLAMA_LOG_WARN("moe warm: bail dims nl=%lld ne=%lld want %d\n", (long long) nl, (long long) ne, n_expert_in);
+        return;
+    }
+    const size_t cpos = s.find("\"counts\"");
+    if (cpos == std::string::npos) {
+        return;
+    }
+    std::vector<uint32_t> counts((size_t) nl * (size_t) ne, 0);
+    size_t idx = 0;
+    for (size_t i = s.find_first_of("0123456789", cpos); i != std::string::npos && idx < counts.size();
+         i = s.find_first_of("0123456789", i)) {
+        counts[idx++] = (uint32_t) strtoul(s.c_str() + i, nullptr, 10);
+        while (i < s.size() && isdigit((unsigned char) s[i])) {
+            i++;
+        }
+    }
+    if (idx != counts.size()) {
+        LLAMA_LOG_WARN("moe warm: bail counts idx=%zu want %zu\n", idx, counts.size());
+        return;
+    }
+    // rank (layer, expert) pairs by profile usage among disk-tier tensors
+    struct warm_job { int fd; size_t off; size_t len; uint64_t c; };
+    std::vector<warm_job> jobs;
+    for (const auto & kv : disk_meta) {
+        const int il = kv.first.first;
+        if (il >= nl) {
+            continue;
+        }
+        if (combined_buffers.count(kv.first) > 0) {
+            continue; // RAM-tier: already resident
+        }
+        const moe_disk_tensor & dm = kv.second;
+        const int fd = (dm.shard_idx < shard_fds.size()) ? shard_fds[dm.shard_idx] : model_fd;
+        if (fd < 0) {
+            continue;
+        }
+        for (int e = 0; e < n_expert_in; ++e) {
+            const uint32_t c = counts[(size_t) il * (size_t) ne + (size_t) e];
+            if (c > 0) {
+                jobs.push_back({ fd, dm.base_offset + (size_t) e * dm.stride, dm.stride, c });
+            }
+        }
+    }
+    if (jobs.empty()) {
+        LLAMA_LOG_WARN("moe warm: bail jobs empty (disk_meta %zu, combined %zu)\n", disk_meta.size(), combined_buffers.size());
+        return;
+    }
+    std::sort(jobs.begin(), jobs.end(), [](const warm_job & a, const warm_job & b) { return a.c > b.c; });
+    // Synchronous real reads, not fadvise: an async WILLNEED storm keeps
+    // draining during serving and starves the critical-path preads (measured
+    // 2.2x slowdown). At load time nothing else reads the drive, so blocking
+    // here is free; afterwards the pages simply sit in the page cache.
+    const size_t cap = budget_mib << 20;
+    size_t used = 0;
+    size_t n_warm = 0;
+    const auto t_w0 = std::chrono::steady_clock::now();
+    // keep only what fits the budget, then read it for real with a small pool
+    // (single-threaded random preads leave the drive mostly idle)
+    std::vector<warm_job> sel;
+    for (const auto & j : jobs) {
+        if (used + j.len > cap) {
+            continue;
+        }
+        used += j.len;
+        n_warm++;
+        sel.push_back(j);
+    }
+    {
+        const int nw = 8;
+        std::atomic<size_t> next{0};
+        std::vector<std::thread> ths;
+        for (int w = 0; w < nw; ++w) {
+            ths.emplace_back([&sel, &next, this]() {
+                std::vector<uint8_t> buf(1 << 20);
+                for (;;) {
+                    const size_t i = next.fetch_add(1, std::memory_order_relaxed);
+                    if (i >= sel.size()) {
+                        break;
+                    }
+                    const warm_job & j = sel[i];
+                    size_t done = 0;
+                    while (done < j.len) {
+                        const size_t chunk = std::min(buf.size(), j.len - done);
+                        const ssize_t got = pread(j.fd, buf.data(), chunk, (off_t) (j.off + done));
+                        if (got <= 0) {
+                            break;
+                        }
+                        done += (size_t) got;
+                    }
+                }
+            });
+        }
+        for (auto & t : ths) {
+            t.join();
+        }
+    }
+    LLAMA_LOG_INFO("%s: MoE page-cache warm: %zu experts (%.1f MiB) read in %.1f s\n",
+                   "moe_ram_arena", n_warm, used / 1024.0 / 1024.0,
+                   std::chrono::duration<double>(std::chrono::steady_clock::now() - t_w0).count());
 }
 
 std::string llama_model_loader::ftype_name() const {

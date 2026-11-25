@@ -1300,6 +1300,9 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         const bool has_draft = params.speculative.has_dft();
         const bool spec_mtp  = std::find(params.speculative.types.begin(), params.speculative.types.end(),
             COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+        // skip fitting the draft model/context when no draft-* spec type is
+        // enabled: no draft context will be created in that case
+        const bool needs_dft_ctx = common_speculative_needs_draft_ctx(params.speculative.types);
 
         common_params params_dft = common_base_params_to_speculative(params);
 
@@ -1322,7 +1325,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.tensor_buft_overrides.data(),
             params.fit_params_target.data(),
             params.fit_params_min_ctx,
-            has_draft || spec_mtp ? &extra : nullptr,
+            needs_dft_ctx ? &extra : nullptr,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
     }
 
@@ -1339,22 +1342,27 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     // is VRAM that is genuinely free for caching host-resident experts.
     // moe_ram_mib still bounds the host-side arena; experts outside both
     // tiers are read from disk on demand.
-    if (params.moe_ram_mib > 0 && !model->moe_device_budget.empty()) {
-        size_t solver_vram = 0;
-        for (size_t b : model->moe_device_budget) {
-            solver_vram += b;
-        }
-        // DEBUG BISECT: sentinel file /tmp/nomoecache disables the VRAM expert
-        // cache so experts stream from host/disk every token (correctness probe).
-        if (solver_vram > 0 && access("/tmp/nomoecache", F_OK) == 0) {
+    // Auto-size only when the user asked for a host arena or explicitly passed
+    // --moe-cache-mib auto; an explicit 0 in a preset must stay 0 (measurements show a
+    // 3-5 GiB bank does not repay its own fills on a 12 GB card).
+    if (cparams.moe_cache_size == 0 && params.moe_ram_mib > 0) {
+        char arch_buf[64] = {0};
+        llama_model_meta_val_str(model, "general.architecture", arch_buf, sizeof(arch_buf));
+        // nemotron_h_moe selects experts with a graph shape the VRAM cache cannot
+        // serve (selection is not RESHAPE(topk)); a cache there would bind bank
+        // tensors that never get filled -> corrupted logits.
+        if (strcmp(arch_buf, "nemotron_h_moe") == 0) {
+            LOG_INF("MoE cache: auto-size skipped for arch '%s' (RAM arena only)\n", arch_buf);
+        } else if (access("/tmp/nomoecache", F_OK) == 0) {
             LOG_INF("MoE cache: DISABLED by /tmp/nomoecache sentinel (correctness bisect)\n");
-            solver_vram = 0;
+        } else {
+            LOG_INF("MoE cache: auto-sizing VRAM expert cache from live free VRAM (host arena cap %zu MiB)\n",
+                    params.moe_ram_mib);
+            cparams.moe_cache_size = SIZE_MAX;
         }
-        if (solver_vram > 0) {
-            LOG_INF("MoE cache: %.2f MiB VRAM expert cache from placement solver (%zu device(s)), host arena cap %zu MiB\n",
-                    solver_vram / 1024.0 / 1024.0, model->moe_device_budget.size(), params.moe_ram_mib);
-            cparams.moe_cache_size = solver_vram;
-        }
+    } else if (cparams.moe_cache_size > 0 && access("/tmp/nomoecache", F_OK) == 0) {
+        LOG_INF("MoE cache: DISABLED by /tmp/nomoecache sentinel (correctness bisect)\n");
+        cparams.moe_cache_size = 0;
     }
 
     if (model_only) {
@@ -1487,6 +1495,35 @@ static void common_batch_set_zero_state(common_batch & batch, const llama_model 
     for (int32_t i = 0; i < batch.size(); ++i) {
         batch.set_embd_state(i, { zeros.data(), 1, zeros.size() });
     }
+}
+
+// Read only the layer count from a GGUF header. Used to resolve placement
+// fractions that must scale with model depth before the model is loaded.
+int common_gguf_block_count(const std::string & path) {
+    struct gguf_init_params meta_gguf_params = {
+        /* .no_alloc = */ true,
+        /* .ctx      = */ nullptr,
+    };
+    gguf_context_ptr ctx_gguf(gguf_init_from_file(path.c_str(), meta_gguf_params));
+    if (!ctx_gguf) {
+        return -1;
+    }
+    const int64_t n_kv = gguf_get_n_kv(ctx_gguf.get());
+    for (int64_t i = 0; i < n_kv; ++i) {
+        const char * key = gguf_get_key(ctx_gguf.get(), i);
+        if (key == nullptr) {
+            continue;
+        }
+        const std::string k(key);
+        static const std::string suffix = ".block_count";
+        if (k.size() > suffix.size() &&
+                k.compare(k.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            if (gguf_get_kv_type(ctx_gguf.get(), i) == GGUF_TYPE_UINT32) {
+                return (int) gguf_get_val_u32(ctx_gguf.get(), i);
+            }
+        }
+    }
+    return -1;
 }
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
@@ -1823,7 +1860,25 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
 
-    cparams.moe_cache_size = params.moe_cache_size;
+    cparams.moe_cache_size      = params.moe_cache_size;
+    cparams.moe_cache_cpu_share = params.moe_cache_cpu_share;
+    {
+        size_t extra_reserve = 896ull * 1024ull * 1024ull;
+        std::error_code ec;
+        if (!params.no_mmproj && params.mmproj_use_gpu && !params.mmproj.path.empty()) {
+            const auto sz = std::filesystem::file_size(params.mmproj.path, ec);
+            if (!ec && sz > 0) {
+                extra_reserve += (size_t) sz + 256ull * 1024ull * 1024ull;
+            }
+        }
+        if (!params.speculative.draft.mparams.path.empty()) {
+            const auto sz = std::filesystem::file_size(params.speculative.draft.mparams.path, ec);
+            if (!ec && sz > 0) {
+                extra_reserve += (size_t) sz + 384ull * 1024ull * 1024ull;
+            }
+        }
+        cparams.moe_cache_reserve = extra_reserve;
+    }
     cparams.moe_profile    = params.moe_profile.empty() ? nullptr : params.moe_profile.c_str();
     cparams.moe_hot        = params.moe_hot.empty()     ? nullptr : params.moe_hot.c_str();
 

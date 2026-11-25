@@ -2568,6 +2568,23 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
     return n_max;
 }
 
+bool common_speculative_needs_draft_ctx(const std::vector<common_speculative_type> & types) {
+    for (const auto type : types) {
+        switch (type) {
+            case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
+            case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
+            case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE4:
+            case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
+            case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
+            case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
+                return true;
+            default:
+                break;
+        }
+    }
+    return false;
+}
+
 int32_t common_speculative_n_max(const common_speculative * spec) {
     int32_t n_max = 0;
 
@@ -2745,6 +2762,17 @@ common_speculative_init_result::common_speculative_init_result(
     const bool spec_mtp = std::find(params.speculative.types.begin(),
                                     params.speculative.types.end(),
                                     COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+
+    // --model-draft only takes effect when a draft-* speculative type is
+    // enabled. With --spec-type none (or ngram-only types) the draft model and
+    // context must not be built: a draft GGUF built as a plain (non-MTP)
+    // context crashes in the qwen4exp expert-mix graph build, and the draft
+    // context would be unused anyway.
+    if (!common_speculative_needs_draft_ctx(params.speculative.types)) {
+        LOG_INF("%s: no draft speculative type enabled, skipping draft model '%s'\n", __func__,
+                params.speculative.draft.mparams.path.c_str());
+        return;
+    }
 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);

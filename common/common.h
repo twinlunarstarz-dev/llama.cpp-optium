@@ -603,7 +603,8 @@ struct common_params {
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
-    size_t moe_cache_size = 0; // internal: VRAM expert cache bytes, derived from the placement solver
+    size_t moe_cache_size = 0; // VRAM expert cache bytes (0 = disabled unless derived from moe_ram_mib, SIZE_MAX = auto)
+    float  moe_cache_cpu_share = 0.0f; // share of MoE cache misses computed on CPU instead of uploaded [0..1]
     std::string moe_profile;   // record per-expert activation counts to this JSON file (requires --moe-cache-mib)
     std::string moe_hot;       // seed and pin the MoE cache from this JSON profile (requires --moe-cache-mib)
 
@@ -611,6 +612,8 @@ struct common_params {
     size_t moe_ram_mib = 0;         // hard RAM cap in MiB for the MoE CPU arena (default: 0 = tiered MoE placement disabled)
     std::string moe_placement;      // "auto" (solver) | "plan:<json>" (explicit plan)
     bool moe_pin_decode = true;     // keep decode/attention layers in VRAM
+    float moe_cpu_layer_frac = 0.0f;      // fraction of layers whose experts stay on CPU (0 = off)
+    bool  moe_cpu_layers_explicit = false; // true when the caller set --n-cpu-moe themselves
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
@@ -1289,6 +1292,8 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 //
 // prompt utils
 //
+
+int common_gguf_block_count(const std::string & path);
 
 struct common_prompt_checkpoint {
     int64_t n_tokens;

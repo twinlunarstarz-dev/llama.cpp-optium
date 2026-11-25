@@ -567,6 +567,44 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
         }
     }
 
+    // discover a compatible draft that ships next to the model (e.g. mtp-<name>-Q4_K_M.gguf):
+    // a MoE model is dominated by expert bandwidth, so a GPU-resident draft pays for itself
+    // even when it costs the expert bank some VRAM. Explicit -md always wins.
+    if (spec_types_is_default(params) && params.speculative.draft.mparams.path.empty() &&
+            !params.model.path.empty()) {
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        const fs::path model_path(params.model.path);
+        const fs::path dir = model_path.parent_path();
+        if (!dir.empty() && fs::is_directory(dir, ec)) {
+            std::vector<fs::path> found;
+            for (const auto & ent : fs::directory_iterator(dir, ec)) {
+                if (!ent.is_regular_file(ec)) {
+                    continue;
+                }
+                const std::string name = ent.path().filename().string();
+                std::string lower = name;
+                for (auto & c : lower) {
+                    c = (char) std::tolower((unsigned char) c);
+                }
+                if (lower.rfind("mtp-", 0) != 0 || lower.size() < 4 ||
+                        lower.compare(lower.size() - 5, 5, ".gguf") != 0) {
+                    continue;
+                }
+                if (lower.find("-of-") != std::string::npos) {
+                    continue; // sharded drafts need an explicit --spec-type
+                }
+                found.push_back(ent.path());
+            }
+            if (!found.empty()) {
+                std::sort(found.begin(), found.end());
+                params.speculative.draft.mparams.path = found.front().string();
+                LOG_INF("%s: no draft specified, using the sidecar MTP draft '%s'\n",
+                        __func__, params.speculative.draft.mparams.path.c_str());
+            }
+        }
+    }
+
     // infer the speculative type from the draft GGUF metadata when none is requested
     // note: reads only the first split - sharded drafts need an explicit --spec-type
     if (spec_types_is_default(params) && !params.speculative.draft.mparams.path.empty()) {
@@ -1320,6 +1358,22 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
         if (ctx_arg.params.completion) {
             common_params_print_completion(ctx_arg);
             exit(0);
+        }
+        // Resolve a fractional CPU-expert placement now that the model path is known.
+        // A fixed layer count cannot serve models of different depth: 16 layers is a third
+        // of a 48-layer model but two thirds of a 24-layer one.
+        if (ctx_arg.params.moe_cpu_layer_frac > 0.0f && !ctx_arg.params.moe_cpu_layers_explicit) {
+            const int n_layer = common_gguf_block_count(ctx_arg.params.model.path);
+            if (n_layer > 0) {
+                const int n_cpu = (int) (n_layer * ctx_arg.params.moe_cpu_layer_frac + 0.5f);
+                if (n_cpu > 0) {
+                    COM_INF("%s: placing experts of %d of %d layers on the CPU (%.0f%%), resolved from the model depth\n",
+                            __func__, n_cpu, n_layer, 100.0 * ctx_arg.params.moe_cpu_layer_frac);
+                    llm_add_n_cpu_ffn_overrides(n_cpu, LLM_FFN_EXPS_REGEX, ctx_arg.params.tensor_buft_overrides);
+                    // the list is walked until a null pattern; re-terminate after appending
+                    ctx_arg.params.tensor_buft_overrides.push_back({ nullptr, nullptr });
+                }
+            }
         }
         params.lr.init();
     } catch (const std::invalid_argument & ex) {
@@ -2453,10 +2507,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_REPACK"));
     add_opt(common_arg(
+        {"--host-buffer"},
         {"--no-host"},
-        "bypass host buffer allowing extra buffers to be used",
-        [](common_params & params) {
-            params.no_host = true;
+        string_format("bypass host buffer allowing extra buffers to be used (default: %s)", params.no_host ? "disabled" : "enabled"),
+        [](common_params & params, bool value) {
+            params.no_host = !value;
         }
     ).set_env("LLAMA_ARG_NO_HOST"));
     add_opt(common_arg(
@@ -2804,9 +2859,38 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             if (value < 0) {
                 throw std::invalid_argument("invalid value");
             }
+            // only a non-zero count is a deliberate split; a global '0' must not
+            params.moe_cpu_layers_explicit = value > 0;
             llm_add_n_cpu_ffn_overrides(value, LLM_FFN_EXPS_REGEX, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
+    add_opt(common_arg(
+        {"--moe-cache-mib"}, "N",
+        "size of the device cache for host-resident MoE experts in MiB, or 'auto' to fill remaining VRAM (default: 0 = disabled unless --moe-ram-mib is set)",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.moe_cache_size = SIZE_MAX;
+            } else {
+                const long long mib = std::stoll(value);
+                if (mib < 0) {
+                    params.moe_cache_size = SIZE_MAX;
+                } else {
+                    params.moe_cache_size = (size_t) mib * 1024ull * 1024ull;
+                }
+            }
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_MIB"));
+    add_opt(common_arg(
+        {"--moe-cache-cpu-share"}, "F",
+        "share of MoE cache misses computed on the CPU from host experts instead of uploaded once the cache is full, 0.0 to 1.0 (default: 0.0)",
+        [](common_params & params, const std::string & value) {
+            const float share = std::stof(value);
+            if (!(share >= 0.0f && share <= 1.0f)) {
+                throw std::invalid_argument("invalid value for --moe-cache-cpu-share (expected 0.0..1.0)");
+            }
+            params.moe_cache_cpu_share = share;
+        }
+    ).set_env("LLAMA_ARG_MOE_CACHE_CPU_SHARE"));
     add_opt(common_arg(
         {"--moe-profile"}, "PATH",
         "record per-expert activation counts of the MoE cache to PATH (JSON, merged with any existing file; 'auto' = <cache dir>/moe-profiles/<model>.json)",

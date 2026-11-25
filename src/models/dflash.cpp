@@ -139,7 +139,17 @@ void llama_model_dflash::load_arch_tensors(llama_model_loader &) {
     if (markov_meta) {
         const int64_t dspark_markov_rank = markov_meta->ne[0];
 
-        dspark_markov_w1   = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W1, "weight"), { dspark_markov_rank, n_vocab }, 0);
+        // Some DSpark exports pad the Markov embedding table past the declared vocabulary
+        // (observed: 200058 declared, 201024 stored). The table is only ever consumed by
+        // ggml_get_rows with token ids < n_vocab, so the extra rows are inert. Allocating the
+        // stored width lets those drafts load instead of failing the shape check at load time.
+        const int64_t markov_rows = markov_meta->ne[1] >= n_vocab ? markov_meta->ne[1] : n_vocab;
+        if (markov_rows != n_vocab) {
+            LLAMA_LOG_INFO("%s: DSpark markov table is vocab-padded: %lld rows stored for n_vocab %lld\n",
+                    __func__, (long long) markov_rows, (long long) n_vocab);
+        }
+
+        dspark_markov_w1   = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W1, "weight"), { dspark_markov_rank, markov_rows }, 0);
         dspark_markov_w2   = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W2, "weight"), { dspark_markov_rank, n_vocab_draft }, 0);
         dspark_markov_w2_s = create_tensor(tn(LLM_TENSOR_DSPARK_MARKOV_W2, "scale"),  { 1 }, TENSOR_NOT_REQUIRED);
 

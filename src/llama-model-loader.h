@@ -9,9 +9,13 @@
 
 #include "ggml-cpp.h"
 
+#include <array>
 #include <cstddef>
 #include <cstring>
+#include <chrono>
 #include <deque>
+#include <set>
+#include <condition_variable>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -143,6 +147,13 @@ struct llama_model_loader {
     std::deque<std::string> moe_pattern_strings; // stable refs: overrides store raw c_str()
     std::unique_ptr<moe_placement_plan> moe_plan;
     moe_ram_arena * moe_arena = nullptr; // owned by g_moe_ram_arena
+
+    // Point every RAM-tier expert tensor at the arena block that holds it, so the
+    // MoE CPU branch can compute those experts straight out of host RAM instead of
+    // streaming them over PCIe. Must run after load_all_data() (arena sizes final).
+    void rebind_moe_arena_tensors();
+    // Pread (and optionally lock) the arena RAM tier before the first token.
+    void preload_moe_arena(size_t n_workers, bool lock_ram);
 
     gguf_context_ptr metadata_ptr;
     struct gguf_context * metadata; // either metadata_ptr.get() or externally set
@@ -409,11 +420,63 @@ struct moe_combined_buffer {
     int layer = -1;
     std::string tensor_type;     // "gate", "up", "down", "gate_up"
     std::vector<uint8_t> buffer; // Combined buffer for all experts
+    // The expert tensors are handed to ggml as host weights, so the first row has
+    // to satisfy GGML's tensor alignment. `offset` aligns buffer.data() without
+    // changing the contiguous per-expert layout: expert e lives at base()+e*stride.
+    size_t offset = 0;
+    size_t alloc = 0;
+    uint8_t * base() { return buffer.data() + offset; }
+    const uint8_t * base() const { return buffer.data() + offset; }
     size_t expert_size = 0;      // Size of one expert in bytes
     size_t stride = 0;           // Stride between experts (nb[2])
     std::vector<bool> resident;  // Per-expert resident flags
     uint64_t last_access = 0;    // For LRU (whole buffer)
 };
+
+// Per-layer expert geometry. Models such as nemotron_h_moe declare a different
+// expert_feed_forward_length per block, so the byte size of one expert is a
+// property of (layer, tensor type), not a global constant. The arena keeps this
+// table so every pread and every upload uses the layer's own stride.
+struct moe_layer_geom {
+    int    n_expert = 0;             // experts in this layer (0 = not yet captured)
+    std::array<size_t, 4> bytes {};  // one expert's bytes per type: gate_up, gate, up, down
+    bool   known = false;            // at least one expert tensor of this layer was captured
+};
+
+// Arena identity. Expert geometry is part of the key: two models (or a target and
+// its MTP/draft head) that share block/expert counts but differ in per-layer
+// expert width must never resolve to the same arena.
+struct moe_arena_key {
+    int      n_layer   = 0;
+    int      n_expert  = 0;
+    uint64_t geom_hash = 0;
+    bool operator<(const moe_arena_key & o) const {
+        if (n_layer   != o.n_layer)   return n_layer   < o.n_layer;
+        if (n_expert  != o.n_expert)  return n_expert  < o.n_expert;
+        return geom_hash < o.geom_hash;
+    }
+};
+
+// Fingerprint of the per-layer expert geometry. The loader calls this with the
+// GGUF arrays and the inference side with llama_hparams (read from the same
+// keys), so the two sides agree without sharing objects. Absent arrays hash as
+// zeros on both sides, i.e. "uniform geometry".
+inline uint64_t moe_arena_geom_hash(int n_layer, int n_expert, const uint32_t * n_ff_exp, const uint32_t * n_expert_used) {
+    uint64_t h = 1469598103934665603ull; // FNV-1a 64
+    auto mix = [&h](uint64_t v) {
+        for (int i = 0; i < 8; ++i) {
+            h ^= (v >> (8*i)) & 0xffull;
+            h *= 1099511628211ull;
+        }
+    };
+    mix((uint64_t) (uint32_t) n_layer);
+    mix((uint64_t) (uint32_t) n_expert);
+    for (int i = 0; i < n_layer; ++i) {
+        mix(n_ff_exp      != nullptr ? (uint64_t) n_ff_exp[i]      : 0ull);
+        mix(n_expert_used != nullptr ? (uint64_t) n_expert_used[i] : 0ull);
+    }
+    return h;
+}
 
 // Bounded RAM arena for MoE experts on disk tier
 // Fixed size (--moe-ram-mib), holds expert tensors loaded on-demand via pread
@@ -441,6 +504,94 @@ struct moe_ram_arena {
     // DISK-tier expert tensors: key = (layer, tensor_type)
     std::map<std::pair<int, std::string>, moe_disk_tensor> disk_meta;
 
+    // Per-layer expert geometry (index = block index). Filled at capture time
+    // from the real tensors, so each layer is addressed with its own stride.
+    std::vector<moe_layer_geom> layer_geom;
+    int      n_layer_total = 0;
+    uint64_t geom_hash     = 0;
+    // Set when a layer's geometry contradicts what the arena recorded. Serving
+    // is then refused for the whole arena so every read falls back to the mmap
+    // path instead of handing out weights of the wrong shape.
+    bool     disabled      = false;
+
+    static int type_index(const char * tensor_type) {
+        return tensor_type == nullptr ? -1 :
+               strcmp(tensor_type, "gate_up") == 0 ? 0 :
+               strcmp(tensor_type, "gate")    == 0 ? 1 :
+               strcmp(tensor_type, "up")      == 0 ? 2 :
+               strcmp(tensor_type, "down")    == 0 ? 3 : -1;
+    }
+    // Bytes of one expert tensor of `tensor_type` in `layer`, 0 if unknown.
+    size_t layer_expert_bytes(int layer, const char * tensor_type) const {
+        const int t = type_index(tensor_type);
+        if (t < 0 || layer < 0 || layer >= (int) layer_geom.size()) {
+            return 0;
+        }
+        return layer_geom[layer].bytes[t];
+    }
+    int layer_n_expert(int layer) const {
+        if (layer < 0 || layer >= (int) layer_geom.size()) {
+            return 0;
+        }
+        return layer_geom[layer].n_expert;
+    }
+    // Record one layer's expert geometry, validating it against what is already
+    // known for that layer. Returns false when the layer contradicts itself (the
+    // arena is then disabled: no expert is served with a wrong stride).
+    bool note_layer_geom(int layer, int n_expert, const char * tensor_type, size_t bytes);
+    void disable(const char * reason);
+
+    // host-RAM LRU in front of disk-tier expert preads
+    struct disk_lru_ent {
+        std::shared_ptr<std::vector<uint8_t>> buf;
+        uint64_t last = 0;
+        size_t   size = 0;
+    };
+    std::mutex disk_lru_mu;
+    std::unordered_map<uint64_t, disk_lru_ent> disk_lru;
+    size_t   disk_lru_bytes = 0;
+    size_t   disk_lru_cap = 0;
+    uint64_t disk_lru_clock = 0;
+    uint64_t disk_lru_hits = 0;
+    uint64_t disk_lru_misses = 0;
+    std::string warm_profile_path;
+    int      warm_n_expert = 0;
+    size_t   warm_budget_mib = 8192;
+    std::atomic<bool> warm_done{false};
+
+    // routing-lookahead warm state
+    int      warm_hist_n = 4;                 // recent routed-id sets kept per layer
+    size_t   warm_budget = 96ull << 20;       // rolling-window byte budget
+    size_t   warm_win_bytes = 0;              // bytes queued in the current window
+    std::chrono::steady_clock::time_point warm_win_t0{};
+    std::mutex warm_mu;
+    std::map<int, std::deque<std::vector<int32_t>>> warm_hist;
+    std::unordered_map<uint64_t, uint64_t> warm_armed; // key -> event armed
+    std::atomic<uint64_t> warm_event_a{0};
+    std::atomic<uint64_t> warm_pred{0}, warm_useful{0}, warm_labytes{0}, warm_dedup{0}, warm_fskip{0}, warm_late{0};
+    uint64_t warm_next_stat = 16384;
+
+    // staged warm ring: workers pread predicted misses into disk_lru so the
+    // serve path hits host RAM instead of NVMe (Strata's staged variant)
+    struct warm_qjob { int il; int tidx; int e; uint64_t ev; };
+    std::mutex warm_q_mu;
+    std::condition_variable warm_q_cv;
+    std::deque<warm_qjob> warm_q;
+    std::set<uint64_t> warm_q_keys;
+    std::vector<std::thread> warm_workers;
+    std::atomic<bool> warm_stop{false};
+    size_t   warm_ring_mib = 1024;
+    void warm_stage_worker();
+    bool warm_stage(int il, int tidx, int expert);
+
+    static uint64_t warm_type_idx(const char * type) {
+        return strcmp(type, "gate_up") == 0 ? 0 : strcmp(type, "gate") == 0 ? 1 :
+               strcmp(type, "up") == 0      ? 2 : 3;
+    }
+    static uint64_t warm_key(int il, uint64_t ti, int e) {
+        return ((uint64_t)(uint32_t) il << 40) | (ti << 32) | (uint32_t) e;
+    }
+
     // Initialize arena with given capacity and expert metadata
     bool init(size_t capacity_mib, const moe_placement_plan & plan, int n_layer, int n_expert, const char * model_path);
     bool init_sharded(size_t capacity_mib, const moe_placement_plan & plan, int n_layer, int n_expert, const std::vector<int> & shard_fds_in);
@@ -459,10 +610,60 @@ struct moe_ram_arena {
 
     // Direct pread of one expert (any tier) into dst; returns bytes read, 0 on miss.
     // Thread-safe for concurrent use: read-only map + positional pread.
-    size_t read_expert_direct(int layer, const char * tensor_type, int expert, void * dst);
+    // dst_cap is the caller's buffer size for one expert of THIS layer; the read
+    // is refused if the layer's own stride would overflow it.
+    size_t read_expert_direct(int layer, const char * tensor_type, int expert, void * dst, size_t dst_cap);
+    size_t read_expert_direct(int layer, const char * tensor_type, int expert, void * dst) {
+        return read_expert_direct(layer, tensor_type, expert, dst, (size_t) -1);
+    }
+
+    // Profile-guided page-cache warm: issue POSIX_FADV_WILLNEED for the hottest
+    // disk-tier experts (by placement profile) so cold topic switches hit RAM.
+    void warm_disk_from_profile(const char * profile_path, int n_expert_in, size_t budget_mib);
+    bool warm_ready() const { return warm_done.load(); }
+    void warm_mark_done() { warm_done.store(true); }
+    int  n_expert_total() const { return warm_n_expert; }
+    void warm_arm(const char * profile_path, int n_expert_in, size_t budget_mib) {
+        if (profile_path && *profile_path && n_expert_in > 0) {
+            warm_profile_path = profile_path;
+            warm_n_expert = n_expert_in;
+            warm_budget_mib = budget_mib;
+        }
+    }
+
+    // Disk-tier expert read with a host-RAM LRU cache in front of the disk.
+    // Repeat uses of a disk-tier expert are served from RAM instead of re-preading
+    // the GGUF shard on every use. Cap via LLAMA_MOE_DISK_LRU_MIB (default 8192, 0 = off).
+    size_t read_expert_cached(int layer, const char * tensor_type, int expert, void * dst, size_t dst_cap);
+    size_t read_expert_cached(int layer, const char * tensor_type, int expert, void * dst) {
+        return read_expert_cached(layer, tensor_type, expert, dst, (size_t) -1);
+    }
 
     // Prefetch expert asynchronously (non-blocking)
     void prefetch_expert(int layer, int expert, const char * tensor_type = nullptr);
+
+    // ---- routing-lookahead warm (adapted from Strata's RouterLookahead) ----
+    // Records the routed expert ids of layer `il` for this event (one call per
+    // copy-callback invocation per layer). History is newest-entry-first.
+    void warm_note(int il, const int32_t * ids, int n);
+    // Warms (POSIX_FADV_WILLNEED) the disk-tier experts of layers il+1..il+ahead
+    // that recent history routed, skipping RAM-resident ones, within a rolling
+    // byte budget. Prediction only warms pages: it never changes what is computed.
+    void warm_lookahead(int il, int ahead);
+    // Credits a warmed prediction when the expert is actually served from disk
+    bool warm_credit(int il, const char * type, int e);
+    // true if expert e of (il, type) currently sits in the arena's RAM tier
+    bool expert_resident(int il, const char * type, int e) const;
+
+    // true only when expert e is resident in EVERY one of `types` for layer `il`.
+    // The CPU expert branch reads all expert tensors of a layer, so a partially
+    // resident expert must not be scheduled there (it would read zero pages).
+    bool expert_resident_all(int layer, int expert, const std::vector<std::string> & types) const;
+
+    // Pread the RAM tier in full, so every arena-backed expert is present before
+    // the first token and the CPU branch never depends on a fill side effect.
+    // Also mlock()s the populated blocks when `lock_ram` is set (best effort).
+    bool preload_all(size_t n_workers, bool lock_ram);
 
     // Evict least recently used expert(s) to make room for new data
     void evict_lru(size_t need_bytes);
@@ -476,7 +677,9 @@ struct moe_ram_arena {
 
 // Global arena instance (owned by llama_model_loader)
 extern moe_ram_arena * g_moe_ram_arena;
-extern std::map<std::pair<int,int>, std::unique_ptr<moe_ram_arena>> g_moe_arenas;
+// Keyed by (blocks, experts, per-layer geometry fingerprint): heterogeneous
+// expert widths get their own arena and can never alias a uniform one.
+extern std::map<moe_arena_key, std::unique_ptr<moe_ram_arena>> g_moe_arenas;
 
 // Early MoE solver - called from common.cpp before standard parameter fitting
 // Returns true on success, false on failure (error in plan.error)
