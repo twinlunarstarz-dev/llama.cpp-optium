@@ -579,6 +579,8 @@ namespace GGUFMeta {
 
     template bool llama_model_loader::get_key<bool>       (enum llm_kv kid, bool & result,        bool required);
     template bool llama_model_loader::get_key<bool>       (const std::string & key, bool & result, bool required);
+    // nari fork: the string-keyed forms read trellis.desc.<w>, trellis.lm_head_bands and trellis.embed_bands
+    template bool llama_model_loader::get_key<uint32_t>   (const std::string & key, uint32_t & result, bool required);
     template bool llama_model_loader::get_key<float>      (enum llm_kv kid, float & result,       bool required);
     template bool llama_model_loader::get_key<uint32_t>   (enum llm_kv kid, uint32_t & result,    bool required);
     template bool llama_model_loader::get_key<std::string>(enum llm_kv kid, std::string & result, bool required);
@@ -915,6 +917,18 @@ llama_model_loader::llama_model_loader(
 
     n_kv      = gguf_get_n_kv(metadata);
     n_tensors = weights_map.size();
+
+    const int version_key = gguf_find_key(metadata, "trellis.version");
+    bool has_coded_tensors = false;
+    for (const auto & item : weights_map) {
+        has_coded_tensors |= ggml_is_trellis_type(item.second.tensor->type);
+    }
+    if (has_coded_tensors || version_key >= 0) {
+        if (version_key < 0 || gguf_get_kv_type(metadata, version_key) != GGUF_TYPE_UINT32 ||
+            gguf_get_val_u32(metadata, version_key) != 1) {
+            throw std::runtime_error("trellis: coded tensors require trellis.version = 1 (uint32)");
+        }
+    }
 
     fver = (enum llama_fver) gguf_get_version(metadata);
 
@@ -1404,6 +1418,31 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
                 ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, w->ne[0], 512, w->ne[2], w->ne[3]);
                 op_tensor = ggml_mul_mat(ctx, w, b);
             } break;
+        case GGML_OP_TRELLIS:
+            {
+                // nari fork: a coded weight's linear, with dummy sides (none on both sides)
+                const int32_t desc[7] = { 0, 0, 1, 0, 0, 1, 0 };
+                if (!ggml_trellis_desc_supported(w->ne[0], w->ne[1], desc, 7)) {
+                    throw std::runtime_error(format("trellis: unsupported shape for %s", ggml_get_name(w)));
+                }
+                ggml_tensor * b    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w->ne[0], 512);
+                ggml_tensor * s16  = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, w->ne[0] / 16);
+                ggml_tensor * pre  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, w->ne[0]);
+                ggml_tensor * post = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, w->ne[1]);
+                op_tensor = ggml_trellis_mul_mat(ctx, w, b, s16, pre, post, nullptr, nullptr, desc, 7);
+            } break;
+        case GGML_OP_TRELLIS_GET_ROWS:
+            {
+                const int32_t desc[7] = { 0, 0, 1, 0, 0, 1, 0 };
+                if (!ggml_trellis_desc_supported(w->ne[0], w->ne[1], desc, 7)) {
+                    throw std::runtime_error(format("trellis: unsupported shape for %s", ggml_get_name(w)));
+                }
+                ggml_tensor * ids  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 512);
+                ggml_tensor * s16  = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, w->ne[0] / 16);
+                ggml_tensor * pre  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, w->ne[0]);
+                ggml_tensor * post = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, w->ne[1]);
+                op_tensor = ggml_trellis_get_rows(ctx, w, ids, s16, pre, post, desc, 7);
+            } break;
         case GGML_OP_MUL_MAT_ID:
             {
                 // Used for either MoE expert routing or embedded adapter routing
@@ -1518,6 +1557,31 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
 
 // find the first buffer type in the list that can use the tensor
 static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hparams, ggml_tensor * tensor, ggml_op op, const buft_list_t * buft_list) {
+    // nari fork: a coded weight's side tensors (<w>.trellis_s16 / pre / post / pin / pout) go where the weight goes,
+    // so they are placed by the same probe, on a stand-in coded weight
+    if (!ggml_is_trellis_type(tensor->type) && strstr(tensor->name, ".trellis_") != nullptr &&
+            (op == GGML_OP_MUL_MAT || op == GGML_OP_GET_ROWS)) {
+        ggml_init_params params = { ggml_tensor_overhead(), NULL, true };
+        ggml_context_ptr ctx { ggml_init(params) };
+        ggml_tensor * probe = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_TRL2, 256, 256);
+        ggml_set_name(probe, tensor->name);
+        return select_weight_buft(hparams, probe, op, buft_list);
+    }
+    // nari fork: a banded lm_head's output.vocab_gather is an index vector read by get_rows: placing it by MUL_MAT
+    // support would put it in host memory and split the graph after the logits (the sides took the branch above)
+    if (tensor->type == GGML_TYPE_I32 && op == GGML_OP_MUL_MAT && strcmp(tensor->name, "output.vocab_gather") == 0) {
+        op = GGML_OP_GET_ROWS;
+    }
+    // nari fork: a coded weight is only ever read by its own ops (no backend runs a plain MUL_MAT or GET_ROWS on
+    // it), so its buffer type is the first that runs those: the GPU's where libtrellis runs, else host memory for the
+    // CPU backend's op (a CPU-only run, a layer left on the CPU, the embedding)
+    if (ggml_is_trellis_type(tensor->type)) {
+        if (op == GGML_OP_MUL_MAT) {
+            op = GGML_OP_TRELLIS;
+        } else if (op == GGML_OP_GET_ROWS) {
+            op = GGML_OP_TRELLIS_GET_ROWS;
+        }
+    }
     GGML_ASSERT(!buft_list->empty());
     for (const auto & cur : *buft_list) {
         ggml_backend_dev_t cur_dev = cur.first;
@@ -1718,6 +1782,15 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             buft = select_weight_buft(hparams, t_meta, op, buft_list);
             if (!buft) {
                 throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", tn.str().c_str()));
+            }
+            // nari fork: say once per load when a backend/device cannot run the coded linears; the
+            // coded embedding always stays in host memory, so it does not count
+            ggml_backend_dev_t gpu = buft_list->front().first;
+            if (op == GGML_OP_MUL_MAT && ggml_is_trellis_type(t_meta->type) && !trellis_gpu_warned && gpu != nullptr &&
+                    ggml_backend_dev_type(gpu) == GGML_BACKEND_DEVICE_TYPE_GPU && ggml_backend_buft_get_device(buft) != gpu) {
+                trellis_gpu_warned = true;
+                LLAMA_LOG_WARN("trellis: %s (%s) cannot run the coded linears on this backend/device; they run on the CPU, which is much slower\n",
+                        ggml_backend_dev_name(gpu), ggml_backend_dev_description(gpu));
             }
         }
 

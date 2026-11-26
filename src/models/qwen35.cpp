@@ -37,7 +37,10 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
     const int trunk_flags = nf.trunk;
     const int mtp_flags   = nf.mtp;
 
-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
+    // nari fork: a coded embedding in frequency bands replaces token_embd.weight
+    if (!create_trellis_embed_bands(n_embd, n_vocab)) {
+        tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
+    }
 
     // output
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), { n_embd }, 0);
@@ -48,7 +51,8 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
     cls_out_b = create_tensor(tn(LLM_TENSOR_CLS_OUT, "bias"),   { hparams.n_embd_out() },         TENSOR_NOT_REQUIRED);
 
     // if output is NULL, init from the input tok embed
-    if (output == NULL) {
+    // nari fork: a coded lm_head in frequency bands replaces output.weight
+    if (output == NULL && !create_trellis_bands(n_embd, n_vocab)) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
 
@@ -230,7 +234,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     }
 
     // LM head
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    cur = model.trellis.bands.empty() ? build_lora_mm(model.output, cur, model.output_s) : build_trellis_bands(cur);
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;

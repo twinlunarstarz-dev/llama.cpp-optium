@@ -96,6 +96,8 @@ struct llama_model_loader {
     bool check_tensors;
     bool no_alloc;
     bool load_mtp = false;
+
+    bool trellis_gpu_warned = false; // nari fork: the warning that the coded linears run on the CPU was given
     bool sequential_load = false;
 
     // handle TENSOR_READ_LAZY

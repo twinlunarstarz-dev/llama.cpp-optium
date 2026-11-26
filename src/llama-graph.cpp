@@ -1664,6 +1664,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     moe_cache        (params.moe_cache),
     prec_policy      (params.prec_policy),
     hdmd             (params.hdmd),
+    trellis          (params.trellis),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1717,10 +1718,66 @@ ggml_tensor * llm_graph_context::build_hadamard_input(
     return x;
 }
 
+// nari fork: the logits of a coded lm_head in frequency bands: every band's coded linear, concatenated in band order,
+// then each vocabulary row picked from its band (logits[t] = banded[vocab_gather[t]])
+ggml_tensor * llm_graph_context::build_trellis_bands(ggml_tensor * cur) const {
+    ggml_tensor * banded = nullptr;
+    if (ggml_nrows(cur) == 1) {
+        // one token: concatenate pairwise, so each band is copied log2(n_bands) times instead of up to n_bands times
+        std::vector<ggml_tensor *> level;
+        for (ggml_tensor * w : trellis->bands) {
+            level.push_back(build_lora_mm(w, cur));
+        }
+        while (level.size() > 1) {
+            size_t n = 0;
+            for (size_t i = 0; i < level.size(); i += 2) {
+                level[n++] = i + 1 < level.size() ? ggml_concat(ctx0, level[i], level[i + 1], 0) : level[i];
+            }
+            level.resize(n);
+        }
+        banded = level.front();
+    } else {
+        for (ggml_tensor * w : trellis->bands) {
+            ggml_tensor * y = build_lora_mm(w, cur);
+            banded = banded ? ggml_concat(ctx0, banded, y, 0) : y;
+        }
+    }
+    if (banded->ne[1] == 1) {  // one token: the transposes are reshapes
+        ggml_tensor * bt = ggml_reshape_2d(ctx0, banded, 1, banded->ne[0]);
+        bt = ggml_get_rows(ctx0, bt, trellis->vocab_gather);
+        return ggml_reshape_2d(ctx0, bt, bt->ne[1], 1);
+    }
+    ggml_tensor * bt = ggml_cont(ctx0, ggml_transpose(ctx0, banded));  // [n_tokens, n_vocab]
+    bt = ggml_get_rows(ctx0, bt, trellis->vocab_gather);               // rows in vocabulary order
+    return ggml_cont(ctx0, ggml_transpose(ctx0, bt));                  // [n_vocab, n_tokens]
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
+    // nari fork: a trellis-coded weight runs as one coded linear (its rotations, scales and gathers included)
+    const llama_trellis_weight * tw = nullptr;
+    if (trellis != nullptr) {
+        const auto tt = trellis->weights.find(w);
+        if (tt != trellis->weights.end()) {
+            tw = &tt->second;
+        }
+    }
+    if (tw != nullptr) {
+        ggml_tensor * x = ggml_is_contiguous(cur) ? cur : ggml_cont(ctx0, cur);
+        ggml_tensor * res = ggml_trellis_mul_mat(ctx0, w, x, tw->s16, tw->pre, tw->post, tw->pin, tw->pout,
+                                                 tw->desc.data(), (int) tw->desc.size());
+        // placed in the graph now, so the coded linears that read one x (q/k/v, up/gate, the DeltaNet in-projections)
+        // are consecutive nodes: the CUDA backend runs them as one input group
+        if (gf) {
+            ggml_build_forward_expand(gf, res);
+        }
+        if (w_s) {
+            res = ggml_mul(ctx0, res, w_s);
+        }
+        return res;
+    }
     // the folded weight sees the rotated input; LoRA deltas are trained in the
     // unrotated basis and keep reading `cur`, unless the adapter declares otherwise
     ggml_tensor * mm_in = build_hadamard_input(w, cur);
@@ -2675,13 +2732,39 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd, float to
     // we use ggml_build_forward_order to make the GET_ROWS ops stick at the beginning of the compute graph
     // this way the embeddings remain in the host buffer, and the GET_ROWS run before any other computations
     {
-        embd0 = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+        // nari fork: a trellis-coded embedding decodes its rows (in host memory, on the CPU); one in frequency bands
+        // (tok_embd NULL) decodes each id's row from its band, one op per band writing in place
+        const llama_trellis_weight * tw = nullptr;
+        if (trellis != nullptr && tok_embd != nullptr) {
+            const auto tit = trellis->weights.find(tok_embd);
+            if (tit != trellis->weights.end()) {
+                tw = &tit->second;
+            }
+        }
+        auto get_rows = [&](ggml_tensor * ids) {
+            if (tok_embd == nullptr) {
+                GGML_ASSERT(trellis != nullptr && !trellis->embed_bands.empty() && trellis->embed_gather != nullptr);
+                ggml_tensor * rows = nullptr;
+                int64_t row0 = 0;
+                for (ggml_tensor * w : trellis->embed_bands) {
+                    const llama_trellis_weight * bw = &trellis->weights.at(w);
+                    rows = ggml_trellis_get_rows_band(ctx0, rows, w, ids, trellis->embed_gather, row0, bw->s16,
+                                                      bw->pre, bw->post, bw->desc.data(), (int) bw->desc.size());
+                    row0 += w->ne[1];
+                }
+                return rows;
+            }
+            return tw ? ggml_trellis_get_rows(ctx0, tok_embd, ids, tw->s16, tw->pre, tw->post, tw->desc.data(),
+                                              (int) tw->desc.size())
+                      : ggml_get_rows(ctx0, tok_embd, ids);
+        };
+        embd0 = get_rows(inp->tokens);
         ggml_build_forward_order(gf, embd0);
 
         embd1 = inp->embd;
 
         if (has_mixed) {
-            embd2 = ggml_get_rows(ctx0, tok_embd, inp->mixed_tokens);
+            embd2 = get_rows(inp->mixed_tokens);
             ggml_build_forward_order(gf, embd2);
         }
     }

@@ -727,6 +727,24 @@ struct llama_hadamard {
     llama_hadamard_rotations inv; // latent lookup table -> inverse transform
 };
 
+// nari fork: a trellis-coded weight's side tensors and sides (nariq/FORMAT.md)
+struct llama_trellis_weight {
+    ggml_tensor * s16  = nullptr; // F16 [K/16] block scales
+    ggml_tensor * pre  = nullptr; // F32 [K] input-side vector
+    ggml_tensor * post = nullptr; // F32 [N] output-side vector
+    ggml_tensor * pin  = nullptr; // I32 [K] input gather, optional
+    ggml_tensor * pout = nullptr; // I32 [N] output gather, optional
+    std::vector<int32_t> desc;    // trellis.desc.<w>: the sides (ggml_trellis_mul_mat)
+};
+
+struct llama_trellis {
+    std::unordered_map<const ggml_tensor *, llama_trellis_weight> weights;
+    std::vector<ggml_tensor *> bands;     // a coded lm_head in frequency bands (output.bandNN.weight), in order
+    ggml_tensor * vocab_gather = nullptr; // I32 [n_vocab]: logits[t] = banded[vocab_gather[t]]
+    std::vector<ggml_tensor *> embed_bands; // a coded embedding in frequency bands (token_embd.bandNN.weight), in order
+    ggml_tensor * embed_gather = nullptr;   // I32 [n_vocab]: token t's row is banded row embed_gather[t]
+};
+
 struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;
@@ -744,6 +762,14 @@ struct llama_model {
     llama_prec_policy prec_policy;
 
     llama_hadamard hdmd;
+
+    // nari fork: the trellis-coded weights (empty for other models)
+    llama_trellis trellis;
+
+    const llama_trellis_weight * trellis_weight(const ggml_tensor * w) const {
+        const auto it = trellis.weights.find(w);
+        return it == trellis.weights.end() ? nullptr : &it->second;
+    }
 
     // see llama_model_set_attn_rot
     bool attn_rot = true;
@@ -1006,6 +1032,20 @@ struct llama_model_base : public llama_model {
         int mtp;   // TENSOR_NOT_REQUIRED when the file holds only the trunk, TENSOR_SKIP when MTP is not loaded
     };
     nextn_flags_t nextn_flags(llama_model_loader & ml, llm_tensor trunk_probe = LLM_TENSOR_ATTN_NORM) const;
+
+    // nari fork: a coded weight's side tensors and `trellis.desc` (called by create_tensor)
+    void create_trellis_sides(llama_model_loader & ml, const LLM_TN_IMPL & tn, ggml_tensor * w);
+
+    // nari fork: a coded lm_head in frequency bands, if the file has one (`trellis.lm_head_bands`)
+    bool create_trellis_bands(int64_t n_embd, int64_t n_vocab);
+
+    // nari fork: a coded embedding in frequency bands, if the file has one (`trellis.embed_bands`); tok_embd stays
+    // NULL then
+    bool create_trellis_embed_bands(int64_t n_embd, int64_t n_vocab);
+
+    // nari fork: the shared part of create_trellis_bands and create_trellis_embed_bands
+    bool create_trellis_banded(const char * key, llm_tensor tensor, const char * what, int64_t n_embd, int64_t n_vocab,
+            std::vector<ggml_tensor *> & bands, ggml_tensor *& gather);
 
     // helper: read the prism.hadamard metadata and record which weights are folded
     void load_hparams_hadamard(llama_model_loader & ml);

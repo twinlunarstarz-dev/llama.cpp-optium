@@ -341,6 +341,12 @@ llama_context::llama_context(
     }
 
     if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_EAGLE4 || model.arch == LLM_ARCH_DFLASH) {
+        // nari fork: the draft reads the target's embedding and lm_head with plain get_rows / mul_mat, which a coded
+        // tensor does not support
+        if ((model.tok_embd != nullptr && model.trellis_weight(model.tok_embd) != nullptr) ||
+            (model.output   != nullptr && model.trellis_weight(model.output)   != nullptr)) {
+            throw std::runtime_error(model.arch_name() + " cannot be trellis-coded: a draft model reads the embedding and the lm_head with plain ops");
+        }
         if (model.tok_embd == nullptr || model.output == nullptr) {
             if (params.ctx_other == nullptr) {
                 throw std::runtime_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
@@ -3051,6 +3057,7 @@ llm_graph_params llama_context::graph_params(
         /*.moe_cache   =*/ moe_cache.get(),
         /*.prec_policy =*/ &model.prec_policy,
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
+        /*.trellis     =*/ model.trellis.weights.empty() ? nullptr : &model.trellis,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),

@@ -21,6 +21,7 @@ struct llama_cparams;
 struct llama_layer;
 struct llama_prec_policy;
 struct llama_hadamard;
+struct llama_trellis;
 
 class llama_moe_cache;
 
@@ -852,6 +853,8 @@ struct llm_graph_params {
 
     const llama_hadamard * hdmd = nullptr;
 
+    const llama_trellis * trellis = nullptr; // nari fork: the coded weights, their sides and the banded heads
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -1105,6 +1108,8 @@ struct llm_graph_context {
 
     const llama_hadamard * hdmd;
 
+    const llama_trellis * trellis;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     const llm_graph_cb & cb_func;
@@ -1147,6 +1152,9 @@ struct llm_graph_context {
               ggml_tensor * w,
               ggml_tensor * cur,
               ggml_tensor * w_s = nullptr) const;
+
+    // nari fork: the logits of a coded lm_head in frequency bands (llama_trellis::bands)
+    ggml_tensor * build_trellis_bands(ggml_tensor * cur) const;
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
     // if slots is set, the experts are read from the MoE cache at these slots (see build_moe_cache_slots)

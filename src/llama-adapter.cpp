@@ -149,6 +149,9 @@ llama_adapter_lora_weight * llama_adapter_lora::get_weight(ggml_tensor * w) {
 }
 
 static void llama_adapter_lora_init_impl(llama_model & model, FILE * file, llama_adapter_lora & adapter) {
+    if (!model.trellis.weights.empty() || !model.trellis.bands.empty() || !model.trellis.embed_bands.empty()) {
+        throw std::runtime_error("trellis: LoRA adapters are not supported for trellis-coded models");
+    }
     ggml_context * ctx_init;
     gguf_init_params meta_gguf_params = {
         /* .no_alloc = */ true,

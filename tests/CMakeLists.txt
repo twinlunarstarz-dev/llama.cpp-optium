@@ -319,6 +319,8 @@ llama_build(test-backend-ops.cpp LINK ggml)
 if (GGML_CPU)
     # nari fork: the coded ops against the host reference
     llama_build_and_test(test-trellis.cpp LABEL "main behavior backend" LINK ggml)
+    # nari fork: trellis.version and the side-tensor validation of the loader
+    llama_build_and_test(test-trellis-metadata.cpp LABEL "main behavior" LINK llama)
 endif()
 
 llama_build_and_test(test-tiled-mulmat.cpp LINK ggml)
