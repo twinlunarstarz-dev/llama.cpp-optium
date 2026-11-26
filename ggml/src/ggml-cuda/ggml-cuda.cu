@@ -27,6 +27,7 @@
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/fwht.cuh"
+#include "ggml-cuda/trellis.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
@@ -2357,6 +2358,10 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 default:
                     return false;
             }
+            break;
+        case GGML_OP_TRELLIS:
+            // nari fork: a coded linear (ggml_trellis_mul_mat) through libtrellis
+            ggml_cuda_op_trellis(ctx, dst);
             break;
         case GGML_OP_GLU:
             switch (ggml_get_glu_op(dst)) {
@@ -5620,6 +5625,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 default:
                     return false;
             }
+        case GGML_OP_TRELLIS:
+            return ggml_cuda_trellis_supported(op);
         case GGML_OP_GLU:
             switch (ggml_get_glu_op(op)) {
                 case GGML_GLU_OP_REGLU:

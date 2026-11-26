@@ -28,6 +28,18 @@ static bool verbose = false;
 static double max_abs[6];
 static double max_rel[6];
 
+// The reference is a float64 product of the dense weight, so the CPU path matches it to fp32 rounding. A tensor-core
+// backend multiplies f16 operands (the codes decode to f16, the activations convert to f16), and a coded linear sums K
+// terms that largely cancel, so its worst relative error over the ~10k checked values reaches a few 1e-3: 2e-2 here.
+// A wrong tile, rotation, scale or stage is off by O(1), which is how the sm_75 race this test caught showed up.
+static double tolerance = 2e-4;
+
+// A coded embedding is read on the host: the GPU backends decline GGML_OP_TRELLIS_GET_ROWS (their coded product is a
+// linear only), so the scheduler leaves the lookup on the CPU, and the embedding checks always run there.
+static ggml_backend_t host_backend = nullptr;
+static int skipped = 0;
+static int mismatches = 0;
+
 static void check_close(double actual, double expected, int bits, const char * what) {
     const double abs_err = std::abs(actual - expected);
     const double rel_err = abs_err / (1.0 + std::abs(expected));
@@ -37,9 +49,11 @@ static void check_close(double actual, double expected, int bits, const char * w
     if (rel_err > max_rel[bits - 1]) {
         max_rel[bits - 1] = rel_err;
     }
-    if (!std::isfinite(actual) || rel_err >= 2e-4) {
-        std::fprintf(stderr, "TRL%d %s: got %.9g expected %.9g (abs %.3g)\n", bits, what, actual, expected, abs_err);
-        check(false, "trellis numerical mismatch");
+    if (!std::isfinite(actual) || rel_err >= tolerance) {
+        ++mismatches;
+        if (mismatches == 1) {
+            std::fprintf(stderr, "TRL%d %s: got %.9g expected %.9g (abs %.3g)\n", bits, what, actual, expected, abs_err);
+        }
     }
 }
 
@@ -113,7 +127,14 @@ static double run(ggml_backend_t backend, int bits, int mode, int columns, const
     auto * op = permute ? pout : nullptr;
     const int nd = desc_len(c);
     auto * y = ggml_trellis_mul_mat(ctx, w, x, s, pre, post, ip, op, c.desc, nd);
-    check(ggml_backend_supports_op(backend, y), "CPU backend rejected a valid coded product");
+    if (!ggml_backend_supports_op(backend, y)) {
+        // The GPU coded product needs K a multiple of 128, which the H12/H20/H68 descriptors of K=192, 320 and 272 are
+        // not; a real model always is. The case is skipped there and still checked on the CPU.
+        ggml_free(ctx);
+        if (backend == host_backend) { check(false, "the CPU backend rejected a valid coded product"); }
+        ++skipped;
+        return 0.0;
+    }
     auto * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, y);
     check(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "trellis graph failed");
@@ -149,7 +170,8 @@ static double run(ggml_backend_t backend, int bits, int mode, int columns, const
     auto * emb = ggml_trellis_get_rows(ctx, w, ids, s, pre, post, e.desc, desc_len(e));
     graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, emb);
-    check(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "embedding graph failed");
+    ggml_backend_t eb = host_backend != nullptr ? host_backend : backend;
+    check(ggml_backend_graph_compute(eb, graph) == GGML_STATUS_SUCCESS, "embedding graph failed");
     for (int i = 0; i < 4; ++i) {
         for (int k = 0; k < K; ++k) {
             check_close(static_cast<float *>(emb->data)[i * K + k], dense[size_t(rows[i]) * K + k], bits, "get_rows");
@@ -165,7 +187,7 @@ static double run(ggml_backend_t backend, int bits, int mode, int columns, const
     band = ggml_trellis_get_rows_band(ctx, band, w, ids, gather, N, s, pre, post2, e.desc, desc_len(e));
     graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, band);
-    check(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "banded embedding graph failed");
+    check(ggml_backend_graph_compute(eb, graph) == GGML_STATUS_SUCCESS, "banded embedding graph failed");
     for (int i = 0; i < 4; ++i) {
         const int row = 2 * N - 1 - tokens[i];
         for (int k = 0; k < K; ++k) {
@@ -198,18 +220,34 @@ static double run(ggml_backend_t backend, int bits, int mode, int columns, const
 
 int main(int argc, char ** argv) {
     const char * dump = nullptr;
+    std::string backend_name;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "-v") {
             verbose = true;
+        } else if (std::string(argv[i]) == "--backend" && i + 1 < argc) {
+            backend_name = argv[++i];
+        } else if (std::string(argv[i]) == "--tol" && i + 1 < argc) {
+            tolerance = std::atof(argv[++i]);
         } else if (std::string(argv[i]) == "--dump" && i + 1 < argc) {
             dump = argv[++i];
         } else {
-            check(false, "usage: test-trellis [-v] [--dump DIR]");
+            check(false, "usage: test-trellis [-v] [--dump DIR] [--backend NAME]");
         }
     }
     ggml_backend_load_all();
     auto * cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     check(cpu != nullptr, "CPU backend unavailable");
+    host_backend = cpu;
+    if (!backend_name.empty() && tolerance == 2e-4) {
+        tolerance = 2e-2;  // f16 operands, see above
+    }
+    // the numeric checks run on --backend when one is named (e.g. CUDA0), on the CPU otherwise
+    ggml_backend_t be = cpu;
+    if (!backend_name.empty()) {
+        be = ggml_backend_init_by_name(backend_name.c_str(), nullptr);
+        check(be != nullptr, "the named backend is unavailable");
+        std::fprintf(stderr, "checking the coded ops on %s\n", ggml_backend_name(be));
+    }
 
     // descriptor validation rejects what the format does not allow
     const int32_t bad_block[] = {1, 3, 1, 0, 0, 1, 0};
@@ -246,20 +284,30 @@ int main(int argc, char ** argv) {
 
     for (int bits = 1; bits <= 6; ++bits) {
         for (int mode = 0; mode < 8; ++mode) {
-            for (int columns : {1, 7}) {
-                run(cpu, bits, mode, columns, nullptr);
+            for (int columns : {1, 7, 96}) {  // 96 crosses the GEMV/GEMM split at 64 columns (prefill)
+                run(be, bits, mode, columns, nullptr);
             }
         }
         if (dump != nullptr) {
-            run(cpu, bits, 2, 3, dump);
-            run(cpu, bits, 0, 3, dump);
+            run(be, bits, 2, 3, dump);
+            run(be, bits, 0, 3, dump);
         }
     }
 
     for (int bits = 1; bits <= 6; ++bits) {
         std::printf("TRL%d: max abs error %.3g, max relative error %.3g\n", bits, max_abs[bits - 1], max_rel[bits - 1]);
     }
+    if (mismatches > 0) {
+        std::fprintf(stderr, "%d coded values are off by more than %.3g (relative)\n", mismatches, tolerance);
+        std::exit(1);
+    }
+    if (skipped > 0) {
+        std::printf("%d cases skipped by %s (K not a multiple of 128)\n", skipped, ggml_backend_name(be));
+    }
     std::puts("TRL1-6: coded products, embeddings and bands match the host reference");
+    if (be != cpu) {
+        ggml_backend_free(be);
+    }
     ggml_backend_free(cpu);
     return 0;
 }
