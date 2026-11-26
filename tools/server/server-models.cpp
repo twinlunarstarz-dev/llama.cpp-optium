@@ -2085,8 +2085,22 @@ std::vector<size_t> server_models::vram_effective_free_locked(const std::string 
     return free;
 }
 
+static bool vram_unified_memory_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 bool server_models::vram_fits_locked(const std::string & name) {
     if (!vram_active()) {
+        return true;
+    }
+    if (vram_unified_memory_enabled()) {
+        // managed/unified memory lets the driver oversubscribe device memory, so the
+        // static footprint is not an admission requirement: try the load and let the
+        // allocation itself decide
         return true;
     }
     const auto needed = vram_cached_for_locked(name);
@@ -2149,9 +2163,11 @@ void server_models::vram_admit(const std::string & name) {
         return;
     }
 
-    // a model that cannot fit on an empty card must not evict anything
+    // a model that cannot fit on an empty card must not evict anything - unless
+    // managed memory is in play, where the footprint may legitimately exceed the
+    // device total and the allocation itself decides
     const auto needed = vram_footprint_for(name);
-    if (!needed.empty()) {
+    if (!needed.empty() && !vram_unified_memory_enabled()) {
         server_vram & drv = server_vram::instance();
         for (size_t i = 0; i < needed.size() && i < drv.n_devices(); i++) {
             if (needed[i] > drv.dev(i).total) {
@@ -2826,7 +2842,8 @@ bool server_models::ensure_model_ready(const std::string & name, const std::func
 
             // a model that device memory refuses can never be admitted: report it with
             // numbers instead of waiting forever and blocking every request behind it
-            if (status == SERVER_MODEL_STATUS_UNLOADED && sched->vram_blocked_at_head(lk, name)) {
+            if (status == SERVER_MODEL_STATUS_UNLOADED && !vram_unified_memory_enabled() &&
+                sched->vram_blocked_at_head(lk, name)) {
                 if (vram_blocked_since == 0) {
                     vram_blocked_since = ggml_time_ms();
                     SRV_WRN("model name=%s does not fit in device memory: %s\n",
