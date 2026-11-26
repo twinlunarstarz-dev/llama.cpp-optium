@@ -439,6 +439,18 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         }
     }
 
+    // nari fork: the trellis types have no to_float, from_float or vec_dot, so only the trellis ops read them
+    if (op->op != GGML_OP_TRELLIS && op->op != GGML_OP_TRELLIS_GET_ROWS) {
+        if (ggml_is_trellis_type(op->type)) {
+            return false;
+        }
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            if (op->src[i] && ggml_is_trellis_type(op->src[i]->type)) {
+                return false;
+            }
+        }
+    }
+
     switch (op->op) {
         case GGML_OP_CPY:
         case GGML_OP_SET_ROWS:
@@ -450,6 +462,26 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                 op->type != GGML_TYPE_IQ2_S   &&
                 op->type != GGML_TYPE_IQ1_S   &&
                 op->type != GGML_TYPE_IQ1_M; // missing type_traits.from_float
+        case GGML_OP_TRELLIS:
+        case GGML_OP_TRELLIS_GET_ROWS:
+            {
+                // nari fork: src1 is x (F32) or ids (I32); an embedding's row side must be unrotated
+                const bool rows = op->op == GGML_OP_TRELLIS_GET_ROWS;
+                const int32_t * desc = (const int32_t *) op->op_params;
+                const bool src1_ok = rows ? src1->type == GGML_TYPE_I32 && desc[0] == 0 :
+                                            src1->type == GGML_TYPE_F32 && src1->nb[0] == sizeof(float);
+                if (!ggml_is_trellis_type(src0->type) || !src1_ok || desc[6] < 0 || desc[6] > GGML_TRELLIS_MAX_PARTS ||
+                    !ggml_trellis_desc_supported(src0->ne[0], src0->ne[1], desc, 7 + desc[6])) {
+                    return false;
+                }
+                // the CPU op reads the weight and its sides (src 0, 2-4) and the linear's gathers in place, so they must be in host memory
+                for (int i = 0; i < (rows ? 5 : 7); i++) {
+                    if (i != 1 && op->src[i] && op->src[i]->buffer && !ggml_backend_buft_is_host(op->src[i]->buffer->buft)) {
+                        return false;
+                    }
+                }
+                return true;
+            }
         case GGML_OP_MUL_MAT:
             if (ggml_get_op_params_i32(op, 1) == GGML_HINT_SRC0_IS_HADAMARD &&
                 src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32) {

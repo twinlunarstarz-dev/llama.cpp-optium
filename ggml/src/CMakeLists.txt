@@ -206,6 +206,7 @@ add_library(ggml-base
             ggml-threading.h
             ggml-quants.c
             ggml-quants.h
+            ggml-trellis.cpp
             ggml-bonsai.c
             gguf.cpp)
 

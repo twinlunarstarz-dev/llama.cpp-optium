@@ -6269,6 +6269,12 @@ class GGMLQuantizationType(IntEnum):
     Q2_0    = 42
     Q1_0_g128 = 43
     Q1_T_g128 = 44
+    TRL1    = 144  # nari trellis, renumbered from 44 (collides with Q1_T_g128)
+    TRL2    = 145
+    TRL3    = 146
+    TRL4    = 147
+    TRL5    = 148
+    TRL6    = 149
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -6490,6 +6496,13 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.Q2_0:    (64, 2 + 16),
     GGMLQuantizationType.Q1_0_g128: (128, 2 + 32),
     GGMLQuantizationType.Q1_T_g128: (128, 2 + 26),
+    # nari trellis: one 16x16 tile is 16*k int16 code words, i.e. 2*k bytes per 16 values
+    GGMLQuantizationType.TRL1:    (16,  2),
+    GGMLQuantizationType.TRL2:    (16,  4),
+    GGMLQuantizationType.TRL3:    (16,  6),
+    GGMLQuantizationType.TRL4:    (16,  8),
+    GGMLQuantizationType.TRL5:    (16, 10),
+    GGMLQuantizationType.TRL6:    (16, 12),
 }
 
 

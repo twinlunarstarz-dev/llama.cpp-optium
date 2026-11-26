@@ -741,6 +741,13 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_ptq1_0,
         .from_float_ref           = (ggml_from_float_t) quantize_row_ptq1_0_ref,
     },
+    // nari fork: no per-row to_float because only 16-row groups decode on their own; only the trellis ops read these types
+    [GGML_TYPE_TRL1] = { .type_name = "trl1", .blck_size = 16, .type_size = 2,  .is_quantized = true },
+    [GGML_TYPE_TRL2] = { .type_name = "trl2", .blck_size = 16, .type_size = 4,  .is_quantized = true },
+    [GGML_TYPE_TRL3] = { .type_name = "trl3", .blck_size = 16, .type_size = 6,  .is_quantized = true },
+    [GGML_TYPE_TRL4] = { .type_name = "trl4", .blck_size = 16, .type_size = 8,  .is_quantized = true },
+    [GGML_TYPE_TRL5] = { .type_name = "trl5", .blck_size = 16, .type_size = 10, .is_quantized = true },
+    [GGML_TYPE_TRL6] = { .type_name = "trl6", .blck_size = 16, .type_size = 12, .is_quantized = true },
     [GGML_TYPE_Q4_0] = {
         .type_name                = "q4_0",
         .blck_size                = QK4_0,
@@ -1150,9 +1157,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "TRELLIS",
+    "TRELLIS_GET_ROWS",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1265,9 +1275,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "trellis(w,x)",
+    "trellis_get_rows(w,ids)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -4033,6 +4046,121 @@ struct ggml_tensor * ggml_get_rows(
     result->op     = GGML_OP_GET_ROWS;
     result->src[0] = a;
     result->src[1] = b;
+
+    return result;
+}
+
+// nari fork: ggml_trellis_mul_mat, ggml_trellis_get_rows, ggml_trellis_get_rows_band
+
+bool ggml_is_trellis_type(enum ggml_type type) {
+    return type >= GGML_TYPE_TRL1 && type <= GGML_TYPE_TRL6;
+}
+
+static_assert(7 + GGML_TRELLIS_MAX_PARTS <= GGML_TRELLIS_BAND_ROW0, "trellis descriptor overlaps the band row0 slot");
+
+struct ggml_tensor * ggml_trellis_mul_mat(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * s16,
+        struct ggml_tensor  * pre,
+        struct ggml_tensor  * post,
+        struct ggml_tensor  * pin,
+        struct ggml_tensor  * pout,
+        const int32_t       * desc,
+        int                   n_desc) {
+    GGML_ASSERT(ggml_is_trellis_type(w->type) && ggml_is_matrix(w));
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && x->ne[0] == w->ne[0]);
+    GGML_ASSERT(s16->type == GGML_TYPE_F16 && s16->ne[0] == w->ne[0] / 16);
+    GGML_ASSERT(pre->type == GGML_TYPE_F32 && pre->ne[0] == w->ne[0]);
+    GGML_ASSERT(post->type == GGML_TYPE_F32 && post->ne[0] == w->ne[1]);
+    GGML_ASSERT(pin == NULL || (pin->type == GGML_TYPE_I32 && pin->ne[0] == w->ne[0]));
+    GGML_ASSERT(pout == NULL || (pout->type == GGML_TYPE_I32 && pout->ne[0] == w->ne[1]));
+    GGML_ASSERT(ggml_trellis_desc_supported(w->ne[0], w->ne[1], desc, n_desc));
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, w->ne[1], x->ne[1], x->ne[2], x->ne[3]);
+    ggml_set_op_params(result, desc, n_desc * sizeof(int32_t));
+
+    result->op     = GGML_OP_TRELLIS;
+    result->src[0] = w;
+    result->src[1] = x;
+    result->src[2] = s16;
+    result->src[3] = pre;
+    result->src[4] = post;
+    result->src[5] = pin;
+    result->src[6] = pout;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_trellis_get_rows(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * s16,
+        struct ggml_tensor  * pre,
+        struct ggml_tensor  * post,
+        const int32_t       * desc,
+        int                   n_desc) {
+    GGML_ASSERT(ggml_is_trellis_type(w->type) && ggml_is_matrix(w));
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ggml_is_vector(ids));
+    GGML_ASSERT(s16->type == GGML_TYPE_F16 && s16->ne[0] == w->ne[0] / 16);
+    GGML_ASSERT(pre->type == GGML_TYPE_F32 && pre->ne[0] == w->ne[0]);
+    GGML_ASSERT(post->type == GGML_TYPE_F32 && post->ne[0] == w->ne[1]);
+    GGML_ASSERT(ggml_trellis_desc_supported(w->ne[0], w->ne[1], desc, n_desc) && desc[0] == 0); // rows unrotated
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w->ne[0], ids->ne[0]);
+    ggml_set_op_params(result, desc, n_desc * sizeof(int32_t));
+
+    result->op     = GGML_OP_TRELLIS_GET_ROWS;
+    result->src[0] = w;
+    result->src[1] = ids;
+    result->src[2] = s16;
+    result->src[3] = pre;
+    result->src[4] = post;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_trellis_get_rows_band(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * prev,
+        struct ggml_tensor  * w,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * gather,
+        int64_t               row0,
+        struct ggml_tensor  * s16,
+        struct ggml_tensor  * pre,
+        struct ggml_tensor  * post,
+        const int32_t       * desc,
+        int                   n_desc) {
+    GGML_ASSERT(ggml_is_trellis_type(w->type) && ggml_is_matrix(w));
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ggml_is_vector(ids));
+    GGML_ASSERT(gather->type == GGML_TYPE_I32 && ggml_is_vector(gather));
+    GGML_ASSERT(row0 >= 0 && row0 + w->ne[1] <= gather->ne[0] && row0 <= INT32_MAX);
+    GGML_ASSERT(s16->type == GGML_TYPE_F16 && s16->ne[0] == w->ne[0] / 16);
+    GGML_ASSERT(pre->type == GGML_TYPE_F32 && pre->ne[0] == w->ne[0]);
+    GGML_ASSERT(post->type == GGML_TYPE_F32 && post->ne[0] == w->ne[1]);
+    GGML_ASSERT(ggml_trellis_desc_supported(w->ne[0], w->ne[1], desc, n_desc) && desc[0] == 0); // rows unrotated
+
+    struct ggml_tensor * result;
+    if (prev) {
+        GGML_ASSERT(prev->type == GGML_TYPE_F32 && prev->ne[0] == w->ne[0] && prev->ne[1] == ids->ne[0]);
+        result = ggml_view_tensor(ctx, prev);  // in place: the earlier bands' rows stay
+    } else {
+        result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w->ne[0], ids->ne[0]);
+    }
+    ggml_set_op_params(result, desc, n_desc * sizeof(int32_t));
+    ggml_set_op_params_i32(result, GGML_TRELLIS_BAND_ROW0, (int32_t) row0);
+
+    result->op     = GGML_OP_TRELLIS_GET_ROWS;
+    result->src[0] = w;
+    result->src[1] = ids;
+    result->src[2] = s16;
+    result->src[3] = pre;
+    result->src[4] = post;
+    result->src[5] = gather;
+    result->src[6] = prev;
 
     return result;
 }

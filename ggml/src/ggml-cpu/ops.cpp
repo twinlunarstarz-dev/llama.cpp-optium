@@ -6271,6 +6271,12 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_TQ2_0:
         case GGML_TYPE_PQ2_0:
         case GGML_TYPE_PTQ1_0:
+        case GGML_TYPE_TRL1: // nari fork: coded weights are not clamped
+        case GGML_TYPE_TRL2:
+        case GGML_TYPE_TRL3:
+        case GGML_TYPE_TRL4:
+        case GGML_TYPE_TRL5:
+        case GGML_TYPE_TRL6:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:

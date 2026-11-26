@@ -52,6 +52,8 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/binary-ops.cpp
         ggml-cpu/unary-ops.h
         ggml-cpu/unary-ops.cpp
+        ggml-cpu/trellis.h
+        ggml-cpu/trellis.cpp
         ggml-cpu/simd-mappings.h
         ggml-cpu/vec.h
         ggml-cpu/vec.cpp

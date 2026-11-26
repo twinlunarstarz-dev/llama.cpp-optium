@@ -5828,6 +5828,17 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_ptq1_0, data, nb);
             } break;
+        case GGML_TYPE_TRL1:
+        case GGML_TYPE_TRL2:
+        case GGML_TYPE_TRL3:
+        case GGML_TYPE_TRL4:
+        case GGML_TYPE_TRL5:
+        case GGML_TYPE_TRL6:
+            {
+                // nari fork: every bit pattern is a valid code
+                GGML_UNUSED(data);
+                GGML_UNUSED(nb);
+            } break;
         case GGML_TYPE_IQ1_S:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_iq1_s, data, nb);
