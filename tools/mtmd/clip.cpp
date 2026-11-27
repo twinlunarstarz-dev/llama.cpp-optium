@@ -1021,6 +1021,10 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
             {
                 builder = std::make_unique<clip_graph_muse_glimmer>(ctx, img);
             } break;
+        case PROJECTOR_TYPE_INKLING2V:
+            {
+                builder = std::make_unique<clip_graph_inkling2v>(ctx, img);
+            } break;
         case PROJECTOR_TYPE_STEP3VL:
             {
                 builder = std::make_unique<clip_graph_step3vl>(ctx, img);
@@ -1809,6 +1813,15 @@ struct clip_model_loader {
                             throw std::runtime_error(string_format("%s: sum of audio depths (%" PRId64 ") does not match n_layer (%d)\n", __func__, n_blocks, hparams.n_layer));
                         }
                         hparams.warmup_audio_size = hparams.audio_samples_per_token();
+                    } break;
+                case PROJECTOR_TYPE_INKLING2V:
+                    {
+                        hparams.ffn_op = FFN_GELU_ERF;
+                        log_ffn_op = "gelu_erf";
+                        get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.n_merge, false);
+                        hparams.rope_theta = 10000.0f;
+                        hparams.set_limit_image_tokens(1, 4096);
+                        hparams.set_warmup_n_tokens(32*32); // avoid OOM on warmup
                     } break;
                 case PROJECTOR_TYPE_MUSE_GLIMMER:
                     {
@@ -2704,6 +2717,18 @@ struct clip_model_loader {
                     }
                     model.mm_fc_w   = get_tensor(string_format(TN_MM_AUDIO_FC, "weight"));
                     model.mm_fc_b   = get_tensor(string_format(TN_MM_AUDIO_FC, "bias"));
+                } break;
+            case PROJECTOR_TYPE_INKLING2V:
+                {
+                    // these come from the generic path above, where they are optional
+                    if (!model.class_embedding || !model.position_embeddings || !model.pre_ln_w || !model.pre_ln_b) {
+                        throw std::runtime_error(string_format("%s: missing class_embd, position_embd or pre_ln\n", __func__));
+                    }
+                    model.class_position_embedding = get_tensor(TN_CLASS_POS_EMBD);
+                    model.mm_1_w = get_tensor(string_format(TN_LLAVA_PROJ, 1, "weight"));
+                    model.mm_1_b = get_tensor(string_format(TN_LLAVA_PROJ, 1, "bias"), false);
+                    model.mm_2_w = get_tensor(string_format(TN_LLAVA_PROJ, 2, "weight"));
+                    model.mm_2_b = get_tensor(string_format(TN_LLAVA_PROJ, 2, "bias"), false);
                 } break;
             case PROJECTOR_TYPE_MUSE_GLIMMER:
                 {
@@ -4293,6 +4318,7 @@ int clip_n_output_tokens_x(const clip_ctx * ctx, const clip_image_f32 * img) {
         case PROJECTOR_TYPE_STEP3VL:
         case PROJECTOR_TYPE_MINICPMV4_6:
         case PROJECTOR_TYPE_MINICPMV4_7:
+        case PROJECTOR_TYPE_INKLING2V:
             return img->nx() / (params.patch_size * params.n_merge);
         case PROJECTOR_TYPE_DEEPSEEKOCR:
         case PROJECTOR_TYPE_DEEPSEEKOCR2:
@@ -4323,6 +4349,7 @@ int clip_n_output_tokens_y(const clip_ctx * ctx, const clip_image_f32 * img) {
         case PROJECTOR_TYPE_STEP3VL:
         case PROJECTOR_TYPE_MINICPMV4_6:
         case PROJECTOR_TYPE_MINICPMV4_7:
+        case PROJECTOR_TYPE_INKLING2V:
             return img->ny() / (params.patch_size * params.n_merge);
         default:
             break;
@@ -4415,6 +4442,7 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
                 int y_patch = img->ny() / (params.patch_size * params.n_merge);
                 n_patches = x_patch * y_patch;
             } break;
+        case PROJECTOR_TYPE_INKLING2V:
         case PROJECTOR_TYPE_GEMMA3:
         case PROJECTOR_TYPE_GEMMA4V:
         case PROJECTOR_TYPE_GEMMA4UV:
@@ -4952,6 +4980,19 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                 std::vector<float> tail = st->stem_tail;
                 tail.resize(hparams.n_embd, 0.0f);
                 set_input_f32("inp_stem_tail", tail);
+            } break;
+        case PROJECTOR_TYPE_INKLING2V:
+            {
+                // CLS is at position 0, the patches are 1-indexed
+                std::vector<int32_t> positions_w{0}, positions_h{0};
+                for (int y = 0; y < pos_h; ++y) {
+                    for (int x = 0; x < pos_w; ++x) {
+                        positions_w.push_back(x + 1);
+                        positions_h.push_back(y + 1);
+                    }
+                }
+                set_input_i32("pos_w", positions_w);
+                set_input_i32("pos_h", positions_h);
             } break;
         case PROJECTOR_TYPE_MUSE_GLIMMER:
             {
@@ -6332,6 +6373,7 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
         case PROJECTOR_TYPE_MINIMAX_M3:
             return ctx->model.mm_merger_fc2_b->ne[0];
         case PROJECTOR_TYPE_MUSE_GLIMMER:
+        case PROJECTOR_TYPE_INKLING2V:
             return ctx->model.mm_2_w->ne[1];
         case PROJECTOR_TYPE_QWEN2VL:
         case PROJECTOR_TYPE_QWEN25VL:
