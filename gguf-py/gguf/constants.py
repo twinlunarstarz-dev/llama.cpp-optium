@@ -181,6 +181,7 @@ class Keys:
         SELECTOR_TOP_K                    = "{arch}.selector_top_k"
         SAMPLE_FROM_ANCHOR                = "{arch}.sample_from_anchor"
         HAS_CONFIDENCE_HEAD               = "{arch}.has_confidence_head"
+        HAS_MARKOV_CONTEXT                = "{arch}.has_markov_context"
         NORM_BEFORE_RESIDUAL              = "{arch}.norm_before_residual"
         NORM_BEFORE_FC                    = "{arch}.norm_before_fc"
         REALTIME_DELAY_TOKENS             = "{arch}.realtime_delay_tokens"
@@ -1329,6 +1330,12 @@ class MODEL_TENSOR(IntEnum):
     DSPARK_MARKOV_W1       = auto()  # markov head: prev-token embed
     DSPARK_MARKOV_W2       = auto()  # markov head: bias projection
     DSPARK_CONF_PROJ       = auto()  # confidence head
+    DSPARK_JOINT_PROJ      = auto()  # rnn markov head
+    DSPARK_MASK_EMBD       = auto()  # per-slot mask embeddings
+    DSPARK_MARKOV_CTX_MIX  = auto()  # rnn markov head: target feature mix
+    DSPARK_MARKOV_CTX_NORM = auto()  # rnn markov head: target feature norm
+    ENGRAM_KV              = auto()
+    ENGRAM_GATE            = auto()
     DFLASH_ATTN_CONV_BASE  = auto()
     DFLASH_ATTN_CONV_PROJ  = auto()
     DFLASH_FFN_CONV_BASE   = auto()
@@ -1336,6 +1343,11 @@ class MODEL_TENSOR(IntEnum):
     DFLASH_SELECTOR_PREV   = auto()
     DFLASH_SELECTOR_NEXT   = auto()
     DFLASH_SELECTOR_HIDDEN = auto()
+    DFLASH_CTX_MIX         = auto()  # per-layer target feature mix
+    DFLASH_CTX_NORM        = auto()  # per-layer target feature norm
+    DFLASH_ATTN_K_CTX      = auto()  # per-layer context K projection
+    DFLASH_ATTN_V_CTX      = auto()  # per-layer context V projection
+    DFLASH_ATTN_K_CTX_NORM = auto()
     LILICORR_TOKEN_PROJ           = auto()
     LILICORR_PASS_HIDDEN_PROJ     = auto()
     LILICORR_SLOT_EMBD            = auto()
@@ -2177,6 +2189,12 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.DSPARK_MARKOV_W1:          "markov_w1",
     MODEL_TENSOR.DSPARK_MARKOV_W2:          "markov_w2",
     MODEL_TENSOR.DSPARK_CONF_PROJ:          "conf_proj",
+    MODEL_TENSOR.DSPARK_JOINT_PROJ:         "joint_proj",
+    MODEL_TENSOR.DSPARK_MASK_EMBD:          "mask_embd",
+    MODEL_TENSOR.DSPARK_MARKOV_CTX_MIX:     "markov_ctx_mix",
+    MODEL_TENSOR.DSPARK_MARKOV_CTX_NORM:    "markov_ctx_norm",
+    MODEL_TENSOR.ENGRAM_KV:                 "blk.{bid}.engram_kv",
+    MODEL_TENSOR.ENGRAM_GATE:               "blk.{bid}.engram_gate",
     MODEL_TENSOR.DFLASH_ATTN_CONV_BASE:     "blk.{bid}.attn_conv_base",
     MODEL_TENSOR.DFLASH_ATTN_CONV_PROJ:     "blk.{bid}.attn_conv_proj",
     MODEL_TENSOR.DFLASH_FFN_CONV_BASE:      "blk.{bid}.ffn_conv_base",
@@ -2184,6 +2202,11 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.DFLASH_SELECTOR_PREV:      "selector_predecessor",
     MODEL_TENSOR.DFLASH_SELECTOR_NEXT:      "selector_successor",
     MODEL_TENSOR.DFLASH_SELECTOR_HIDDEN:    "selector_hidden",
+    MODEL_TENSOR.DFLASH_CTX_MIX:            "blk.{bid}.ctx_mix",
+    MODEL_TENSOR.DFLASH_CTX_NORM:           "blk.{bid}.ctx_norm",
+    MODEL_TENSOR.DFLASH_ATTN_K_CTX:         "blk.{bid}.attn_k_ctx",
+    MODEL_TENSOR.DFLASH_ATTN_V_CTX:         "blk.{bid}.attn_v_ctx",
+    MODEL_TENSOR.DFLASH_ATTN_K_CTX_NORM:    "blk.{bid}.attn_k_ctx_norm",
     MODEL_TENSOR.LILICORR_TOKEN_PROJ:                   "lilicorr.token_proj",
     MODEL_TENSOR.LILICORR_PASS_HIDDEN_PROJ:             "lilicorr.pass_hidden_proj",
     MODEL_TENSOR.LILICORR_SLOT_EMBD:                    "lilicorr.slot_embedding",
@@ -5664,6 +5687,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.LAYER_OUT_SCALE,
         MODEL_TENSOR.ROPE_FREQS,
         MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.TOKEN_EMBD_NORM,
         MODEL_TENSOR.OUTPUT,
         MODEL_TENSOR.OUTPUT_NORM,
         MODEL_TENSOR.ATTN_NORM,
@@ -5709,6 +5733,10 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.DSPARK_MARKOV_W1,
         MODEL_TENSOR.DSPARK_MARKOV_W2,
         MODEL_TENSOR.DSPARK_CONF_PROJ,
+        MODEL_TENSOR.DSPARK_JOINT_PROJ,
+        MODEL_TENSOR.DSPARK_MASK_EMBD,
+        MODEL_TENSOR.DSPARK_MARKOV_CTX_MIX,
+        MODEL_TENSOR.DSPARK_MARKOV_CTX_NORM,
         MODEL_TENSOR.DFLASH_ATTN_CONV_BASE,
         MODEL_TENSOR.DFLASH_ATTN_CONV_PROJ,
         MODEL_TENSOR.DFLASH_FFN_CONV_BASE,
@@ -5716,6 +5744,11 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.DFLASH_SELECTOR_PREV,
         MODEL_TENSOR.DFLASH_SELECTOR_NEXT,
         MODEL_TENSOR.DFLASH_SELECTOR_HIDDEN,
+        MODEL_TENSOR.DFLASH_CTX_MIX,
+        MODEL_TENSOR.DFLASH_CTX_NORM,
+        MODEL_TENSOR.DFLASH_ATTN_K_CTX,
+        MODEL_TENSOR.DFLASH_ATTN_V_CTX,
+        MODEL_TENSOR.DFLASH_ATTN_K_CTX_NORM,
         MODEL_TENSOR.LILICORR_TOKEN_PROJ,
         MODEL_TENSOR.LILICORR_PASS_HIDDEN_PROJ,
         MODEL_TENSOR.LILICORR_SLOT_EMBD,

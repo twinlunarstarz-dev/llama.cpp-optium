@@ -103,6 +103,20 @@ llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DSpark.gguf \
 `--spec-draft-conf-min P` truncates each drafted block at the first position whose predicted
 acceptance (from the draft's confidence head, if present) falls below `P` (default 0 = disabled).
 
+Inkling 2 ships its DSpark drafter as `mtp.safetensors` in the model directory. Export it from a local
+checkpoint with `--dspark`; the converter also reads the target's lm head and embedding norm from there:
+
+```bash
+python convert_hf_to_gguf.py /path/to/Inkling-2-Mini --dspark --outtype bf16 --outfile Inkling-2-Mini-DSpark.gguf
+
+llama-server -m Inkling-2-Mini.gguf -md Inkling-2-Mini-DSpark.gguf \
+    --spec-type draft-dspark --spec-draft-n-max 3 -fa on --jinja
+```
+
+The Inkling 2 drafter supports `--spec-draft-sampling probabilistic`:
+at a positive request temperature, each drawn token conditions the next one, and the target verifies the draft by
+rejection sampling.
+
 Currently only drafts with a Qwen3 backbone are supported; support for other backbones
 (e.g. Gemma4) is planned.
 
