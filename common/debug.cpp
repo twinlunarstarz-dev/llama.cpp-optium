@@ -4,6 +4,8 @@
 #include "log.h"
 
 #include <cmath>
+#include <cstdlib>
+#include <algorithm>
 #include <regex>
 #include <string>
 #include <vector>
@@ -183,7 +185,52 @@ bool common_debug_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
 
     if (!ggml_is_quantized(t->type) && matches_filter) {
         uint8_t * data = is_host ? (uint8_t *) t->data : pimpl->data.data();
-        common_debug_print_tensor(data, t->type, t->ne, t->nb, 3, pimpl->abort_on_nan);
+        if (getenv("LLAMA_DEBUG_DIGEST") != nullptr) {
+            double sum = 0.0, sumsq = 0.0, amax = 0.0;
+            size_t n = 0;
+            for (int64_t i3 = 0; i3 < t->ne[3]; i3++)
+            for (int64_t i2 = 0; i2 < t->ne[2]; i2++)
+            for (int64_t i1 = 0; i1 < t->ne[1]; i1++)
+            for (int64_t i0 = 0; i0 < t->ne[0]; i0++) {
+                const float v = common_ggml_get_float_value(data, t->type, t->nb, i0, i1, i2, i3);
+                sum += v; sumsq += (double) v * v; amax = std::max(amax, (double) std::fabs(v)); n++;
+            }
+            std::string slices;
+            if (getenv("LLAMA_DEBUG_SLICES") != nullptr && t->ne[1] > 1) {
+                char buf[64];
+                slices = " slices=";
+                for (int64_t i1 = 0; i1 < t->ne[1]; i1++) {
+                    double s1 = 0.0, s2 = 0.0; size_t n1 = 0;
+                    for (int64_t i3 = 0; i3 < t->ne[3]; i3++)
+                    for (int64_t i2 = 0; i2 < t->ne[2]; i2++)
+                    for (int64_t i0 = 0; i0 < t->ne[0]; i0++) {
+                        const float v = common_ggml_get_float_value(data, t->type, t->nb, i0, i1, i2, i3);
+                        s1 += v; s2 += (double) v * v; n1++;
+                    }
+                    snprintf(buf, sizeof(buf), "%.4f/%.4f,", n1 ? std::sqrt(s2/(double)n1) : 0.0, s1);
+                    slices += buf;
+                }
+            }
+            std::string head;
+            if (getenv("LLAMA_DEBUG_HEAD") != nullptr) {
+                char buf[160];
+                int cnt = 0;
+                head = " head=";
+                for (int64_t i1 = 0; i1 < t->ne[1] && cnt < 8; i1++) {
+                    for (int64_t i0 = 0; i0 < t->ne[0] && cnt < 8; i0++, cnt++) {
+                        const float v = common_ggml_get_float_value(data, t->type, t->nb, i0, i1, 0, 0);
+                        snprintf(buf, sizeof(buf), "%.6g,", v);
+                        head += buf;
+                    }
+                }
+            }
+            LOG("DIGEST %s %s [%lld %lld %lld %lld] n=%zu sum=%.6f rms=%.6f absmax=%.6f%s\n",
+                t->name, ggml_type_name(t->type),
+                (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+                n, sum, n ? std::sqrt(sumsq / (double) n) : 0.0, amax, (head + slices).c_str());
+        } else {
+            common_debug_print_tensor(data, t->type, t->ne, t->nb, 3, pimpl->abort_on_nan);
+        }
     }
 
     return true;
