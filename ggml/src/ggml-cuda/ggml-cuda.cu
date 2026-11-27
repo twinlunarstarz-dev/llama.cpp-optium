@@ -3798,6 +3798,12 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
             return false;
         }
 
+        // softcap kernel assumes contiguous src; VIEW inputs (e.g. Inkling situ gate/up split)
+        // would read wrong linear offsets. Require contiguous.
+        if (!ggml_is_contiguous(scale->src[0])) {
+            return false;
+        }
+
         return true;
     }
 
