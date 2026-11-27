@@ -1099,6 +1099,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     // dspark speculators
     bool sample_from_anchor = true;
+    // the Markov head reads the target's context state (Inkling2 f_rnn) from h_nextn,
+    // so the nextn output must stay unmasked
+    bool has_markov_context = false;
+    // per-token state of the block tokens: the context state on the anchor row
+    size_t ctx_rows = 0;
+    std::vector<float>     ctx_embd;
+    std::vector<llama_pos> ctx_pos;
+    std::vector<float>     block_state;
 
     // block-internal attention
     bool causal_attn = false;
@@ -1140,6 +1148,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (llama_model_meta_val_str(model_dft, "dflash.attention.causal", buf, sizeof(buf)) >= 0) {
                 causal_attn = std::strcmp(buf, "true") == 0;
             }
+            if (llama_model_meta_val_str(model_dft, "dflash.has_markov_context", buf, sizeof(buf)) >= 0) {
+                has_markov_context = std::strcmp(buf, "true") == 0;
+            }
         }
 
         selector_top_k = llama_model_dflash_selector_top_k(model_dft);
@@ -1153,6 +1164,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             const size_t lilicorr_slots = (size_t) n_seq * lilicorr_rows;
             lilicorr_embd.resize(lilicorr_slots * (size_t) n_embd_dec);
             lilicorr_pos.assign(lilicorr_slots, -1);
+        }
+        if (has_markov_context) {
+            ctx_rows = (size_t) block_size + 1;
+            const size_t ctx_slots = (size_t) n_seq * ctx_rows;
+            ctx_embd.resize(ctx_slots * (size_t) n_embd_dec);
+            ctx_pos.assign(ctx_slots, -1);
+            block_state.reserve((size_t) n_seq * (size_t) block_size * (size_t) n_embd_dec);
         }
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
 
@@ -1168,8 +1186,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         LOG_INF("%s: adding speculative implementation '%s'\n", __func__, common_speculative_type_to_str(type).c_str());
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
-        LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u, sample_from_anchor=%s\n", __func__,
-                block_size, mask_token_id, target_layer_ids_n, sample_from_anchor ? "true" : "false");
+        LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u, sample_from_anchor=%s, has_markov_context=%s\n", __func__,
+                block_size, mask_token_id, target_layer_ids_n, sample_from_anchor ? "true" : "false",
+                has_markov_context ? "true" : "false");
 
         // DFlash input is [id_last, <mask> * (block_size-1)]: in-place denoising yields at most
         // block_size-1 draft tokens, anchor-first DSpark yields a full block_size draft tokens
@@ -1219,7 +1238,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
-        llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2 && !is_lilicorr);
+        llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2 && !is_lilicorr && !has_markov_context);
         llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise
     }
 
@@ -1334,6 +1353,23 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                             __func__, rc, (int) n_chunk, (int) offset);
                     return false;
                 }
+                if (is_dspark && has_markov_context) {
+                    // the Markov head reads the context state of the last committed token (Inkling2 f_rnn)
+                    const float * state = llama_get_embeddings_nextn(ctx_dft);
+                    if (state) {
+                        const llama_pos pos_min = std::max(0, batch_inject.tokens.back().pos[0] - block_size);
+                        for (int32_t i = 0; i < n_chunk; ++i) {
+                            const llama_pos pos = batch_inject.tokens[i].pos[0];
+                            if (pos < pos_min) {
+                                continue;
+                            }
+                            const size_t slot = (size_t) seq_id * ctx_rows + (size_t) pos % ctx_rows;
+                            std::memcpy(ctx_embd.data() + slot * (size_t) n_embd_dec,
+                                    state + (size_t) i * n_embd_dec, (size_t) n_embd_dec * sizeof(float));
+                            ctx_pos[slot] = pos;
+                        }
+                    }
+                }
                 if (is_lilicorr) {
                     // Ordinary DFlash can write to the KV cache, but LiliCorr needs to store embeddings across sequences.
                     const float * projected = llama_get_embeddings_nextn(ctx_dft);
@@ -1368,10 +1404,26 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         std::vector<int32_t> i_block_beg(n_seq, -1);
         std::vector<int32_t> n_block    (n_seq,  0);
 
+        block_state.clear();
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
             if (!dp.drafting) {
                 continue;
+            }
+
+            // the Markov head reads the context state of the token before the block, no draft without it
+            const float * state = nullptr;
+            if (is_dspark && has_markov_context) {
+                const llama_pos pos = dp.pos0 - 1;
+                if (pos < 0) {
+                    continue;
+                }
+                const size_t slot = (size_t) seq_id * ctx_rows + (size_t) pos % ctx_rows;
+                if (ctx_pos[slot] != pos) {
+                    continue;
+                }
+                state = ctx_embd.data() + slot * (size_t) n_embd_dec;
             }
 
             common_sampler_reset(smpls[seq_id].get());
@@ -1389,6 +1441,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     const llama_pos pos = dp.pos0 - 1;
                     const size_t slot = (size_t) seq_id * lilicorr_rows + (size_t) pos % lilicorr_rows;
                     batch.set_embd_state(idx, { lilicorr_embd.data() + slot * (size_t) n_embd_dec, 1, (size_t) n_embd_dec });
+                }
+                if (state) {
+                    // the anchor row carries the context state, the draft rows carry none yet
+                    GGML_ASSERT(block_state.size() + (size_t) n_embd_dec <= block_state.capacity());
+                    float * row = block_state.data() + block_state.size();
+                    if (i == 0) {
+                        std::memcpy(row, state, (size_t) n_embd_dec * sizeof(float));
+                    } else {
+                        std::memset(row, 0, (size_t) n_embd_dec * sizeof(float));
+                    }
+                    block_state.resize(block_state.size() + (size_t) n_embd_dec, 0.0f);
+                    batch.set_embd_state(idx, { row, 1, (size_t) n_embd_dec });
                 }
             }
         }
@@ -2697,6 +2761,17 @@ common_params common_base_params_to_speculative(const common_params & params) {
         result.model                 = params_spec.mparams;
         result.n_gpu_layers          = params_spec.n_gpu_layers;
         result.tensor_buft_overrides = params_spec.tensor_buft_overrides;
+
+        // a draft that migrates to host memory makes every speculative round pay the PCIe cost,
+        // which is worse than not drafting at all: keep these drafts resident in VRAM
+        result.pin_weights_resident = params.moe_pin_decode && std::any_of(
+            params.speculative.types.begin(), params.speculative.types.end(),
+            [](common_speculative_type t) {
+                return t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 ||
+                       t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+                       t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK ||
+                       t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+            });
 
         // a draft pinned to a single device doesn't need the meta wrapper an inherited -sm tensor would give it
         // (the device list is null-terminated, so a single device means size 2)
