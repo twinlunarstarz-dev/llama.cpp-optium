@@ -755,10 +755,21 @@ llama_context::llama_context(
                                 __func__, (double) v);
                     }
                 }
-                const size_t reserve = base_reserve + compute_total + (n_accel > 1 ? (n_accel - 1) * 512ull * 1024ull * 1024ull : 0);
+                // Under unified memory the probe compute buffers are managed allocations, not
+                // exclusive VRAM: subtracting them from the free VRAM makes the reserve larger
+                // than the card on every load (measured 17.6 GiB reserve vs 11.8 GiB VRAM), so the
+                // requested cache is clamped to 0 and the expert cache never runs. Size from the
+                // real free VRAM instead and keep only the static reserve.
+                const char * uvm_env = getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY");
+                const bool   uvm = uvm_env != nullptr &&
+                    !(uvm_env[0] == '0' || uvm_env[0] == 'f' || uvm_env[0] == 'F' ||
+                      uvm_env[0] == 'n' || uvm_env[0] == 'N');
+                const size_t reserve = base_reserve + (uvm ? 0 : compute_total) +
+                    (n_accel > 1 ? (n_accel - 1) * 512ull * 1024ull * 1024ull : 0);
                 const size_t avail   = free_total > reserve ? free_total - reserve : 0;
-                LLAMA_LOG_INFO("%s: MoE cache reserve includes %.2f MiB probe compute buffers\n",
-                        __func__, compute_total / 1024.0 / 1024.0);
+                LLAMA_LOG_INFO("%s: MoE cache reserve includes %.2f MiB probe compute buffers%s\n",
+                        __func__, compute_total / 1024.0 / 1024.0,
+                        uvm ? " (unified memory: managed, not counted against VRAM)" : "");
                 if (cparams.moe_cache_size == SIZE_MAX) {
                     LLAMA_LOG_INFO("%s: auto-sized MoE cache to %.2f MiB (%.2f MiB free across %zu device(s), %.2f MiB reserve)\n",
                             __func__, avail / 1024.0 / 1024.0,
