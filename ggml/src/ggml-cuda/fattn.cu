@@ -530,6 +530,8 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_MMA_F16 = 400,
 };
 
+static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(int device, const ggml_tensor * dst);
+
 // K/V types for which there is a vector kernel template instance, other kernels convert these to f16:
 static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
     switch (type) {
@@ -548,7 +550,7 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
     }
 }
 
-static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
+static best_fattn_kernel ggml_cuda_get_best_fattn_kernel_impl(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
     return BEST_FATTN_KERNEL_NONE;
@@ -636,9 +638,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_NONE;
     }
 
-    if (mask && mask->ne[2] != 1) {
-        return BEST_FATTN_KERNEL_NONE;
-    }
+    // A per-head mask (mask->ne[2] == n_head) is supported by the vec kernel, which indexes
+    // the mask plane by head. The tile and MMA kernels apply a single plane to every head in
+    // a block, so ggml_cuda_flash_attn_ext_supported() downgrades those to the vec kernel.
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
@@ -804,6 +806,52 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     }
 }
 
+static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
+    best_fattn_kernel best = ggml_cuda_get_best_fattn_kernel_impl(device, dst);
+    if (best == BEST_FATTN_KERNEL_NONE) {
+        return best;
+    }
+
+    const ggml_tensor * mask = dst->src[3];
+    if (mask == nullptr || mask->ne[2] == 1) {
+        return best;
+    }
+
+    if (best != BEST_FATTN_KERNEL_VEC) {
+        // The tile and MMA kernels broadcast one mask plane across every head of a block. Only
+        // the vec kernel reads the plane of the head it was launched for, so route per-head
+        // masks there; if vec cannot take this shape, decline instead of computing a wrong bias.
+        const ggml_tensor * Q = dst->src[0];
+        const ggml_tensor * K = dst->src[1];
+        const bool vec_can_take_it = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 &&
+            K->ne[1] % FATTN_KQ_STRIDE == 0;
+        if (!vec_can_take_it) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
+        best = BEST_FATTN_KERNEL_VEC;
+    }
+
+    return best;
+}
+
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
-    return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
+    const best_fattn_kernel best = ggml_cuda_get_best_fattn_kernel(device, dst);
+    if (best == BEST_FATTN_KERNEL_NONE && getenv("GGML_FATTN_DEBUG") != nullptr) {
+        const ggml_tensor * Q = dst->src[0];
+        const ggml_tensor * K = dst->src[1];
+        const ggml_tensor * V = dst->src[2];
+        const ggml_tensor * m = dst->src[3];
+        fprintf(stderr, "[FATTN] unsupported dst=%s Q=%lld,%lld,%lld,%lld K=%lld,%lld,%lld,%lld V=%lld,%lld,%lld,%lld"
+                " ktype=%s vtype=%s mask=%s ne=%lld,%lld,%lld,%lld sinks=%p\n",
+                dst->name ? dst->name : "?",
+                (long long) Q->ne[0], (long long) Q->ne[1], (long long) Q->ne[2], (long long) Q->ne[3],
+                (long long) K->ne[0], (long long) K->ne[1], (long long) K->ne[2], (long long) K->ne[3],
+                (long long) V->ne[0], (long long) V->ne[1], (long long) V->ne[2], (long long) V->ne[3],
+                ggml_type_name(K->type), ggml_type_name(V->type),
+                m ? ggml_type_name(m->type) : "none",
+                m ? (long long) m->ne[0] : 0, m ? (long long) m->ne[1] : 0,
+                m ? (long long) m->ne[2] : 0, m ? (long long) m->ne[3] : 0,
+                (void *) dst->src[4]);
+    }
+    return best != BEST_FATTN_KERNEL_NONE;
 }
