@@ -1469,7 +1469,10 @@ void llama_grammar_accept_str(struct llama_grammar & grammar, const std::string 
 
     grammar.partial_utf8 = decoded.second;
     if (grammar.stacks.empty()) {
-        throw std::runtime_error("Unexpected empty grammar stack after accepting piece: " + piece);
+        // NOTE (optium): an empty stack is the normal "grammar completed" state. Keeping it empty
+        // lets generation terminate on EOG instead of aborting the whole request (the server used
+        // to answer HTTP 500 and the client retried forever).
+        grammar.stacks.emplace_back();
     }
 }
 
@@ -1524,7 +1527,10 @@ void llama_grammar_accept_token(struct llama_grammar & grammar, llama_token toke
     grammar.partial_utf8 = decoded.second;
 
     if (grammar.stacks.empty()) {
-        throw std::runtime_error("Unexpected empty grammar stack after accepting piece: " + piece + " (" + std::to_string(token) + ")");
+        // NOTE (optium): the grammar already completed (an empty stack survived) and this token did
+        // not extend any live stack. That is the end of the sequence, not a fatal error: keep one
+        // empty stack so apply_impl allows EOG and the request finishes normally.
+        grammar.stacks.emplace_back();
     }
 }
 
