@@ -939,6 +939,61 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
     return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
 }
 
+// Keep a (managed) allocation resident on its device instead of letting the driver migrate it to host.
+// Only meaningful under unified memory: plain cudaMalloc memory is device resident by construction.
+bool ggml_backend_cuda_buffer_pin_resident(ggml_backend_buffer_t buffer) {
+    if (!ggml_cuda_unified_memory_enabled()) {
+        return false;
+    }
+
+    auto * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    if (ctx == nullptr || ctx->dev_ptr == nullptr || buffer->size == 0) {
+        return false;
+    }
+
+    ggml_cuda_set_device(ctx->device);
+    (void) cudaGetLastError(); // clear any sticky error before advising
+
+    int cuda_dev = 0;
+    if (cudaGetDevice(&cuda_dev) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+
+    cudaMemLocation loc = {};
+    loc.type = cudaMemLocationTypeDevice;
+    loc.id   = cuda_dev;
+
+    // model weights are read-only for the lifetime of the model
+    const cudaError_t err_ro = cudaMemAdvise(ctx->dev_ptr, buffer->size, cudaMemAdviseSetReadMostly, loc);
+    (void) cudaGetLastError();
+
+    const cudaError_t err_loc = cudaMemAdvise(ctx->dev_ptr, buffer->size, cudaMemAdviseSetPreferredLocation, loc);
+    (void) cudaGetLastError();
+
+    // the prefetch is what actually makes the pages resident now
+    const cudaError_t err_pf = cudaMemPrefetchAsync(ctx->dev_ptr, buffer->size, loc, 0, 0);
+    (void) cudaGetLastError();
+
+    if (err_pf != cudaSuccess) {
+        cudaPointerAttributes pa = {};
+        const cudaError_t err_pa = cudaPointerGetAttributes(&pa, ctx->dev_ptr);
+        (void) cudaGetLastError();
+        GGML_LOG_WARN("%s: prefetch of %.2f MiB to device %d failed (%s); advise: read-mostly=%s preferred=%s; ptr type=%d device=%d managed=%d (attrs=%s)\n",
+                __func__, buffer->size / 1024.0 / 1024.0, cuda_dev, cudaGetErrorString(err_pf),
+                cudaGetErrorString(err_ro), cudaGetErrorString(err_loc),
+                (int) pa.type, pa.device, pa.type == cudaMemoryTypeManaged ? 1 : 0,
+                cudaGetErrorString(err_pa));
+        return false;
+    }
+
+    GGML_LOG_INFO("%s: pinned %.2f MiB resident on %s (device %d, preferred=%s)\n", __func__,
+            buffer->size / 1024.0 / 1024.0, ctx->name.c_str(), cuda_dev,
+            err_loc == cudaSuccess ? "yes" : "no");
+
+    return true;
+}
+
 static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
     return 128;
 

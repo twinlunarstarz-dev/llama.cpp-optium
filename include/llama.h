@@ -366,6 +366,8 @@ extern "C" {
         const char * moe_placement; // expert placement mode: "auto" (solver) | "plan:<json>" [EXPERIMENTAL]
         bool moe_pin_decode;      // keep decode/attention layers in VRAM [EXPERIMENTAL]
         const char * moe_hot;         // seed expert activation profile for tiered placement [EXPERIMENTAL]
+
+        bool pin_weights_resident; // pin the model weights resident on their device under unified memory [EXPERIMENTAL]
     };
 
     struct llama_sampler_seq_config {

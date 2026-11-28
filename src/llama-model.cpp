@@ -1,7 +1,10 @@
+#include <cstring>
 #include <sys/mman.h>
 #include <unistd.h>
 
 #include "llama-model.h"
+
+#include "ggml-cuda.h"
 
 #include "llama-arch.h"
 #include "llama-ext.h"
@@ -1880,6 +1883,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
             if (!layer.ffn_up_exps_s && layer.ffn_up_exps) {
                 layer.ffn_up_exps_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+                if (layer.ffn_up_exps_s && layer.ffn_gate_up_exps) {
+                    throw std::runtime_error(format("ffn_up_exps.scale and ffn_gate_up_exps.weight both exist for layer %d", i));
+                }
+            }
+            // merged gate_up experts use the up scale, as build_moe_ffn applies up_exps_s to the merged output
+            if (!layer.ffn_up_exps_s && layer.ffn_gate_up_exps) {
+                layer.ffn_up_exps_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
             }
 
             // recurrent / linear-attention weight scales (per-tensor, shape {1})
@@ -2096,6 +2106,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             // indicate that this buffer contains weights
             // this is used by ggml_backend_sched to improve op scheduling: ops that use a weight are preferably scheduled to the backend that contains the weight
             ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+            // keep the weights in device memory instead of letting unified memory migrate them to host
+            if (params.pin_weights_resident) {
+                const char * buft_name = ggml_backend_buft_name(ggml_backend_buffer_get_type(buf.get()));
+                if (buft_name != nullptr && std::strncmp(buft_name, "CUDA", 4) == 0) {
+                    ggml_backend_cuda_buffer_pin_resident(buf.get());
+                }
+            }
 
             buf_ptrs.emplace_back(buf.get());
         }
@@ -3604,6 +3622,7 @@ llama_model_params llama_model_default_params() {
         /*.moe_placement               =*/ nullptr,
         /*.moe_pin_decode              =*/ true,
         /*.moe_hot                       =*/ nullptr,
+        /*.pin_weights_resident        =*/ false,
     };
 
     return result;

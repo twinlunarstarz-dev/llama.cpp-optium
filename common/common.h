@@ -612,6 +612,7 @@ struct common_params {
     size_t moe_ram_mib = 0;         // hard RAM cap in MiB for the MoE CPU arena (default: 0 = tiered MoE placement disabled)
     std::string moe_placement;      // "auto" (solver) | "plan:<json>" (explicit plan)
     bool moe_pin_decode = true;     // keep decode/attention layers in VRAM
+    bool pin_weights_resident = false; // pin model weights resident on the device under unified memory (set for draft models)
     float moe_cpu_layer_frac = 0.0f;      // fraction of layers whose experts stay on CPU (0 = off)
     bool  moe_cpu_layers_explicit = false; // true when the caller set --n-cpu-moe themselves
 
