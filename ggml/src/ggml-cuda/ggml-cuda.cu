@@ -3866,6 +3866,66 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+
+// Inkling 2 row clamp: SQR -> SUM_ROWS -> SQRT -> SCALE(+eps) -> FILL(threshold) -> DIV -> CLAMP -> MUL
+// Eight tiny kernels between two CPU segments collapse into one.
+static int ggml_cuda_try_fuse_clip_norm(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    if (i + 7 >= cgraph->n_nodes) {
+        return 0;
+    }
+
+    const ggml_tensor * sqr = cgraph->nodes[i];
+    if (sqr->op != GGML_OP_SQR || sqr->type != GGML_TYPE_F32 || sqr->ne[0] == 0) {
+        return 0;
+    }
+
+    if (!ggml_can_fuse_subgraph(cgraph, i, {
+            GGML_OP_SQR, GGML_OP_SUM_ROWS, GGML_OP_SQRT, GGML_OP_SCALE,
+            GGML_OP_FILL, GGML_OP_DIV, GGML_OP_CLAMP, GGML_OP_MUL }, { i + 7 })) {
+        return 0;
+    }
+
+    const ggml_tensor * sum = cgraph->nodes[i + 1];
+    const ggml_tensor * srt = cgraph->nodes[i + 2];
+    const ggml_tensor * scl = cgraph->nodes[i + 3];
+    const ggml_tensor * fil = cgraph->nodes[i + 4];
+    const ggml_tensor * div = cgraph->nodes[i + 5];
+    const ggml_tensor * clp = cgraph->nodes[i + 6];
+    const ggml_tensor * dst = cgraph->nodes[i + 7];
+
+    const ggml_tensor * x = sqr->src[0];
+
+    if (!x || x->type != GGML_TYPE_F32 || x->nb[0] != sizeof(float)) {
+        return 0;
+    }
+    if (sum->src[0] != sqr || srt->src[0] != sum || scl->src[0] != srt || fil->src[0] != scl ||
+        div->src[0] != fil || div->src[1] != scl || clp->src[0] != div ||
+        dst->src[0] != x || dst->src[1] != clp) {
+        return 0;
+    }
+
+    // the eps of SCALE and the threshold of FILL must be the ones this kernel applies
+    const float scale = ggml_get_op_params_f32(scl, 0);
+    const float eps   = ggml_get_op_params_f32(scl, 1);
+    if (scale != 1.0f || !(eps >= 0.0f)) {
+        return 0;
+    }
+    const float threshold = ggml_get_op_params_f32(fil, 0);
+    if (!(threshold >= 0.0f)) {
+        return 0;
+    }
+    if (ggml_get_op_params_f32(clp, 0) != 0.0f || ggml_get_op_params_f32(clp, 1) != 1.0f) {
+        return 0;
+    }
+
+    if (dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) || !ggml_are_same_shape(x, dst)) {
+        return 0;
+    }
+
+    ggml_cuda_op_clip_norm(*cuda_ctx, x, dst, eps, threshold);
+    return 7;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -3873,6 +3933,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_SQR) {
+        const int fused = ggml_cuda_try_fuse_clip_norm(cuda_ctx, cgraph, i);
+        if (fused > 0) {
+            return fused;
+        }
+    }
 
     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&

@@ -530,6 +530,87 @@ static void rms_norm_back_f32_cuda(const float * grad, const float * xf, float *
     }
 }
 
+// Inkling 2 row clamp: sqrt(sum_rows(sqr(x))) -> SCALE (+eps) -> threshold/x -> CLAMP [0,1] -> MUL back into x
+template <int block_size>
+static __global__ void clip_norm_f32(
+        const float * x, float * dst, const int ncols, const int nchannels, const int nsamples,
+        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample,
+        const float eps, const float threshold) {
+    const int nrows = gridDim.x;
+    const int row   = blockIdx.x;
+    const int tid   = threadIdx.x;
+
+    extern __shared__ float s_sum[];
+
+    ggml_cuda_pdl_sync();
+
+    for (int sample = blockIdx.z; sample < nsamples; sample += gridDim.z) {
+        for (int channel = blockIdx.y; channel < nchannels; channel += gridDim.y) {
+            const float * xc   = x   + sample*stride_sample + channel*stride_channel + row*stride_row;
+            float       * dstc = dst + ((sample*nchannels + channel)*nrows + row)*ncols;
+
+            float tmp = 0.0f;
+
+            for (int col = tid; col < ncols; col += block_size) {
+                const float xi = xc[col];
+                tmp += xi*xi;
+            }
+
+            tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+            const float l2 = sqrtf(tmp);
+            const float fc = fminf(fmaxf(threshold/(l2 + eps), 0.0f), 1.0f);
+
+            for (int col = tid; col < ncols; col += block_size) {
+                dstc[col] = xc[col]*fc;
+            }
+
+            if constexpr (block_size > WARP_SIZE) {
+                __syncthreads();
+            }
+        }
+    }
+}
+
+static void clip_norm_f32_cuda(
+        const float * x, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
+        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample,
+        const float eps, const float threshold, cudaStream_t stream) {
+    const dim3 blocks_num(nrows, MIN(nchannels, UINT16_MAX), MIN(nsamples, UINT16_MAX));
+    if (ncols < 1024) {
+        const dim3 block_dims(WARP_SIZE, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, 0, stream};
+        ggml_cuda_kernel_launch(clip_norm_f32<WARP_SIZE>, launch_params, x, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, threshold);
+    } else {
+        const dim3 block_dims(1024, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float) : 0, stream};
+        ggml_cuda_kernel_launch(clip_norm_f32<1024>, launch_params, x, dst, ncols, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, threshold);
+    }
+}
+
+void ggml_cuda_op_clip_norm(ggml_backend_cuda_context & ctx, const ggml_tensor * x, const ggml_tensor * dst,
+                            const float eps, const float threshold) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(x, dst));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(x->nb[0] == sizeof(float));
+
+    const int64_t ne00 = x->ne[0];
+    const int64_t ne01 = x->ne[1];
+    const int64_t ne02 = x->ne[2];
+    const int64_t ne03 = x->ne[3];
+
+    const int64_t s01 = x->nb[1] / sizeof(float);
+    const int64_t s02 = x->nb[2] / sizeof(float);
+    const int64_t s03 = x->nb[3] / sizeof(float);
+
+    cudaStream_t stream = ctx.stream();
+
+    clip_norm_f32_cuda((const float *) x->data, (float *) dst->data, ne00, ne01, ne02, ne03, s01, s02, s03, eps, threshold, stream);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 static void l2_norm_f32_cuda(
         const float * x, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream) {
