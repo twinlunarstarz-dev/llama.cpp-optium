@@ -8454,6 +8454,7 @@ struct test_flash_attn_ext : public test_case {
     const int64_t nb; // batch size
 
     const bool mask; // use mask
+    const int64_t mask_nh; // per-head mask: number of head planes (0 = broadcast a single plane)
     const bool sinks; // use sinks
 
     const float max_bias; // ALiBi
@@ -8468,7 +8469,8 @@ struct test_flash_attn_ext : public test_case {
     const int64_t n_kv_max;
 
     std::string vars() override {
-        return VARS_TO_STR17(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max);
+        return VARS_TO_STR17(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max)
+                + ", mask_nh = " + std::to_string(mask_nh);
     }
 
     double max_nmse_err() override {
@@ -8485,8 +8487,8 @@ struct test_flash_attn_ext : public test_case {
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
-                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0)
-        : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
+                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0, int64_t mask_nh = 0)
+        : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), mask_nh(mask_nh), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
           type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -8535,7 +8537,7 @@ struct test_flash_attn_ext : public test_case {
 
         ggml_tensor * m = nullptr;
         if (mask) {
-            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nr23[1]);
+            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, mask_nh > 0 ? mask_nh : 1, nr23[1]);
             ggml_set_name(m, "m");
         }
 
@@ -11785,6 +11787,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // asymmetric head_dim (hsk != hsv) with one or both sides not 64-aligned
+    // a per-head mask (one bias plane per Q head, as used by models that fold their relative
+    // position bias into the mask) must match the CPU reference on every backend
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {1, 1}, 256, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, 8));
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, 4));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {1, 1}, 256, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0, 8));
+    // prefill shape: enough query columns that the tile kernel, not vec, handles the op
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {1, 1}, 768, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0, 8));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {1, 1}, 768, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, 8));
     test_cases.emplace_back(new test_flash_attn_ext(72, 64, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 72, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(65, 67, 4, {1, 1}, 113, 75, true, true, 8.0f, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
